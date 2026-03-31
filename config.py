@@ -16,7 +16,7 @@ BINANCE_SECRET_KEY = os.environ["BINANCE_SECRET_KEY"]
 
 # ── Telegram ──────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 
 # ── Webhook (optional — leave empty to disable) ───────────────
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")

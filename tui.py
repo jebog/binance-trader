@@ -437,7 +437,7 @@ class EquityWidget(Widget):
 class SettingsModal(ModalScreen):
     """Edit runtime settings (scan interval). Dismisses with new interval or None."""
 
-    BINDINGS = [Binding("escape", "action_dismiss_modal", "Close", show=False)]
+    BINDINGS = [Binding("escape", "dismiss_modal", "Close", show=False)]
 
     def __init__(self, current_interval: int):
         super().__init__()
@@ -865,9 +865,12 @@ class ScannerApp(App):
             card = self.query_one(f"#pair-{sym.lower()}", PairCard)
             card.update_result(results_by_symbol.get(sym))
 
-        # Update portfolio panel
+        # Update portfolio panel and dismiss LoadingIndicator immediately
         if msg.portfolio:
             self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(msg.portfolio)
+            switcher = self.query_one("#left-switcher", ContentSwitcher)
+            if switcher.current == "portfolio-loading":
+                switcher.current = "portfolio-widget"
 
         # Update positions table
         self._refresh_positions_table(msg.positions)

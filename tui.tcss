@@ -336,8 +336,11 @@ OrderConfirmModal {
     height: 1;
 }
 
-.modal-label { color: $subtext; width: 20; }
+.modal-label { color: $subtext; width: 12; }
 .modal-value { color: $text;    width: 1fr; }
+
+/* Settings modal — wider label column for "Scan interval (s):" */
+SettingsModal .modal-label { width: 20; }
 
 /* Settings modal Input */
 SettingsModal Input {

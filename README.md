@@ -25,17 +25,19 @@ Personal macOS algorithmic scanner that monitors 6 spot pairs every 10 minutes, 
 ## Quick Start
 
 ```bash
-# 1 — Credentials (if not already set)
-echo "BINANCE_API_KEY=your_key" >> ~/.env
-echo "BINANCE_SECRET_KEY=your_secret" >> ~/.env
+# 1 — Clone and install dependencies
+git clone https://github.com/your-username/trading-scanner.git
+cd trading-scanner
+pip3 install -r requirements.txt
 
-# 2 — Dependencies (TUI only)
-pip3 install textual
+# 2 — Set your credentials
+cp .env.example .env
+# Edit .env and fill in BINANCE_API_KEY, BINANCE_SECRET_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 # 3a — Interactive scan (manual confirm prompt)
 python3 scanner.py
 
-# 3b — Real-time TUI dashboard + scan
+# 3b — Real-time TUI dashboard + scan (recommended)
 python3 tui.py
 
 # 3c — Cron mode (no prompt, Telegram confirm)
@@ -48,21 +50,22 @@ SCANNER_CRON=1 python3 scanner.py
 
 ```
 Trading/
-├── scanner.py              Main scanner engine (indicators, signals, orders, state)
+├── config.py               Single source of truth for all settings (reads from .env)
+├── scanner.py              Core engine — indicators, signals, orders, state, Telegram
 ├── tui.py                  Real-time TUI dashboard (Textual)
-├── tui.tcss                Catppuccin Mocha CSS for the TUI
-├── backtest.py             Historical signal backtester (stdlib only)
-├── run_scanner.sh          Shell wrapper for launchd (loads env + runs cron mode)
-├── state.json              Live scan state — written each run, read by TUI/dashboard
-├── scanner.log             Append-only run log (last 200 lines embedded in state.json)
-├── backtest_results.json   Output of the last backtest run
-└── dashboard.html          Legacy browser dashboard (reads state.json every 30s)
+├── tui.tcss                Catppuccin Mocha theme for the TUI
+├── backtest.py             Walk-forward backtester (stdlib only, no look-ahead)
+├── run_scanner.sh          Shell wrapper for launchd (loads .env, runs cron mode)
+├── requirements.txt        Python dependencies
+├── .env.example            Credential template — copy to .env and fill in values
+├── LICENSE                 MIT
+├── state.json              Runtime state — written each run, read by TUI (gitignored)
+├── scanner.log             Append-only run log (gitignored)
+├── backtest_results.json   Output of last backtest run (gitignored)
+└── dashboard.html          Auto-generated HTML dashboard (gitignored)
 
 ~/Library/LaunchAgents/
-└── com.trading.scanner.plist   launchd job — triggers every 10 minutes
-
-~/.agent/diagrams/
-└── trading-dashboard.html      Auto-generated HTML dashboard (updated each scan)
+└── com.trading.scanner.plist   launchd job — runs every 30 minutes
 ```
 
 > **Never edit `state.json` or `scanner.log` manually** — they are overwritten/appended on every run.
@@ -106,31 +109,31 @@ No stdin prompt. If a signal fires, the scanner sends a Telegram alert and waits
 ## TUI App
 
 ```bash
-pip3 install textual   # one-time
+pip3 install -r requirements.txt   # one-time
 python3 tui.py
 ```
 
 ### Layout
 
 ```
-┌─ Header ──────────────────────────────────────────────────────────┐
-│  ◉ TRADING SCANNER    F&G: 45 Fear  |  BTC $66,395  RSI:52.1 ↑  │
-├─ Left panel (30) ────┬─ Center ─────────────────────────────────── │
-│ PORTFOLIO  $2,706    │  MARKET OVERVIEW                            │
-│ ETH  $1,385  51% ████│  ┌─ETH──┐  ┌─ADA──┐  ┌─DOGE─┐            │
-│ USDC $1,221  45% ███ │  │$2000 │  │$0.248│  │$0.16 │            │
-│ ADA  $100     4% ▌   │  │RSI 44│  │RSI 38│  │RSI 52│            │
-│                      │  │ NONE │  │ NONE │  │ NONE │            │
-│ COOLDOWNS            │  └──────┘  └──────┘  └──────┘            │
-│ None active          │  OPEN POSITIONS (live P&L)                 │
-│                      │  TRADE HISTORY  (last 10)                  │
-│ PERFORMANCE          │                                            │
-│ 0W / 0L  —% WR       │                                            │
-├─ Log strip ──────────┴──────────────────────────────────────────── │
-│  10:01:30  ETH RSI 44.5 — NONE | ADA RSI 38.2 — NONE             │
-├─ Status bar ────────────────────────────────────────────────────── │
-│  [S] Scan  [R] Refresh  [P] Panel  [L] Log  [Q] Quit              │
-└───────────────────────────────────────────────────────────────────┘
+┌─ Header ───────────────────────────────────────────────────────────────┐
+│  ◉ TRADING SCANNER   F&G: 45 Fear  │  BTC $66,395  RSI:52.1 ↑  ████  │
+├─ Left panel (30) ────┬─ Market ─ Positions ─ History ─ Backtest ───── │
+│ PORTFOLIO  $2,706    │  ┌─ ETHUSDC ──────┐  ┌─ ADAUSDC ──────┐        │
+│ ETH  51%  ████████   │  │ $1,998   RSI 44│  │ $0.248   RSI 38│        │
+│ USDC 45%  ███████    │  │ 1d:52  NONE    │  │ 1d:41  NONE    │        │
+│ ADA   4%  ▌          │  │ ▁▂▃▄▅▆▇█▇▆▅   │  │ ▃▃▄▅▆▇▇▆▇█▇   │        │
+│                      │  └────────────────┘  └────────────────┘        │
+│ COOLDOWNS            │                                                  │
+│ None active          │                                                  │
+│                      │                                                  │
+│ PERFORMANCE          │                                                  │
+│ 0W / 0L  —% WR       │                                                  │
+├─ Log strip ──────────┴──────────────────────────────────────────────── │
+│  10:01:30  ETH RSI 44.5 1d:52 — NONE | ADA RSI 38.2 1d:41 — NONE     │
+├─ Status bar ───────────────────────────────────────────────────────── │
+│  [S] Scan [R] Refresh [P] Panel [E] Equity [C] Settings [L] Log [Q]  │
+└────────────────────────────────────────────────────────────────────── ┘
 ```
 
 ### Key bindings
@@ -140,6 +143,8 @@ python3 tui.py
 | `S` | Run a full scan now |
 | `R` | Re-read `state.json` from disk |
 | `P` | Toggle left portfolio panel |
+| `E` | Toggle left panel: portfolio ↔ equity curve |
+| `C` | Open settings (scan interval) |
 | `L` | Toggle log strip |
 | `Q` | Quit |
 
@@ -176,6 +181,21 @@ The TUI and the launchd cron job are independent. When cron writes `state.json`,
 ### Pairs monitored
 
 `ETHUSDC` · `ADAUSDC` · `DOGEUSDC` · `BNBUSDC` · `SOLUSDC` · `XRPUSDC`
+
+### Timeframes
+
+- **1h candles** — signal generation (RSI, SMA, volume, ATR)
+- **1d candles** — trend filter (fetched per pair, last 30 daily candles)
+
+The daily timeframe classifies each pair's broader trend before the 1h signal is evaluated:
+
+| Daily state | daily RSI | Price vs SMA20 | Effect |
+|-------------|-----------|----------------|--------|
+| **Bullish** | > 45 | above | MODERATE allowed |
+| **Neutral** | 30–45 | any | STRONG allowed, MODERATE blocked |
+| **Bearish** | < 30 | below | STRONG blocked, EXTREME still fires |
+
+EXTREME signals bypass the daily filter — deep oversold readings are entries regardless of trend.
 
 ### Market filters (fetched once per scan)
 
@@ -250,7 +270,7 @@ Used for dynamic SL/TP sizing in `place_buy_order()`.
 
 ## Configuration Reference
 
-All constants are at the top of `scanner.py`:
+All settings live in `config.py` — edit only this file, never `scanner.py` directly:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -389,18 +409,14 @@ Reads `state.json` and auto-refreshes every 30 seconds.
 ### Setup
 
 ```bash
-# 1 — Create bot via @BotFather, copy token
-# 2 — Store token
-echo "SCANNER_TELEGRAM_TOKEN=your_bot_token" >> ~/.env
-
-# 3 — Pair your chat ID (Claude Code skill)
-/telegram:configure
+# 1 — Create a bot via @BotFather on Telegram, copy the token
+# 2 — Get your numeric chat ID via @userinfobot or @RawDataBot
+# 3 — Add to .env:
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_numeric_chat_id
 ```
 
 In cron mode, reply `CONFIRM` or `SKIP` to the bot within 120 seconds after a signal alert.
-
-Token priority: env var → `<project>/.env` → `~/.env`.
-Chat ID is read from `~/.claude/channels/telegram/access.json`.
 
 ---
 
@@ -436,26 +452,27 @@ tail -f /Users/jebog/Documents/Claude/Projects/Trading/scanner.log
 
 ## Credentials
 
-Read in priority order:
-1. `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` environment variables
-2. `<project>/.env`
-3. `~/.env`
+Credentials are loaded from the `.env` file in the project root (via `python-dotenv`):
 
 ```bash
+cp .env.example .env
+# Then edit .env:
 BINANCE_API_KEY=your_api_key
 BINANCE_SECRET_KEY=your_secret_key
-chmod 600 ~/.env
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_numeric_chat_id
+chmod 600 .env
 ```
 
-Spot trading permission is required to place orders. Market data (klines, ticker) works without authentication.
+Spot trading permission is required on the Binance API key to place orders. Market data (klines, ticker) works without authentication. `.env` is gitignored and will never be committed.
 
 ---
 
 ## Troubleshooting
 
-### `No module named 'textual'`
+### `No module named 'textual'` / `No module named 'dotenv'`
 ```bash
-pip3 install textual
+pip3 install -r requirements.txt
 ```
 
 ### TUI crashes with `TypeError: 'dict' object is not callable`

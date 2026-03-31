@@ -4,6 +4,8 @@ Binance Trading Scanner
 Config: ETH/ADA/DOGE/BNB (USDC pairs) | $200/trade | SL -3% | TP +7.5%
 """
 
+from __future__ import annotations
+
 import math
 import os
 import json
@@ -14,6 +16,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from typing import Any, Optional
 
 SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE  = os.path.join(SCANNER_DIR, "state.json")
@@ -26,10 +29,10 @@ class TeeLogger:
     def __init__(self):
         self._log = open(LOG_FILE, "a", buffering=1)
         self._stdout = sys.__stdout__
-    def write(self, msg):
+    def write(self, msg: str) -> None:
         self._stdout.write(msg)
         self._log.write(msg)
-    def flush(self):
+    def flush(self) -> None:
         self._stdout.flush()
         self._log.flush()
 
@@ -51,7 +54,7 @@ from config import (
     INTERVAL, KLINE_LIMIT,
 )
 
-def send_telegram(text):
+def send_telegram(text: str) -> None:
     """Send a message to the paired Telegram user (non-blocking)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -73,7 +76,7 @@ def send_telegram(text):
             print(f"  ⚠ Telegram failed: {e}")
     threading.Thread(target=_post, daemon=True).start()
 
-def send_telegram_sync(text):
+def send_telegram_sync(text: str) -> None:
     """Send a Telegram message synchronously (blocking). Used before polling replies."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -92,7 +95,7 @@ def send_telegram_sync(text):
     except Exception as e:
         print(f"  ⚠ Telegram sync send failed: {e}")
 
-def telegram_get_updates(offset, timeout_sec):
+def telegram_get_updates(offset: int, timeout_sec: int) -> list[dict[str, Any]]:
     """Long-poll Telegram getUpdates. Returns list of update dicts."""
     url = (f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
            f"?offset={offset}&timeout={timeout_sec}")
@@ -104,7 +107,7 @@ def telegram_get_updates(offset, timeout_sec):
         print(f"  ⚠ Telegram poll failed: {e}")
         return []
 
-def wait_telegram_confirm(symbol, timeout=120):
+def wait_telegram_confirm(symbol: str, timeout: int = 120) -> bool:
     """
     Send a CONFIRM/SKIP prompt then long-poll for the user's reply.
     Returns True on CONFIRM, False on SKIP or timeout.
@@ -143,7 +146,7 @@ def wait_telegram_confirm(symbol, timeout=120):
     send_telegram_sync(f"⏰ `{symbol}` — timed out, no order placed.")
     return False
 
-def call_webhook(signal):
+def call_webhook(signal: dict[str, Any]) -> None:
     """POST signal data to Claude Terminal webhook (non-blocking)."""
     if not WEBHOOK_URL:
         return
@@ -158,14 +161,19 @@ def call_webhook(signal):
             print(f"  ⚠ Webhook call failed: {e}")
     threading.Thread(target=_post, daemon=True).start()
 
-def notify_mac(title, message):
+def notify_mac(title: str, message: str) -> None:
     """Send a native macOS notification."""
     title   = title.replace("\\", "\\\\").replace('"', '\\"')
     message = message.replace("\\", "\\\\").replace('"', '\\"')
     script  = f'display notification "{message}" with title "{title}" sound name "Ping"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
-def save_state(results, signals, new_trades=None, portfolio=None):
+def save_state(
+    results: list[dict[str, Any]],
+    signals: list[dict[str, Any]],
+    new_trades: Optional[list[dict[str, Any]]] = None,
+    portfolio: Optional[dict[str, Any]] = None,
+) -> None:
     """Save last scan results to state.json for the dashboard."""
     try:
         state = {"last_scan": datetime.now().isoformat(), "results": results, "signals": signals,
@@ -198,7 +206,7 @@ def save_state(results, signals, new_trades=None, portfolio=None):
 BASE_URL = "https://api.binance.com"
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
-def get(path, params=None):
+def get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     url = BASE_URL + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -209,14 +217,14 @@ def get(path, params=None):
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
 
-def signed_get(path, params):
+def signed_get(path: str, params: dict[str, Any]) -> Any:
     params["timestamp"] = int(time.time() * 1000)
     query = urllib.parse.urlencode(params)
     sig = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
     params["signature"] = sig
     return get(path, params)
 
-def signed_post(path, params):
+def signed_post(path: str, params: dict[str, Any]) -> Any:
     params["timestamp"] = int(time.time() * 1000)
     query = urllib.parse.urlencode(params)
     sig = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
@@ -238,7 +246,7 @@ def signed_post(path, params):
         raise Exception(f"HTTP {e.code} — {body}") from None
 
 # ── Indicators ───────────────────────────────────────────────────────────────
-def calc_rsi(closes, period=14):
+def calc_rsi(closes: list[float], period: int = 14) -> float:
     """Wilder's EMA RSI — matches TradingView/Binance standard."""
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -258,7 +266,7 @@ def calc_rsi(closes, period=14):
         return 100.0
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
-def calc_atr(klines, period=14):
+def calc_atr(klines: list[list[Any]], period: int = 14) -> Optional[float]:
     """Wilder's ATR — uses high/low/prev_close from raw klines."""
     trs = []
     for i in range(1, len(klines)):
@@ -274,13 +282,13 @@ def calc_atr(klines, period=14):
         atr = (atr * (period - 1) + tr) / period
     return atr
 
-def calc_sma(closes, period=20):
+def calc_sma(closes: list[float], period: int = 20) -> Optional[float]:
     if len(closes) < period:
         return None  # caller must handle — don't silently return price (price > price = False)
     return sum(closes[-period:]) / period
 
 # ── Market context ───────────────────────────────────────────────────────────
-def get_fear_greed():
+def get_fear_greed() -> tuple[int, str]:
     """Fetch Crypto Fear & Greed index — with state.json cache (valid 25h).
 
     Priority: live fetch → cached value (< 25h old) → fallback 50 + Telegram warning.
@@ -336,7 +344,7 @@ def get_fear_greed():
     send_telegram("⚠️ F&G cache expired — sentiment filter inactive, using neutral 50")
     return 50, "Neutral"
 
-def get_btc_context():
+def get_btc_context() -> dict[str, Any]:  # {rsi: float, above_sma: bool, price: float}
     """Fetch BTC 1h RSI + SMA trend as a market regime filter."""
     try:
         klines = get("/api/v3/klines", {"symbol": "BTCUSDC", "interval": "1h", "limit": 100})
@@ -351,7 +359,7 @@ def get_btc_context():
         return {"rsi": 50.0, "above_sma": True, "price": 0}
 
 # ── Signal logic ─────────────────────────────────────────────────────────────
-def analyze(symbol, context):
+def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     klines = get("/api/v3/klines", {"symbol": symbol, "interval": INTERVAL, "limit": KLINE_LIMIT})
     closed = klines[:-1]   # drop the currently-forming candle (incomplete data)
     closes = [float(k[4]) for k in closed]
@@ -441,7 +449,7 @@ def analyze(symbol, context):
     }
 
 # ── Open position guard ──────────────────────────────────────────────────────
-def has_open_position(symbol):
+def has_open_position(symbol: str) -> bool:
     """Return True if there is already an open order or OCO for this symbol."""
     try:
         open_orders = signed_get("/api/v3/openOrders", {"symbol": symbol})
@@ -457,7 +465,7 @@ def has_open_position(symbol):
     return False
 
 # ── Portfolio ────────────────────────────────────────────────────────────────
-def get_open_positions():
+def get_open_positions() -> list[dict[str, Any]]:
     """Return open positions with live P&L, sourced from OCO list + state.json trades."""
     try:
         ocos = signed_get("/api/v3/openOrderList", {})
@@ -504,7 +512,7 @@ def get_open_positions():
         })
     return positions
 
-def get_portfolio():
+def get_portfolio() -> Optional[dict[str, Any]]:
     """Fetch account balances + live USDC prices → portfolio snapshot.
 
     Returns a dict:
@@ -565,7 +573,7 @@ def get_portfolio():
     }
 
 # ── Cooldown helpers ─────────────────────────────────────────────────────────
-def _load_cooldowns():
+def _load_cooldowns() -> dict[str, str]:
     """Return {symbol: expiry_iso} from state.json, pruning expired entries."""
     if not os.path.exists(STATE_FILE):
         return {}
@@ -578,7 +586,7 @@ def _load_cooldowns():
     except Exception:
         return {}
 
-def _save_sent_signals(sent_signals: dict) -> None:
+def _save_sent_signals(sent_signals: dict[str, str]) -> None:
     """Patch sent_signals into state.json without touching other fields."""
     if not os.path.exists(STATE_FILE):
         return
@@ -591,7 +599,7 @@ def _save_sent_signals(sent_signals: dict) -> None:
     except Exception:
         pass
 
-def _save_cooldown(symbol):
+def _save_cooldown(symbol: str) -> None:
     """Record a SL-cooldown for symbol for SL_COOLDOWN_H hours."""
     try:
         state = {}
@@ -607,7 +615,7 @@ def _save_cooldown(symbol):
     except Exception:
         pass
 
-def _check_sl_outcomes():
+def _check_sl_outcomes() -> None:
     """Check closed OCO orders — if stop leg filled, trigger SL cooldown."""
     if not os.path.exists(STATE_FILE):
         return
@@ -660,7 +668,12 @@ def _check_sl_outcomes():
         print(f"  ⚠ SL outcome check failed: {e}")
 
 # ── Order placement ──────────────────────────────────────────────────────────
-def place_buy_order(symbol, capital, price, closed_klines=None):
+def place_buy_order(
+    symbol: str,
+    capital: float,
+    price: float,
+    closed_klines: Optional[list[list[Any]]] = None,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any]]:
     """Place market buy + OCO (TP/SL). Uses ATR-based SL/TP if ATR_SL_MULT > 0 and klines supplied."""
     qty_raw = capital / price
     # Get lot size filter
@@ -786,7 +799,7 @@ def place_buy_order(symbol, capital, price, closed_klines=None):
     return order, oco, trade
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
-def generate_dashboard(state):
+def generate_dashboard(state: dict[str, Any]) -> None:
     """Generate a self-contained HTML dashboard from scan state and write to ~/.agent/diagrams/trading-dashboard.html"""
     DASHBOARD_FILE = os.path.join(os.path.expanduser("~/.agent/diagrams"), "trading-dashboard.html")
 
@@ -1299,13 +1312,13 @@ def generate_dashboard(state):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-def _escape_md(text):
+def _escape_md(text: Any) -> str:
     """Escape Telegram Markdown special characters in arbitrary strings (e.g. exceptions)."""
     for ch in ("*", "_", "`", "[", "]"):
         text = str(text).replace(ch, "\\" + ch)
     return text
 
-def _calc_capital(s, context):
+def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
     """Central capital-sizing rule — single source of truth.
 
     EXTREME + quality (above SMA, F&G<40) → full CAPITAL ($200)
@@ -1319,7 +1332,7 @@ def _calc_capital(s, context):
         return CAPITAL / 2
     return CAPITAL
 
-def _estimate_sl_tp_pct(s):
+def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
     """Estimate SL/TP % for pre-order display — mirrors place_buy_order ATR logic."""
     if ATR_SL_MULT > 0 and s.get("closed_klines"):
         atr = calc_atr(s["closed_klines"])
@@ -1331,7 +1344,7 @@ def _estimate_sl_tp_pct(s):
     return STOP_LOSS, TAKE_PROFIT
 
 # ── Main scan ────────────────────────────────────────────────────────────────
-def scan():
+def scan() -> None:
     print(f"\n--- {datetime.now().strftime('%a. %d %b %Y %H:%M:%S')} ---")
     print(f"\n{'='*55}")
     print(f"  TRADING SCANNER — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

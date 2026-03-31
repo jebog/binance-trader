@@ -9,12 +9,15 @@ Filters:   No Fear & Greed or BTC context filter applied
 Data:      Binance public klines API, 1h, 1000 candles (~41 days) per pair.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from typing import Any, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 from config import (
@@ -34,7 +37,7 @@ RESULTS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtes
 
 # ── Indicator functions (copied verbatim from scanner.py) ─────────────────────
 
-def calc_rsi(closes, period=14):
+def calc_rsi(closes: list[float], period: int = 14) -> float:
     """Wilder's EMA RSI — matches TradingView/Binance standard."""
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -55,7 +58,7 @@ def calc_rsi(closes, period=14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def calc_atr(klines, period=14):
+def calc_atr(klines: list[list[Any]], period: int = 14) -> Optional[float]:
     """Wilder's ATR — uses high/low/prev_close from raw klines."""
     trs = []
     for i in range(1, len(klines)):
@@ -72,7 +75,7 @@ def calc_atr(klines, period=14):
     return atr
 
 
-def calc_sma(closes, period=20):
+def calc_sma(closes: list[float], period: int = 20) -> Optional[float]:
     if len(closes) < period:
         return None
     return sum(closes[-period:]) / period
@@ -80,7 +83,7 @@ def calc_sma(closes, period=20):
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
-def fetch_klines(symbol, interval=INTERVAL, limit=KLINE_LIMIT):
+def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT) -> list[list[Any]]:
     """Fetch klines from Binance public API (no auth required)."""
     url = "https://api.binance.com/api/v3/klines?" + urllib.parse.urlencode({
         "symbol":   symbol,
@@ -104,7 +107,7 @@ def fetch_klines(symbol, interval=INTERVAL, limit=KLINE_LIMIT):
 
 # ── Signal logic (mirrors scanner.py analyze(), no F&G / BTC filter) ──────────
 
-def compute_signal(window_klines):
+def compute_signal(window_klines: list[list[Any]]) -> tuple[str, float, bool, bool, bool, Optional[float], float]:
     """
     Given a list of WINDOW closed klines, compute the signal tier.
     Returns: (signal_str, rsi, above_sma, vol_surge, momentum_up, atr, price)
@@ -145,7 +148,7 @@ def compute_signal(window_klines):
 
 # ── Per-symbol backtest ────────────────────────────────────────────────────────
 
-def backtest_symbol(symbol, klines):
+def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]]:
     """
     Rolling-window simulation over all klines for one symbol.
     Returns list of trade dicts.
@@ -249,7 +252,7 @@ def backtest_symbol(symbol, klines):
 
 # ── Stats helpers ──────────────────────────────────────────────────────────────
 
-def compute_stats(trades):
+def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     if not trades:
         return {
             "n": 0, "wins": 0, "losses": 0, "timeouts": 0,
@@ -288,7 +291,7 @@ def compute_stats(trades):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def _print_stats_row(label: str, s: dict, trades: list, suffix: str = "") -> None:
+def _print_stats_row(label: str, s: dict[str, Any], trades: list[dict[str, Any]], suffix: str = "") -> None:
     from collections import Counter
     c   = Counter(t["signal"] for t in trades)
     sig = " ".join(f"{k[0]}{k[1:3].lower()}:{c[k]}" for k in ["EXTREME","STRONG","MODERATE"] if c[k]) or "—"
@@ -300,7 +303,7 @@ def _print_stats_row(label: str, s: dict, trades: list, suffix: str = "") -> Non
     )
 
 
-def main():
+def main() -> None:
     from collections import Counter
     print()
     print("══════════════════════════════════════════════════════════════")

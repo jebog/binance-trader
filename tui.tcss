@@ -121,12 +121,50 @@ Screen {
 .perf-positive { color: $green; }
 .perf-neutral  { color: $muted; }
 
-/* ── Center panel ────────────────────────────────── */
-#center-panel {
+/* ── Center panel (TabbedContent) ───────────────── */
+#center-tabs {
     width: 1fr;
     height: 100%;
+}
+
+/* ContentSwitcher is the direct parent of TabPane inside TabbedContent —
+   anchor it so 1fr on TabPane/DataTable resolves against a real height */
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
     padding: 0 1;
+    height: 1fr;
     overflow-y: auto;
+}
+
+/* Tab bar styling */
+Tabs {
+    background: $surface;
+    border-bottom: solid $overlay;
+    height: 3;
+}
+
+Tab {
+    color: $subtext;
+    padding: 0 2;
+}
+
+Tab:focus {
+    color: $text;
+    background: $overlay;
+}
+
+Tab.-active {
+    color: $blue;
+    text-style: bold;
+    background: $bg;
+}
+
+Tab:hover {
+    background: $overlay;
+    color: $text;
 }
 
 /* ── Pair grid ───────────────────────────────────── */
@@ -171,18 +209,11 @@ Screen {
 .pair-change-pos { color: $green; }
 .pair-change-neg { color: $red;   }
 
-/* ── Section headers ─────────────────────────────── */
-.section-header {
-    color: $subtext;
-    text-style: bold;
-    margin: 1 0 0 0;
-}
 
 /* ── DataTable (positions + history) ─────────────── */
 DataTable {
     background: $bg;
-    height: auto;
-    max-height: 10;
+    height: 1fr;
     margin-bottom: 1;
 }
 

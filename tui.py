@@ -31,6 +31,8 @@ from textual.widgets import (
     ProgressBar,
     RichLog,
     Static,
+    TabbedContent,
+    TabPane,
 )
 
 # ── Import scanner functions ──────────────────────────────────────────────────
@@ -400,7 +402,7 @@ class ScannerApp(App):
 
         # ── Main body
         with Horizontal(id="main-layout"):
-            # Left panel
+            # Left panel — portfolio / cooldowns / performance
             with Vertical(id="left-panel"):
                 yield Label("PORTFOLIO", classes="panel-title")
                 yield Label("─" * 26, classes="panel-divider")
@@ -413,27 +415,26 @@ class ScannerApp(App):
                 yield Label("PERFORMANCE", classes="panel-title")
                 yield Label("─" * 26, classes="panel-divider")
                 yield PerformanceWidget(id="perf-widget")
-                yield Label("")
-                yield Label("BACKTEST", classes="panel-title")
-                yield Label("─" * 26, classes="panel-divider")
-                yield BacktestWidget(id="backtest-widget")
 
-            # Center panel
-            with Vertical(id="center-panel"):
-                yield Label("MARKET OVERVIEW", classes="section-header")
-                with Container(id="pairs-grid"):
-                    for sym in PAIRS:
-                        yield PairCard(sym)
+            # Center panel — tabbed: Market / Positions / History / Backtest
+            with TabbedContent(id="center-tabs"):
+                with TabPane("Market", id="tab-market"):
+                    with Container(id="pairs-grid"):
+                        for sym in PAIRS:
+                            yield PairCard(sym)
 
-                yield Label("OPEN POSITIONS", classes="section-header")
-                positions_table = DataTable(id="positions-table", show_cursor=False)
-                positions_table.add_columns("Symbol", "Qty", "Entry", "Current", "TP", "SL", "P&L")
-                yield positions_table
+                with TabPane("Positions", id="tab-positions"):
+                    positions_table = DataTable(id="positions-table", show_cursor=False)
+                    positions_table.add_columns("Symbol", "Qty", "Entry", "Current", "TP", "SL", "P&L")
+                    yield positions_table
 
-                yield Label("TRADE HISTORY  (last 10)", classes="section-header")
-                history_table = DataTable(id="history-table", show_cursor=False)
-                history_table.add_columns("Time", "Symbol", "Entry", "Outcome", "Signal")
-                yield history_table
+                with TabPane("History", id="tab-history"):
+                    history_table = DataTable(id="history-table", show_cursor=False)
+                    history_table.add_columns("Time", "Symbol", "Entry", "Outcome", "Signal")
+                    yield history_table
+
+                with TabPane("Backtest", id="tab-backtest"):
+                    yield BacktestWidget(id="backtest-widget")
 
         # ── Log strip
         yield RichLog(id="log-strip", highlight=True, markup=True,
@@ -443,7 +444,8 @@ class ScannerApp(App):
         with Horizontal(id="status-bar"):
             yield Label(
                 "[dim][S][/] Scan  [dim][R][/] Refresh  "
-                "[dim][P][/] Panel  [dim][L][/] Log  [dim][Q][/] Quit",
+                "[dim][P][/] Panel  [dim][L][/] Log  "
+                "[dim][Tab][/] Switch tab  [dim][Q][/] Quit",
                 id="status-keys",
             )
             yield Label("", id="status-last-scan")

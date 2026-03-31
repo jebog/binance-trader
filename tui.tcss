@@ -179,7 +179,17 @@ Tab:hover {
     background: $surface;
     border: solid $overlay;
     padding: 0 1;
-    height: 7;
+    height: 9;
+    layout: vertical;
+}
+
+.pair-info {
+    height: auto;
+}
+
+.pair-spark {
+    height: 2;
+    margin-top: 0;
 }
 
 .pair-card.EXTREME { border: solid $red;    }

@@ -20,16 +20,19 @@ from typing import Any
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.color import Color
 from textual.containers import Container, Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     DataTable,
     Label,
     ProgressBar,
     RichLog,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
@@ -172,13 +175,26 @@ class OrderConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+# Sparkline tint per signal tier — module-level constant, consistent with M_* palette
+_SPARK_COLOR: dict[str, str] = {
+    "EXTREME":  M_RED,
+    "STRONG":   M_ORANGE,
+    "MODERATE": M_YELLOW,
+    "NONE":     M_BLUE,
+}
+
+
 # ── Widgets ───────────────────────────────────────────────────────────────────
-class PairCard(Static):
-    """Displays one trading pair with RSI, price, signal tier."""
+class PairCard(Widget):
+    """Displays one trading pair: text info block + Sparkline price chart."""
 
     def __init__(self, symbol: str):
         super().__init__(id=f"pair-{symbol.lower()}", classes="pair-card")
         self.symbol = symbol
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="pair-info")
+        yield Sparkline([], summary_function=max, classes="pair-spark")
 
     def render_for(self, result: dict | None) -> str:
         if result is None:
@@ -232,11 +248,24 @@ class PairCard(Static):
         )
 
     def update_result(self, result: dict | None) -> None:
-        self.update(self.render_for(result))
+        # Update text block
+        self.query_one(".pair-info", Static).update(self.render_for(result))
+
+        # Update border class
         tier = (result or {}).get("signal_strength", "NONE")
         self.remove_class("EXTREME", "STRONG", "MODERATE")
         if tier != "NONE":
             self.add_class(tier)
+
+        # Update sparkline: data + tint color
+        # set_styles() does NOT affect Sparkline rendering — must use max_color/min_color
+        spark  = self.query_one(".pair-spark", Sparkline)
+        klines = (result or {}).get("closed_klines") or []
+        if klines:
+            spark.data = [float(k[4]) for k in klines[-20:]]
+            tint = Color.parse(_SPARK_COLOR.get(tier, M_BLUE))
+            spark.max_color = tint
+            spark.min_color = tint
 
 
 class PortfolioWidget(Static):
@@ -520,7 +549,15 @@ class ScannerApp(App):
                         timeout=15,
                     )
 
-        # Refresh widgets
+        # Populate pair card sparklines from disk state (gives instant charts on startup)
+        results_by_symbol = {r["symbol"]: r for r in (state.get("results") or [])}
+        for sym in PAIRS:
+            result = results_by_symbol.get(sym)
+            if result and result.get("closed_klines"):
+                card = self.query_one(f"#pair-{sym.lower()}", PairCard)
+                card.update_result(result)
+
+        # Refresh left-panel widgets
         self.query_one("#cooldown-widget", CooldownWidget).update_cooldowns(self._cooldowns)
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
         if self._portfolio:

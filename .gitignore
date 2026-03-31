@@ -1,7 +1,5 @@
 # ── Secrets & credentials ─────────────────────────────────────────────────────
 .env
-# config.py committed only after feature/secrets-migration (credentials must be removed first)
-config.py
 
 # ── Runtime / generated files ─────────────────────────────────────────────────
 state.json

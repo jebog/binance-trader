@@ -127,7 +127,13 @@ Screen {
     height: 100%;
 }
 
-TabbedContent > TabPane {
+/* ContentSwitcher is the direct parent of TabPane inside TabbedContent —
+   anchor it so 1fr on TabPane/DataTable resolves against a real height */
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
     padding: 0 1;
     height: 1fr;
     overflow-y: auto;
@@ -203,12 +209,6 @@ Tab:hover {
 .pair-change-pos { color: $green; }
 .pair-change-neg { color: $red;   }
 
-/* ── Section headers ─────────────────────────────── */
-.section-header {
-    color: $subtext;
-    text-style: bold;
-    margin: 1 0 0 0;
-}
 
 /* ── DataTable (positions + history) ─────────────── */
 DataTable {

@@ -96,6 +96,17 @@ Screen {
     margin: 0;
 }
 
+/* ── ContentSwitcher + LoadingIndicator ─────────── */
+#left-switcher {
+    height: auto;
+    max-height: 12;
+}
+
+LoadingIndicator {
+    height: 3;
+    color: $teal;
+}
+
 /* ── Portfolio ───────────────────────────────────── */
 #portfolio-total {
     color: $teal;
@@ -107,6 +118,21 @@ Screen {
 }
 
 /* asset bar colours now use M_* hex constants inline in tui.py */
+
+/* ── Equity widget ───────────────────────────────── */
+#equity-widget {
+    height: auto;
+    max-height: 12;
+}
+
+#equity-spark {
+    height: 4;
+}
+
+#equity-stats {
+    color: $subtext;
+    margin-top: 1;
+}
 
 /* ── Cooldowns ───────────────────────────────────── */
 .cooldown-active {
@@ -312,6 +338,21 @@ OrderConfirmModal {
 
 .modal-label { color: $subtext; width: 12; }
 .modal-value { color: $text;    width: 1fr; }
+
+/* Settings modal — wider label column for "Scan interval (s):" */
+SettingsModal .modal-label { width: 20; }
+
+/* Settings modal Input */
+SettingsModal Input {
+    width: 1fr;
+    background: $bg;
+    color: $text;
+    border: solid $overlay;
+}
+
+SettingsModal Input:focus {
+    border: solid $blue;
+}
 .modal-value-tp  { color: $green; }
 .modal-value-sl  { color: $red;   }
 .modal-value-cap { color: $teal;  }

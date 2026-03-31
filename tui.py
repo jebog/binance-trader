@@ -20,10 +20,12 @@ from typing import Any
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.color import Color
 from textual.containers import Container, Horizontal, Vertical
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     DataTable,
@@ -173,17 +175,18 @@ class OrderConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+# Sparkline tint per signal tier — module-level constant, consistent with M_* palette
+_SPARK_COLOR: dict[str, str] = {
+    "EXTREME":  M_RED,
+    "STRONG":   M_ORANGE,
+    "MODERATE": M_YELLOW,
+    "NONE":     M_BLUE,
+}
+
+
 # ── Widgets ───────────────────────────────────────────────────────────────────
 class PairCard(Widget):
     """Displays one trading pair: text info block + Sparkline price chart."""
-
-    # Sparkline color per signal tier
-    _SPARK_COLOR = {
-        "EXTREME":  M_RED,
-        "STRONG":   M_ORANGE,
-        "MODERATE": M_YELLOW,
-        "NONE":     M_BLUE,
-    }
 
     def __init__(self, symbol: str):
         super().__init__(id=f"pair-{symbol.lower()}", classes="pair-card")
@@ -254,12 +257,15 @@ class PairCard(Widget):
         if tier != "NONE":
             self.add_class(tier)
 
-        # Update sparkline with last 20 close prices (tinted by signal tier)
-        spark = self.query_one(".pair-spark", Sparkline)
+        # Update sparkline: data + tint color
+        # set_styles() does NOT affect Sparkline rendering — must use max_color/min_color
+        spark  = self.query_one(".pair-spark", Sparkline)
         klines = (result or {}).get("closed_klines") or []
         if klines:
             spark.data = [float(k[4]) for k in klines[-20:]]
-        spark.set_styles(f"color: {self._SPARK_COLOR.get(tier, M_BLUE)};")
+            tint = Color.parse(_SPARK_COLOR.get(tier, M_BLUE))
+            spark.max_color = tint
+            spark.min_color = tint
 
 
 class PortfolioWidget(Static):

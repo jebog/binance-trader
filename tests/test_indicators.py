@@ -186,6 +186,11 @@ class TestAnalyzeSignalTiers:
     """
     analyze() makes two real API calls: get() (klines + ticker) and get() for daily.
     We patch scanner.get to return synthetic klines and ticker data.
+
+    For signal-tier boundary tests (F&G guard, BTC-SMA guard, daily filter) we also
+    patch scanner.calc_rsi to return a precise value without crafting exact price series.
+    The mock distinguishes 1h from daily by list length: daily closes ≈ 29 items,
+    1h closes ≈ 99 items (KLINE_LIMIT=100 minus the forming candle).
     """
 
     def _run_analyze(self, h1_closes: list[float], d1_closes: list[float],
@@ -226,6 +231,80 @@ class TestAnalyzeSignalTiers:
         with patch.object(scanner, "get", side_effect=fake_get):
             return scanner.analyze("ETHUSDC", context)
 
+    def _run_analyze_rsi_controlled(
+        self,
+        h1_rsi: float,
+        fg: int,
+        btc_above: bool,
+        daily_rsi: float,
+        vol_surge: bool = True,
+        above_sma: bool = True,
+        momentum_up: bool = True,
+    ) -> dict:
+        """
+        Test signal tier logic with a controlled RSI value and daily regime.
+
+        Patches scanner.calc_rsi so:
+          - calls with len(closes) < 50 → daily_rsi  (daily: ~29 values)
+          - calls with len(closes) >= 50 → h1_rsi    (1h: ~99 values)
+
+        Klines are built flat at 100.0 with structural tweaks for above_sma,
+        vol_surge, and momentum_up — SMA and volume are exact, not approximate.
+        """
+        import scanner
+
+        price = 100.0
+        vol_base = 1000.0
+
+        # Build h1 closes: flat except last 5 adjusted for above_sma + momentum_up
+        #   SMA20 = avg of last 20 closes. If all are `price` except last = price+delta:
+        #     SMA20 = (19*price + (price+delta)) / 20 = price + delta/20
+        #     above_sma ⟺ last_close > SMA20 ⟺ delta > 0
+        sma_delta = +1.0 if above_sma else -1.0
+        mom_delta  = +0.5 if momentum_up else -0.5   # closes[-1] vs closes[-5]
+
+        h1_closes = [price] * 99
+        h1_closes[-1]  = price + sma_delta + mom_delta   # last close
+        h1_closes[-5]  = price + sma_delta               # 5th-from-last
+
+        h1_klines = []
+        for i, c in enumerate(h1_closes):
+            v = vol_base * (1.5 if vol_surge and i == len(h1_closes) - 1 else 0.8)
+            h1_klines.append([i, str(c), str(c*1.005), str(c*0.995), str(c), str(v),
+                               None, None, None, None, None, None])
+        h1_klines.append(h1_klines[-1][:])   # dummy forming candle
+
+        # Build d1 closes: flat so d_above_sma = (delta > 0)
+        # daily_bullish = daily_rsi > 45 AND d_above_sma
+        # For daily_bullish state: daily_rsi > 45 → use +1 delta (price above SMA)
+        # For daily_neutral:       daily_rsi in [30,45] → above_sma doesn't matter for neutral
+        # For daily_bearish:       daily_rsi < 30 → below SMA to also fail above_sma check
+        d_delta = +1.0 if daily_rsi > 45 else -1.0
+        d_closes = [price] * 29
+        d_closes[-1] = price + d_delta
+
+        d_klines = []
+        for i, c in enumerate(d_closes):
+            d_klines.append([i, str(c), str(c*1.005), str(c*0.995), str(c), "1000",
+                              None, None, None, None, None, None])
+        d_klines.append(d_klines[-1][:])
+
+        ticker = {"priceChangePercent": "0.5"}
+        context = {"fg_value": fg, "btc_rsi": 50.0, "btc_above_sma": btc_above}
+
+        def fake_get(path, params=None):
+            if "ticker" in path:
+                return ticker
+            interval = (params or {}).get("interval", "1h")
+            return d_klines if interval == "1d" else h1_klines
+
+        def mock_calc_rsi(closes, period=14):
+            return daily_rsi if len(closes) < 50 else h1_rsi
+
+        with patch.object(scanner, "get", side_effect=fake_get), \
+             patch.object(scanner, "calc_rsi", side_effect=mock_calc_rsi):
+            return scanner.analyze("ETHUSDC", context)
+
     def test_extreme_signal_rsi_below_25(self):
         # RSI < 25: need many consecutive drops
         closes = [100.0 - i * 2 for i in range(50)]  # strong downtrend → low RSI
@@ -248,40 +327,99 @@ class TestAnalyzeSignalTiers:
         assert result["signal_strength"] == "EXTREME"
 
     def test_fg_blocks_moderate_above_60(self):
-        # Even with vol_surge + above SMA + RSI ~35, high F&G blocks MODERATE
-        closes = [100.0 - i * 0.8 for i in range(40)] + [72.0 + i * 0.2 for i in range(10)]
-        context = {"fg_value": 65, "btc_rsi": 50.0, "btc_above_sma": True}
-        result = self._run_analyze(closes, closes[-29:], context, vol_surge=True)
-        # MODERATE blocked by F&G ≥ 60; STRONG may fire depending on RSI
-        assert result["signal_strength"] in ("STRONG", "NONE")
+        # MODERATE fires at F&G=30, is blocked at F&G=65.
+        # Uses controlled RSI=37 in the MODERATE band [32,40].
+        # daily_rsi=55 (bullish) ensures the daily filter doesn't fire first.
+        result_allowed = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        assert result_allowed["signal_strength"] == "MODERATE"
+
+        result_blocked = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=65, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        # F&G ≥ 60: MODERATE blocked. RSI=37 is also in STRONG range (< 40 but ≥ 32)
+        # so STRONG fires if daily not bearish (daily_rsi=55 → bullish, allowed).
+        # But STRONG requires rsi < 32 — rsi=37 is outside STRONG band.
+        assert result_blocked["signal_strength"] == "NONE"
 
     def test_btc_below_sma_blocks_moderate(self):
-        # BTC below its SMA should block MODERATE
-        closes = [100.0 - i * 0.8 for i in range(40)] + [72.0 + i * 0.2 for i in range(10)]
-        context = {"fg_value": 30, "btc_rsi": 50.0, "btc_above_sma": False}
-        result = self._run_analyze(closes, closes[-29:], context, vol_surge=True)
-        assert result["signal_strength"] in ("STRONG", "NONE")
+        # BTC below its 1h SMA20 should block MODERATE specifically.
+        # daily_rsi=55 (bullish) — ensures daily filter is not the blocker.
+        result_allowed = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        assert result_allowed["signal_strength"] == "MODERATE"
+
+        result_blocked = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=False, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        assert result_blocked["signal_strength"] == "NONE"
+
+    def test_strong_blocked_by_daily_bearish(self):
+        # STRONG (RSI < 32) fires on daily_neutral but is blocked on daily_bearish.
+        # daily_rsi=38 → neutral ([30,45], not bullish): STRONG allowed.
+        # daily_rsi=25 → bearish (< 30): STRONG blocked.
+        result_neutral = self._run_analyze_rsi_controlled(
+            h1_rsi=28.0, fg=30, btc_above=True, daily_rsi=38.0,
+            vol_surge=False, above_sma=True, momentum_up=True,
+        )
+        assert result_neutral["signal_strength"] == "STRONG"
+
+        result_bearish = self._run_analyze_rsi_controlled(
+            h1_rsi=28.0, fg=30, btc_above=True, daily_rsi=25.0,
+            vol_surge=False, above_sma=True, momentum_up=True,
+        )
+        assert result_bearish["signal_strength"] == "NONE"
+
+    def test_moderate_requires_daily_bullish_not_neutral(self):
+        # MODERATE requires daily_bullish (RSI > 45 AND above SMA).
+        # daily_neutral (RSI in [30,45]) blocks MODERATE even if all other conditions pass.
+        result_bullish = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        assert result_bullish["signal_strength"] == "MODERATE"
+
+        result_neutral = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=38.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+        )
+        # daily_neutral → daily_bullish=False → MODERATE blocked.
+        # RSI=37 also ≥ 32 so STRONG (rsi < 32) is also blocked. → NONE
+        assert result_neutral["signal_strength"] == "NONE"
 
     def test_result_keys_present(self):
         closes = [100.0 - i for i in range(50)]
         result = self._run_analyze(closes, closes[-29:], _neutral_context())
-        required = {
+        expected_keys = {
             "symbol", "price", "rsi", "daily_rsi", "sma20", "above_sma",
             "vol_surge", "momentum", "change24h", "buy_signal",
             "signal_strength", "extreme_quality", "closed_klines",
         }
-        assert required.issubset(result.keys())
+        assert set(result.keys()) == expected_keys
 
-    def test_extreme_quality_flag(self):
-        # EXTREME + above SMA + F&G < 40 → extreme_quality = True
-        closes = [100.0 - i * 2 for i in range(50)]  # strong downtrend
-        # Last price should still be above SMA20 — ensure upward bias at end
-        sma_base = closes[-20:]
-        context = {"fg_value": 30, "btc_rsi": 50.0, "btc_above_sma": True}
-        result = self._run_analyze(closes, closes[-29:], context)
-        if result["signal_strength"] == "EXTREME":
-            # extreme_quality depends on above_sma — just verify the field exists and is bool
-            assert isinstance(result["extreme_quality"], bool)
+    def test_extreme_quality_falling_knife(self):
+        # Deep downtrend: EXTREME fires but price is below SMA → extreme_quality = False
+        # (falling-knife pattern — capital is halved via _calc_capital)
+        closes = [100.0 - i * 2 for i in range(50)]
+        # SMA20 of last 20 closes: avg(2,4,...,40) = 21.0; last close = 2.0 < 21.0
+        result = self._run_analyze(closes, closes[-29:], _neutral_context())
+        assert result["signal_strength"] == "EXTREME"
+        assert result["extreme_quality"] is False  # below SMA → falling knife
+
+    def test_extreme_quality_true_when_above_sma(self):
+        # RSI < 25 + above_sma + F&G < 40 → extreme_quality = True
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=20.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=False, above_sma=True, momentum_up=True,
+        )
+        assert result["signal_strength"] == "EXTREME"
+        assert result["extreme_quality"] is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -311,8 +449,11 @@ class TestCalcCapital:
         assert self.fn(s, {"btc_rsi": 35.0}) == self.CAPITAL
 
     def test_moderate_always_full_capital(self):
+        # MODERATE takes neither the EXTREME nor the STRONG branch → always full capital
+        # even when BTC RSI is below the 35 threshold that would halve a STRONG order.
         s = {"signal_strength": "MODERATE", "extreme_quality": False}
-        assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL  # BTC RSI ignored for MODERATE
+        assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL  # weak BTC irrelevant for MODERATE
+        assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL  # same result with neutral BTC
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -328,6 +469,12 @@ class TestComputeStats:
         assert s["n"] == 0
         assert s["win_rate"] == 0.0
         assert s["net_pct"] == 0.0
+        # Verify the empty-path dict has the same keys as the non-empty path
+        # (guards against missing keys like avg_to_pct that callers may unconditionally read)
+        non_empty = compute_stats([self._trade("TP", 1.0)])
+        assert set(s.keys()) == set(non_empty.keys()), (
+            f"Empty-path dict missing keys: {set(non_empty.keys()) - set(s.keys())}"
+        )
 
     def test_all_wins(self):
         trades = [self._trade("TP", 7.5) for _ in range(4)]

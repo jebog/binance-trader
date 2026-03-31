@@ -28,6 +28,7 @@ from textual.widgets import (
     Button,
     DataTable,
     Label,
+    ProgressBar,
     RichLog,
     Static,
 )
@@ -371,12 +372,13 @@ class ScannerApp(App):
     btc_above_sma:  reactive[bool]  = reactive(True)
 
     # Internal state (not reactive — updated via message handlers)
-    _pair_results:  list[dict]  = []
-    _portfolio:     dict        = {}
-    _positions:     list[dict]  = []
-    _cooldowns:     dict        = {}
-    _trades:        list[dict]  = []
-    _scan_ctx:      dict        = {}   # market context (fg, btc) — NOT _context (shadows Textual)
+    _pair_results:      list[dict]  = []
+    _portfolio:         dict        = {}
+    _positions:         list[dict]  = []
+    _cooldowns:         dict        = {}
+    _trades:            list[dict]  = []
+    _scan_ctx:          dict        = {}   # market context (fg, btc) — NOT _context (shadows Textual)
+    _notified_outcomes: set         = set()  # (oco_id|time, status) — prevents re-toasting known trades
 
     def compose(self) -> ComposeResult:
         # ── Header
@@ -384,6 +386,12 @@ class ScannerApp(App):
             yield Label("◉ TRADING SCANNER", id="header-title")
             yield Label("",                  id="header-context")
             yield Label("",                  id="header-scan-status")
+            yield ProgressBar(
+                total=len(PAIRS),
+                show_eta=False,
+                show_percentage=False,
+                id="scan-progress",
+            )
 
         # ── Main body
         with Horizontal(id="main-layout"):
@@ -448,6 +456,20 @@ class ScannerApp(App):
         # Load backtest results from disk (shown immediately, no API call)
         self.query_one("#backtest-widget", BacktestWidget).refresh_backtest()
 
+        # Seed known trade outcomes so we don't toast historical tp/sl hits on startup
+        try:
+            with open(STATE_FILE) as f:
+                init_state = json.load(f)
+            for t in (init_state.get("trades") or []):
+                if t.get("status") in ("tp_hit", "sl_hit"):
+                    key = (t.get("oco_id") or t.get("time", ""), t["status"])
+                    self._notified_outcomes.add(key)
+        except Exception:
+            pass
+
+        # Hide progress bar until first scan starts
+        self.query_one("#scan-progress", ProgressBar).display = False
+
         # Immediately read state.json for instant display
         self._read_state_file()
         # Start timers
@@ -475,6 +497,22 @@ class ScannerApp(App):
 
         self.last_scan = (state.get("last_scan") or "")[:19]
 
+        # Toast on new TP/SL outcomes (seeded on mount to avoid toasting history)
+        for t in self._trades:
+            if t.get("status") in ("tp_hit", "sl_hit"):
+                key = (t.get("oco_id") or t.get("time", ""), t["status"])
+                if key not in self._notified_outcomes:
+                    self._notified_outcomes.add(key)
+                    sym    = t.get("symbol", "?")
+                    entry  = t.get("entry", 0)
+                    is_tp  = t["status"] == "tp_hit"
+                    self.notify(
+                        f"{sym}  entry ${entry:.4f}",
+                        title="✅ Take Profit hit" if is_tp else "🛑 Stop Loss hit",
+                        severity="information" if is_tp else "warning",
+                        timeout=15,
+                    )
+
         # Refresh widgets
         self.query_one("#cooldown-widget", CooldownWidget).update_cooldowns(self._cooldowns)
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
@@ -501,8 +539,14 @@ class ScannerApp(App):
     # ── Reactive watchers ─────────────────────────────────────────────────────
     def watch_scanning(self, scanning: bool) -> None:
         self.query_one("#header-scan-status", Label).update(
-            f"[blink {M_TEAL}]◌ scanning...[/]" if scanning else ""
+            f"[{M_TEAL}]◌[/]" if scanning else ""
         )
+        bar = self.query_one("#scan-progress", ProgressBar)
+        if scanning:
+            bar.update(progress=0)
+            bar.display = True
+        else:
+            bar.display = False
 
     def watch_last_scan(self, ts: str) -> None:
         self.query_one("#status-last-scan", Label).update(
@@ -559,6 +603,7 @@ class ScannerApp(App):
             cooldowns  = _load_cooldowns()
             positions  = get_open_positions()
             open_count = len(positions)
+            scan_bar   = self.query_one("#scan-progress", ProgressBar)
 
             for symbol in PAIRS:
                 try:
@@ -582,6 +627,8 @@ class ScannerApp(App):
                         candidates.append(result)
                 except Exception as e:
                     tlog(f"[red]{symbol}: {markup_escape(str(e))}[/]")
+                finally:
+                    self.call_from_thread(scan_bar.advance, 1)
 
             # Correlation cap (before per-symbol guards)
             if len(candidates) >= 3:
@@ -619,6 +666,19 @@ class ScannerApp(App):
                     pass
 
             tlog(f"[green]Scan complete — {len(results)} pairs, {len(signals)} signal(s)[/]")
+
+            if signals:
+                sig_summary = ", ".join(
+                    f"{s['symbol'].replace('USDC','')} {s['signal_strength']} RSI {s['rsi']}"
+                    for s in signals
+                )
+                self.call_from_thread(
+                    self.notify,
+                    sig_summary,
+                    title=f"🔔 {len(signals)} signal{'s' if len(signals) > 1 else ''} detected",
+                    severity="warning",
+                    timeout=12,
+                )
 
             self.call_from_thread(
                 self.post_message,
@@ -698,6 +758,14 @@ class ScannerApp(App):
                 f"qty {trade['qty']}  entry ${trade['entry']:.4f}  "
                 f"TP ${trade['tp']:.4f}  SL ${trade['sl']:.4f}[/]"
             )
+            self.call_from_thread(
+                self.notify,
+                f"{signal['symbol']}  qty {trade['qty']}  @ ${trade['entry']:.4f}"
+                f"\nTP ${trade['tp']:.4f}  ·  SL ${trade['sl']:.4f}",
+                title="✅ Order placed",
+                severity="information",
+                timeout=15,
+            )
             send_telegram(
                 f"✅ *Order placed*\n"
                 f"`{signal['symbol']}` {trade['qty']} @ `${trade['entry']:.4f}`\n"
@@ -708,6 +776,13 @@ class ScannerApp(App):
             self.call_from_thread(self._read_state_file)
         except Exception as e:
             tlog(f"[red bold]✗ Order failed: {markup_escape(str(e))}[/]")
+            self.call_from_thread(
+                self.notify,
+                markup_escape(str(e)[:120]),
+                title=f"✗ Order failed — {signal['symbol']}",
+                severity="error",
+                timeout=20,
+            )
             send_telegram(f"❌ Order failed for `{_escape_md(signal['symbol'])}`: {_escape_md(str(e)[:200])}")
 
     # ── Table refresh helpers ─────────────────────────────────────────────────

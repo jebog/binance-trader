@@ -257,7 +257,7 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "n": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "win_rate": 0.0, "avg_tp_pct": 0.0, "avg_sl_pct": 0.0,
-            "net_pct": 0.0, "expectancy": 0.0,
+            "avg_to_pct": 0.0, "net_pct": 0.0, "expectancy": 0.0,
         }
     wins     = [t for t in trades if t["outcome"] == "TP"]
     losses   = [t for t in trades if t["outcome"] == "SL"]

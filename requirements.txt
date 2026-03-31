@@ -8,3 +8,6 @@ python-dotenv>=1.0.0     # Load credentials from .env
 # ── No additional runtime dependencies ────────────────────────
 # scanner.py and backtest.py use only the standard library:
 # urllib, hmac, hashlib, json, math, datetime, os, subprocess, sys, time
+
+# ── Development / testing ─────────────────────────────────────
+pytest>=8.0.0            # run: python3 -m pytest tests/

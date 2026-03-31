@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "feature/**"]
+  pull_request:
+    branches: ["main", "develop"]
+
+jobs:
+  lint:
+    name: Lint & type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt ruff mypy
+
+      - name: ruff check
+        run: python -m ruff check scanner.py backtest.py config.py tui.py
+
+      - name: mypy
+        run: python -m mypy scanner.py backtest.py --ignore-missing-imports
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    env:
+      BINANCE_API_KEY: ci_placeholder
+      BINANCE_SECRET_KEY: ci_placeholder
+      TELEGRAM_TOKEN: ci_placeholder
+      TELEGRAM_CHAT_ID: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: pytest
+        run: python -m pytest tests/ -q

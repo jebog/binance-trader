@@ -11,12 +11,10 @@ from __future__ import annotations
 import json
 import math
 import os
-import time
+from datetime import datetime
+
 from rich.markup import escape as markup_escape
 from rich.text import Text
-from datetime import datetime, timedelta
-from typing import Any
-
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -45,26 +43,24 @@ from textual.widgets import (
 # TeeLogger is guarded by `if __name__ == "__main__"` in scanner.py,
 # so this import does NOT hijack sys.stdout.
 from scanner import (
-    PAIRS,
-    CAPITAL,
-    STATE_FILE,
-    MAX_POSITIONS,
     LOG_FILE,
-    analyze,
-    get_portfolio,
-    get_open_positions,
-    get_fear_greed,
-    get_btc_context,
-    place_buy_order,
-    has_open_position,
-    _check_sl_outcomes,
-    _load_cooldowns,
+    MAX_POSITIONS,
+    PAIRS,
+    STATE_FILE,
     _calc_capital,
+    _check_sl_outcomes,
+    _escape_md,
     _estimate_sl_tp_pct,
+    _load_cooldowns,
+    analyze,
+    generate_dashboard,
+    get_btc_context,
+    get_fear_greed,
+    get_open_positions,
+    get_portfolio,
+    place_buy_order,
     save_state,
     send_telegram,
-    generate_dashboard,
-    _escape_md,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -214,10 +210,14 @@ class PairCard(Widget):
         vol     = f"[bold {M_YELLOW}]⚡[/]" if result.get("vol_surge") else " "
 
         # RSI colour — hotter as oversold deepens
-        if rsi < 25:   rsi_col = f"bold {M_RED}"
-        elif rsi < 32: rsi_col = f"bold {M_ORANGE}"
-        elif rsi < 40: rsi_col = M_YELLOW
-        else:          rsi_col = M_SUBTEXT
+        if rsi < 25:
+            rsi_col = f"bold {M_RED}"
+        elif rsi < 32:
+            rsi_col = f"bold {M_ORANGE}"
+        elif rsi < 40:
+            rsi_col = M_YELLOW
+        else:
+            rsi_col = M_SUBTEXT
 
         # Signal tier colour
         sig_col = {
@@ -236,9 +236,12 @@ class PairCard(Widget):
         # Daily RSI — multi-TF trend context
         d_rsi = result.get("daily_rsi")
         if d_rsi is not None:
-            if d_rsi < 30:   d_col = f"bold {M_RED}"
-            elif d_rsi < 45: d_col = M_YELLOW
-            else:            d_col = M_MUTED
+            if d_rsi < 30:
+                d_col = f"bold {M_RED}"
+            elif d_rsi < 45:
+                d_col = M_YELLOW
+            else:
+                d_col = M_MUTED
             daily_str = f"  1d:[{d_col}]{d_rsi}[/]"
         else:
             daily_str = ""
@@ -287,7 +290,6 @@ class PortfolioWidget(Static):
             color    = ASSET_COLORS.get(a["asset"], "port-bar-muted")
             qty      = a["qty"]
             val      = a["value_usdc"]
-            price    = a["price_usdc"]
 
             qty_fmt  = f"{qty:.4f}".rstrip("0").rstrip(".")
             val_fmt  = f"${val:,.2f}"

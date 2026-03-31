@@ -1,0 +1,10 @@
+# ── Core TUI ──────────────────────────────────────────────────
+textual>=0.38.0          # TUI framework — Sparkline requires >= 0.38
+rich>=13.0.0             # Rich text markup (used directly in tui.py)
+
+# ── Configuration ─────────────────────────────────────────────
+python-dotenv>=1.0.0     # Load credentials from .env
+
+# ── No additional runtime dependencies ────────────────────────
+# scanner.py and backtest.py use only the standard library:
+# urllib, hmac, hashlib, json, math, datetime, os, subprocess, sys, time

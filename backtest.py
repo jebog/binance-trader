@@ -58,7 +58,7 @@ def calc_rsi(closes: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-def calc_atr(klines: list[list], period: int = 14) -> Optional[float]:
+def calc_atr(klines: list[list[Any]], period: int = 14) -> Optional[float]:
     """Wilder's ATR — uses high/low/prev_close from raw klines."""
     trs = []
     for i in range(1, len(klines)):
@@ -83,7 +83,7 @@ def calc_sma(closes: list[float], period: int = 20) -> Optional[float]:
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
 
-def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT) -> list[list]:
+def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT) -> list[list[Any]]:
     """Fetch klines from Binance public API (no auth required)."""
     url = "https://api.binance.com/api/v3/klines?" + urllib.parse.urlencode({
         "symbol":   symbol,
@@ -107,7 +107,7 @@ def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT
 
 # ── Signal logic (mirrors scanner.py analyze(), no F&G / BTC filter) ──────────
 
-def compute_signal(window_klines: list[list]) -> tuple[str, float, bool, bool, bool, Optional[float], float]:
+def compute_signal(window_klines: list[list[Any]]) -> tuple[str, float, bool, bool, bool, Optional[float], float]:
     """
     Given a list of WINDOW closed klines, compute the signal tier.
     Returns: (signal_str, rsi, above_sma, vol_surge, momentum_up, atr, price)
@@ -148,7 +148,7 @@ def compute_signal(window_klines: list[list]) -> tuple[str, float, bool, bool, b
 
 # ── Per-symbol backtest ────────────────────────────────────────────────────────
 
-def backtest_symbol(symbol: str, klines: list[list]) -> list[dict[str, Any]]:
+def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]]:
     """
     Rolling-window simulation over all klines for one symbol.
     Returns list of trade dicts.

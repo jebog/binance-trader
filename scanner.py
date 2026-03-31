@@ -266,7 +266,7 @@ def calc_rsi(closes: list[float], period: int = 14) -> float:
         return 100.0
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
-def calc_atr(klines: list[list], period: int = 14) -> Optional[float]:
+def calc_atr(klines: list[list[Any]], period: int = 14) -> Optional[float]:
     """Wilder's ATR — uses high/low/prev_close from raw klines."""
     trs = []
     for i in range(1, len(klines)):
@@ -344,7 +344,7 @@ def get_fear_greed() -> tuple[int, str]:
     send_telegram("⚠️ F&G cache expired — sentiment filter inactive, using neutral 50")
     return 50, "Neutral"
 
-def get_btc_context() -> dict[str, Any]:
+def get_btc_context() -> dict[str, Any]:  # {rsi: float, above_sma: bool, price: float}
     """Fetch BTC 1h RSI + SMA trend as a market regime filter."""
     try:
         klines = get("/api/v3/klines", {"symbol": "BTCUSDC", "interval": "1h", "limit": 100})
@@ -586,7 +586,7 @@ def _load_cooldowns() -> dict[str, str]:
     except Exception:
         return {}
 
-def _save_sent_signals(sent_signals: dict) -> None:
+def _save_sent_signals(sent_signals: dict[str, str]) -> None:
     """Patch sent_signals into state.json without touching other fields."""
     if not os.path.exists(STATE_FILE):
         return
@@ -672,7 +672,7 @@ def place_buy_order(
     symbol: str,
     capital: float,
     price: float,
-    closed_klines: Optional[list[list]] = None,
+    closed_klines: Optional[list[list[Any]]] = None,
 ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any]]:
     """Place market buy + OCO (TP/SL). Uses ATR-based SL/TP if ATR_SL_MULT > 0 and klines supplied."""
     qty_raw = capital / price
@@ -1344,7 +1344,7 @@ def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
     return STOP_LOSS, TAKE_PROFIT
 
 # ── Main scan ────────────────────────────────────────────────────────────────
-def scan() -> dict[str, Any]:
+def scan() -> None:
     print(f"\n--- {datetime.now().strftime('%a. %d %b %Y %H:%M:%S')} ---")
     print(f"\n{'='*55}")
     print(f"  TRADING SCANNER — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

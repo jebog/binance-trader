@@ -30,6 +30,7 @@ from textual.widgets import (
     Label,
     ProgressBar,
     RichLog,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
@@ -173,12 +174,24 @@ class OrderConfirmModal(ModalScreen):
 
 
 # ── Widgets ───────────────────────────────────────────────────────────────────
-class PairCard(Static):
-    """Displays one trading pair with RSI, price, signal tier."""
+class PairCard(Widget):
+    """Displays one trading pair: text info block + Sparkline price chart."""
+
+    # Sparkline color per signal tier
+    _SPARK_COLOR = {
+        "EXTREME":  M_RED,
+        "STRONG":   M_ORANGE,
+        "MODERATE": M_YELLOW,
+        "NONE":     M_BLUE,
+    }
 
     def __init__(self, symbol: str):
         super().__init__(id=f"pair-{symbol.lower()}", classes="pair-card")
         self.symbol = symbol
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="pair-info")
+        yield Sparkline([], summary_function=max, classes="pair-spark")
 
     def render_for(self, result: dict | None) -> str:
         if result is None:
@@ -232,11 +245,21 @@ class PairCard(Static):
         )
 
     def update_result(self, result: dict | None) -> None:
-        self.update(self.render_for(result))
+        # Update text block
+        self.query_one(".pair-info", Static).update(self.render_for(result))
+
+        # Update border class
         tier = (result or {}).get("signal_strength", "NONE")
         self.remove_class("EXTREME", "STRONG", "MODERATE")
         if tier != "NONE":
             self.add_class(tier)
+
+        # Update sparkline with last 20 close prices (tinted by signal tier)
+        spark = self.query_one(".pair-spark", Sparkline)
+        klines = (result or {}).get("closed_klines") or []
+        if klines:
+            spark.data = [float(k[4]) for k in klines[-20:]]
+        spark.set_styles(f"color: {self._SPARK_COLOR.get(tier, M_BLUE)};")
 
 
 class PortfolioWidget(Static):
@@ -520,7 +543,15 @@ class ScannerApp(App):
                         timeout=15,
                     )
 
-        # Refresh widgets
+        # Populate pair card sparklines from disk state (gives instant charts on startup)
+        results_by_symbol = {r["symbol"]: r for r in (state.get("results") or [])}
+        for sym in PAIRS:
+            result = results_by_symbol.get(sym)
+            if result and result.get("closed_klines"):
+                card = self.query_one(f"#pair-{sym.lower()}", PairCard)
+                card.update_result(result)
+
+        # Refresh left-panel widgets
         self.query_one("#cooldown-widget", CooldownWidget).update_cooldowns(self._cooldowns)
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
         if self._portfolio:

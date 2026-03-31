@@ -28,8 +28,11 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
+    ContentSwitcher,
     DataTable,
+    Input,
     Label,
+    LoadingIndicator,
     ProgressBar,
     RichLog,
     Sparkline,
@@ -381,6 +384,105 @@ class BacktestWidget(Static):
         self.update(self.render_backtest())
 
 
+# ── Equity curve widget ───────────────────────────────────────────────────────
+class EquityWidget(Widget):
+    """Cumulative P&L sparkline built from closed trades in state.json."""
+
+    def compose(self) -> ComposeResult:
+        yield Sparkline([], id="equity-spark", summary_function=max)
+        yield Static("[dim]No closed trades yet[/]", id="equity-stats")
+
+    def refresh_equity(self, trades: list[dict]) -> None:
+        closed = sorted(
+            [t for t in trades if t.get("status") in ("tp_hit", "sl_hit")],
+            key=lambda t: t.get("time", ""),
+        )
+        spark = self.query_one("#equity-spark", Sparkline)
+        stats = self.query_one("#equity-stats", Static)
+
+        if not closed:
+            spark.data = []
+            stats.update("[dim]No closed trades yet[/]")
+            return
+
+        # Build cumulative P&L series from entry/tp/sl prices
+        cumulative = 0.0
+        series: list[float] = []
+        for t in closed:
+            entry = float(t.get("entry") or 0)
+            if entry == 0:
+                continue
+            if t["status"] == "tp_hit" and t.get("tp"):
+                pnl = (float(t["tp"]) - entry) / entry * 100
+            elif t["status"] == "sl_hit" and t.get("sl"):
+                pnl = (float(t["sl"]) - entry) / entry * 100
+            else:
+                continue
+            cumulative += pnl
+            series.append(cumulative)
+
+        spark.data = series
+        if series:
+            total = series[-1]
+            col = M_GREEN if total >= 0 else M_RED
+            tint = Color.parse(col)
+            spark.max_color = tint
+            spark.min_color = tint
+            stats.update(
+                f"[{col}]{total:+.2f}%[/] cumulative  [dim]({len(series)} trades)[/]"
+            )
+
+
+# ── Settings modal ─────────────────────────────────────────────────────────────
+class SettingsModal(ModalScreen):
+    """Edit runtime settings (scan interval). Dismisses with new interval or None."""
+
+    BINDINGS = [Binding("escape", "action_dismiss_modal", "Close", show=False)]
+
+    def __init__(self, current_interval: int):
+        super().__init__()
+        self._current_interval = current_interval
+
+    def compose(self) -> ComposeResult:
+        with Container(id="modal-outer"):
+            yield Label("⚙  SETTINGS", id="modal-title")
+            yield Label("─" * 44, classes="modal-row")
+            yield Horizontal(
+                Label("Scan interval (s):", classes="modal-label"),
+                Input(
+                    value=str(self._current_interval),
+                    placeholder="seconds (min 10)",
+                    id="input-interval",
+                    type="integer",
+                ),
+            )
+            yield Label("[dim]Min 10 s — current scans are not interrupted[/]",
+                        classes="modal-row")
+            yield Label("─" * 44, classes="modal-row")
+            with Horizontal(id="modal-buttons"):
+                yield Button("✓ Apply  [Enter]", id="btn-confirm")
+                yield Button("✗ Cancel  [Esc]",  id="btn-skip")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-confirm":
+            self._apply()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, _: Input.Submitted) -> None:
+        self._apply()
+
+    def _apply(self) -> None:
+        try:
+            value = max(10, int(self.query_one("#input-interval", Input).value))
+            self.dismiss(value)
+        except ValueError:
+            self.dismiss(None)
+
+    def action_dismiss_modal(self) -> None:
+        self.dismiss(None)
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 class ScannerApp(App):
     CSS_PATH = "tui.tcss"
@@ -389,6 +491,8 @@ class ScannerApp(App):
         Binding("s", "trigger_scan",      "Scan",     show=True),
         Binding("r", "refresh_state",     "Refresh",  show=True),
         Binding("p", "toggle_left_panel", "Panel",    show=True),
+        Binding("e", "toggle_equity",     "Equity",   show=True),
+        Binding("c", "open_settings",     "Settings", show=True),
         Binding("l", "toggle_log",        "Log",      show=True),
         Binding("q", "quit",              "Quit",     show=True),
     ]
@@ -415,6 +519,8 @@ class ScannerApp(App):
         self._scan_ctx:          dict       = {}   # NOT _context — shadows Textual internal
         self._notified_outcomes: set        = set()  # (oco_id|time, status) — no re-toast
         self._scan_bar:          ProgressBar | None = None  # captured on main thread in watch_scanning
+        self._scan_interval:     int               = AUTO_SCAN_INTERVAL
+        self._scan_timer                           = None   # Timer ref for settings-driven reset
 
     def compose(self) -> ComposeResult:
         # ── Header
@@ -431,11 +537,15 @@ class ScannerApp(App):
 
         # ── Main body
         with Horizontal(id="main-layout"):
-            # Left panel — portfolio / cooldowns / performance
+            # Left panel — portfolio / equity / cooldowns / performance
             with Vertical(id="left-panel"):
-                yield Label("PORTFOLIO", classes="panel-title")
+                yield Label("PORTFOLIO", classes="panel-title", id="left-panel-title")
                 yield Label("─" * 26, classes="panel-divider")
-                yield PortfolioWidget(id="portfolio-widget")
+                # ContentSwitcher: LoadingIndicator until first data, then Portfolio or Equity
+                with ContentSwitcher(id="left-switcher", initial="portfolio-loading"):
+                    yield LoadingIndicator(id="portfolio-loading")
+                    yield PortfolioWidget(id="portfolio-widget")
+                    yield EquityWidget(id="equity-widget")
                 yield Label("")
                 yield Label("COOLDOWNS", classes="panel-title")
                 yield Label("─" * 26, classes="panel-divider")
@@ -472,9 +582,9 @@ class ScannerApp(App):
         # ── Status bar
         with Horizontal(id="status-bar"):
             yield Label(
-                "[dim][S][/] Scan  [dim][R][/] Refresh  "
-                "[dim][P][/] Panel  [dim][L][/] Log  "
-                "[dim][Tab][/] Switch tab  [dim][Q][/] Quit",
+                "[dim][S][/] Scan  [dim][R][/] Refresh  [dim][P][/] Panel  "
+                "[dim][E][/] Equity  [dim][C][/] Settings  "
+                "[dim][L][/] Log  [dim][Tab][/] Tab  [dim][Q][/] Quit",
                 id="status-keys",
             )
             yield Label("", id="status-last-scan")
@@ -510,7 +620,7 @@ class ScannerApp(App):
         self._read_state_file()
         # Start timers
         self.set_interval(STATE_READ_INTERVAL, self._read_state_file)
-        self.set_interval(AUTO_SCAN_INTERVAL,  self.action_trigger_scan)
+        self._scan_timer = self.set_interval(self._scan_interval, self.action_trigger_scan)
         # Kick off first scan right away
         self.call_after_refresh(self.action_trigger_scan)
 
@@ -560,8 +670,13 @@ class ScannerApp(App):
         # Refresh left-panel widgets
         self.query_one("#cooldown-widget", CooldownWidget).update_cooldowns(self._cooldowns)
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
+        self.query_one("#equity-widget",   EquityWidget).refresh_equity(self._trades)
         if self._portfolio:
             self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(self._portfolio)
+            # Swap LoadingIndicator → portfolio on first data arrival
+            switcher = self.query_one("#left-switcher", ContentSwitcher)
+            if switcher.current == "portfolio-loading":
+                switcher.current = "portfolio-widget"
 
         # Tail log file
         self._tail_log()
@@ -872,8 +987,33 @@ class ScannerApp(App):
         self._read_state_file()
 
     def action_toggle_left_panel(self) -> None:
-        panel = self.query_one("#left-panel")
-        panel.toggle_class("hidden")
+        self.query_one("#left-panel").toggle_class("hidden")
+
+    def action_toggle_equity(self) -> None:
+        """Cycle left panel content: Portfolio ↔ Equity curve."""
+        switcher = self.query_one("#left-switcher", ContentSwitcher)
+        title    = self.query_one("#left-panel-title", Label)
+        if switcher.current == "equity-widget":
+            switcher.current = "portfolio-widget"
+            title.update(f"[bold {M_BLUE}]PORTFOLIO[/]")
+        else:
+            switcher.current = "equity-widget"
+            title.update(f"[bold {M_MAUVE}]EQUITY CURVE[/]")
+
+    def action_open_settings(self) -> None:
+        """Open settings modal — apply new scan interval without restart."""
+        def on_dismiss(new_interval: int | None) -> None:
+            if new_interval is not None and new_interval != self._scan_interval:
+                self._scan_interval = new_interval
+                self._scan_timer.stop()
+                self._scan_timer = self.set_interval(new_interval, self.action_trigger_scan)
+                self.notify(
+                    f"Scan will run every {new_interval}s",
+                    title="⚙ Settings applied",
+                    severity="information",
+                    timeout=5,
+                )
+        self.push_screen(SettingsModal(self._scan_interval), callback=on_dismiss)
 
     def action_toggle_log(self) -> None:
         log = self.query_one("#log-strip", RichLog)

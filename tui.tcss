@@ -1,0 +1,291 @@
+/* ═══════════════════════════════════════════════════
+   tui.tcss — Catppuccin Mocha for Trading Scanner TUI
+═══════════════════════════════════════════════════ */
+
+/* ── Colour tokens ───────────────────────────────── */
+$bg:      #1e1e2e;
+$surface: #313244;
+$overlay: #45475a;
+$border:  #585b70;
+$text:    #cdd6f4;
+$muted:   #6c7086;
+$subtext: #a6adc8;
+$green:   #a6e3a1;
+$red:     #f38ba8;
+$orange:  #fab387;
+$yellow:  #f9e2af;
+$blue:    #89b4fa;
+$teal:    #94e2d5;
+$lavender:#b4befe;
+$mauve:   #cba6f7;
+
+/* ── Root ────────────────────────────────────────── */
+Screen {
+    background: $bg;
+    color: $text;
+    layers: base overlay;
+}
+
+/* ── Header ─────────────────────────────────────── */
+#header {
+    layout: horizontal;
+    height: 3;
+    background: $surface;
+    border-bottom: solid $overlay;
+    padding: 0 2;
+    align: left middle;
+}
+
+#header-title {
+    color: $blue;
+    text-style: bold;
+    width: auto;
+}
+
+#header-context {
+    color: $subtext;
+    margin-left: 4;
+    width: 1fr;
+}
+
+#header-scan-status {
+    width: auto;
+    color: $teal;
+    text-style: italic;
+}
+
+/* ── Main layout ─────────────────────────────────── */
+#main-layout {
+    layout: horizontal;
+    height: 1fr;
+}
+
+/* ── Left panel ──────────────────────────────────── */
+#left-panel {
+    width: 30;
+    height: 100%;
+    background: $surface;
+    border-right: solid $overlay;
+    overflow-y: auto;
+    padding: 0 1;
+    display: block;
+}
+
+#left-panel.hidden {
+    display: none;
+}
+
+.panel-title {
+    color: $blue;
+    text-style: bold;
+    margin: 1 0 0 0;
+}
+
+.panel-divider {
+    color: $overlay;
+    margin: 0;
+}
+
+/* ── Portfolio ───────────────────────────────────── */
+#portfolio-total {
+    color: $teal;
+    text-style: bold;
+}
+
+.port-asset {
+    color: $text;
+}
+
+/* asset bar colours now use M_* hex constants inline in tui.py */
+
+/* ── Cooldowns ───────────────────────────────────── */
+.cooldown-active {
+    color: $red;
+}
+
+.cooldown-none {
+    color: $muted;
+}
+
+/* ── Performance ─────────────────────────────────── */
+.perf-positive { color: $green; }
+.perf-neutral  { color: $muted; }
+
+/* ── Center panel ────────────────────────────────── */
+#center-panel {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* ── Pair grid ───────────────────────────────────── */
+#pairs-grid {
+    layout: grid;
+    grid-gutter: 1;
+    height: auto;
+    margin-bottom: 1;
+}
+
+.pair-card {
+    background: $surface;
+    border: solid $overlay;
+    padding: 0 1;
+    height: 7;
+}
+
+.pair-card.EXTREME { border: solid $red;    }
+.pair-card.STRONG  { border: solid $orange; }
+.pair-card.MODERATE{ border: solid $yellow; }
+
+.pair-symbol {
+    color: $blue;
+    text-style: bold;
+}
+
+.pair-price {
+    color: $text;
+    text-style: bold;
+}
+
+.pair-rsi-extreme { color: $red;    text-style: bold; }
+.pair-rsi-strong  { color: $orange; text-style: bold; }
+.pair-rsi-moderate{ color: $yellow; }
+.pair-rsi-normal  { color: $subtext; }
+
+.pair-signal-EXTREME { color: $red;    text-style: bold; }
+.pair-signal-STRONG  { color: $orange; text-style: bold; }
+.pair-signal-MODERATE{ color: $yellow; }
+.pair-signal-NONE    { color: $muted;  }
+
+.pair-change-pos { color: $green; }
+.pair-change-neg { color: $red;   }
+
+/* ── Section headers ─────────────────────────────── */
+.section-header {
+    color: $subtext;
+    text-style: bold;
+    margin: 1 0 0 0;
+}
+
+/* ── DataTable (positions + history) ─────────────── */
+DataTable {
+    background: $bg;
+    height: auto;
+    max-height: 10;
+    margin-bottom: 1;
+}
+
+DataTable > .datatable--header {
+    background: $surface;
+    color: $subtext;
+}
+
+DataTable > .datatable--cursor {
+    background: $overlay;
+    color: $text;
+}
+
+DataTable > .datatable--odd-row {
+    background: $bg;
+}
+
+DataTable > .datatable--even-row {
+    background: $surface;
+}
+
+.pnl-pos { color: $green; }
+.pnl-neg { color: $red;   }
+
+/* ── Log strip ───────────────────────────────────── */
+#log-strip {
+    height: 5;
+    background: $bg;
+    border-top: solid $overlay;
+    color: $muted;
+    display: block;
+}
+
+#log-strip.hidden {
+    display: none;
+}
+
+/* ── Status bar / footer ─────────────────────────── */
+#status-bar {
+    layout: horizontal;
+    height: 1;
+    background: $surface;
+    border-top: solid $overlay;
+    padding: 0 2;
+    align: left middle;
+}
+
+#status-keys {
+    width: 1fr;
+    color: $subtext;
+}
+
+#status-last-scan {
+    width: auto;
+    color: $muted;
+}
+
+/* ── Order confirm modal ─────────────────────────── */
+OrderConfirmModal {
+    align: center middle;
+    background: rgba(0,0,0,0.7);
+    layer: overlay;
+}
+
+#modal-outer {
+    background: $surface;
+    border: double $blue;
+    width: 50;
+    height: auto;
+    padding: 1 2;
+}
+
+#modal-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#modal-title.EXTREME  { color: $red;    }
+#modal-title.STRONG   { color: $orange; }
+#modal-title.MODERATE { color: $yellow; }
+
+.modal-row {
+    color: $text;
+    height: 1;
+}
+
+.modal-label { color: $subtext; width: 12; }
+.modal-value { color: $text;    width: 1fr; }
+.modal-value-tp  { color: $green; }
+.modal-value-sl  { color: $red;   }
+.modal-value-cap { color: $teal;  }
+
+#modal-buttons {
+    layout: horizontal;
+    height: 3;
+    margin-top: 1;
+}
+
+#btn-confirm {
+    width: 1fr;
+    background: $green;
+    color: $bg;
+    text-style: bold;
+    margin-right: 1;
+}
+
+#btn-confirm:hover { background: $teal; }
+
+#btn-skip {
+    width: 1fr;
+    background: $surface;
+    color: $red;
+    border: solid $red;
+}
+
+#btn-skip:hover { background: $red; color: $bg; }

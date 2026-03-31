@@ -1,0 +1,53 @@
+# ── Secrets & credentials ─────────────────────────────────────────────────────
+.env
+# config.py committed only after feature/secrets-migration (credentials must be removed first)
+config.py
+
+# ── Runtime / generated files ─────────────────────────────────────────────────
+state.json
+scanner.log
+dashboard.html
+backtest_results.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# ── Tooling ───────────────────────────────────────────────────────────────────
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/
+.playwright-mcp/
+
+# ── Unrelated assets (to be cleaned up in feature/project-structure) ──────────
+generate_guide.py
+guide_trading_debutants.pdf
+ve-full.png
+ve-hero.png

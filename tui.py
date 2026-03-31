@@ -371,14 +371,19 @@ class ScannerApp(App):
     btc_rsi:        reactive[float] = reactive(50.0)
     btc_above_sma:  reactive[bool]  = reactive(True)
 
-    # Internal state (not reactive — updated via message handlers)
-    _pair_results:      list[dict]  = []
-    _portfolio:         dict        = {}
-    _positions:         list[dict]  = []
-    _cooldowns:         dict        = {}
-    _trades:            list[dict]  = []
-    _scan_ctx:          dict        = {}   # market context (fg, btc) — NOT _context (shadows Textual)
-    _notified_outcomes: set         = set()  # (oco_id|time, status) — prevents re-toasting known trades
+    # Internal state initialised in __init__ (NOT class-level to avoid shared mutable defaults)
+    # _pair_results, _portfolio, _positions, _cooldowns, _trades, _scan_ctx, _notified_outcomes
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._pair_results:      list[dict] = []
+        self._portfolio:         dict       = {}
+        self._positions:         list[dict] = []
+        self._cooldowns:         dict       = {}
+        self._trades:            list[dict] = []
+        self._scan_ctx:          dict       = {}   # NOT _context — shadows Textual internal
+        self._notified_outcomes: set        = set()  # (oco_id|time, status) — no re-toast
+        self._scan_bar:          ProgressBar | None = None  # captured on main thread in watch_scanning
 
     def compose(self) -> ComposeResult:
         # ── Header
@@ -541,12 +546,13 @@ class ScannerApp(App):
         self.query_one("#header-scan-status", Label).update(
             f"[{M_TEAL}]◌[/]" if scanning else ""
         )
-        bar = self.query_one("#scan-progress", ProgressBar)
+        # Capture reference on main thread so the scan worker can safely call advance()
+        self._scan_bar = self.query_one("#scan-progress", ProgressBar)
         if scanning:
-            bar.update(progress=0)
-            bar.display = True
+            self._scan_bar.update(progress=0)
+            self._scan_bar.display = True
         else:
-            bar.display = False
+            self._scan_bar.display = False
 
     def watch_last_scan(self, ts: str) -> None:
         self.query_one("#status-last-scan", Label).update(
@@ -603,7 +609,7 @@ class ScannerApp(App):
             cooldowns  = _load_cooldowns()
             positions  = get_open_positions()
             open_count = len(positions)
-            scan_bar   = self.query_one("#scan-progress", ProgressBar)
+            scan_bar   = self._scan_bar  # reference captured on main thread in watch_scanning
 
             for symbol in PAIRS:
                 try:
@@ -645,7 +651,7 @@ class ScannerApp(App):
                     tlog(f"[dim]{symbol} — skipped (max positions)[/]")
                 elif symbol in cooldowns:
                     tlog(f"[dim]{symbol} — skipped (SL cooldown)[/]")
-                elif has_open_position(symbol):
+                elif any(p["symbol"] == symbol for p in positions):
                     tlog(f"[dim]{symbol} — skipped (open position)[/]")
                 else:
                     signals.append(result)

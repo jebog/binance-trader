@@ -49,9 +49,19 @@ Screen {
 }
 
 #header-scan-status {
-    width: auto;
+    width: 3;
     color: $teal;
-    text-style: italic;
+}
+
+#scan-progress {
+    width: 20;
+    height: 1;
+    margin-left: 1;
+}
+
+#scan-progress Bar {
+    color: $teal;
+    background: $overlay;
 }
 
 /* ── Main layout ─────────────────────────────────── */

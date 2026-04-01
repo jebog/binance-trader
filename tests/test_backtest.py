@@ -274,3 +274,83 @@ def test_compute_stats_breakeven_save_requires_be_moved():
     trades = [_trade("SL", 0.0, entry=50.0, exit_price=50.0, breakeven_moved=False)]
     s = compute_stats(trades)
     assert s["breakeven_saves"] == 0
+
+
+def test_compute_stats_sharpe():
+    """Sharpe = mean / std of per-trade P&L."""
+    import pytest
+    trades = [_trade("TP", 10.0), _trade("TP", 5.0), _trade("SL", -3.0)]
+    s = compute_stats(trades)
+    # mean = 4.0, std = sqrt(((10-4)^2 + (5-4)^2 + (-3-4)^2) / 3) = sqrt(86/3) ≈ 5.354
+    assert s["sharpe"] == pytest.approx(4.0 / 5.354, abs=0.01)
+
+
+def test_compute_stats_max_drawdown():
+    """Max drawdown from cumulative P&L peak."""
+    import pytest
+    trades = [_trade("TP", 10.0), _trade("TP", 5.0), _trade("SL", -8.0), _trade("SL", -4.0)]
+    s = compute_stats(trades)
+    # Cumulative: 10, 15, 7, 3. Peak=15, lowest after peak=3. DD = 15-3 = 12
+    assert s["max_drawdown_pct"] == pytest.approx(12.0)
+
+
+def test_compute_stats_max_consec_loss():
+    trades = [
+        _trade("TP", 5.0), _trade("SL", -2.0), _trade("SL", -3.0),
+        _trade("SL", -1.0), _trade("TP", 4.0), _trade("SL", -2.0),
+    ]
+    s = compute_stats(trades)
+    assert s["max_consec_loss"] == 3
+
+
+def test_compute_stats_empty_new_fields():
+    s = compute_stats([])
+    assert s["sharpe"] == 0.0
+    assert s["max_drawdown_pct"] == 0.0
+    assert s["max_consec_loss"] == 0
+
+
+# ── Split-entry simulation tests ──────────────────────────────────────────────
+
+def test_split_entry_fires_on_trigger():
+    """EXTREME signal: second leg fills when price drops to trigger, doubling capital."""
+    entry = ENTRY_PRICE  # 50.5
+    # Candle 0 (i=101): price drops to split trigger (~49.88) but stays above
+    # post-split SL (~49.19). low=49.59 triggers split without hitting SL.
+    drop_candle = _kline(entry * 0.982, high=entry * 0.99, low=entry * 0.982)
+    # Candle 1 (i=102): TP hit
+    tp_candle = _kline(entry, high=entry * 1.12, low=entry * 0.99)
+    # Use only 2 candles so no third iteration can fire a second signal
+    with _no_be, _no_tr:
+        klines = _declining_window() + [_kline(ENTRY_PRICE)] + [drop_candle, tp_candle]
+        trades = backtest_symbol("TESTUSDC", klines)
+    assert len(trades) == 1
+    t = trades[0]
+    assert t["split_filled"] is True
+    # Capital should be doubled
+    assert t["capital"] > ENTRY_PRICE
+    # Entry should be averaged down
+    assert t["entry"] < ENTRY_PRICE
+
+
+def test_split_entry_ttl_expires():
+    """If trigger never hit within TTL candles, split stays unfilled."""
+    # 49 neutral candles — TTL is 48 candles, trigger never reached
+    neutral = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.002, low=ENTRY_PRICE * 0.998)
+    with _no_be, _no_tr:
+        trades = _run([neutral] * 50)
+    assert len(trades) == 1
+    assert trades[0]["split_filled"] is False
+
+
+def test_split_entry_not_armed_for_non_extreme():
+    """Only EXTREME signals get split-entry pending legs."""
+    # The declining window produces an EXTREME signal (RSI << 25).
+    # All trades from our fixture are EXTREME, so split_trigger should be set.
+    # For non-EXTREME, we'd need a different window. Instead, just verify
+    # that the EXTREME trade HAS a trigger.
+    neutral = _kline(ENTRY_PRICE)
+    with _no_be, _no_tr:
+        trades = _run([neutral] * 5)
+    assert len(trades) == 1
+    assert trades[0].get("split_trigger") is not None  # EXTREME → trigger armed

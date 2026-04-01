@@ -442,6 +442,7 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "win_rate": 0.0, "avg_tp_pct": 0.0, "avg_sl_pct": 0.0,
             "avg_to_pct": 0.0, "net_pct": 0.0, "expectancy": 0.0,
             "net_usdc": 0.0, "expectancy_usdc": 0.0,
+            "sharpe": 0.0, "max_drawdown_pct": 0.0, "max_consec_loss": 0,
         }
     wins     = [t for t in trades if t["outcome"] == "TP"]
     losses   = [t for t in trades if t["outcome"] == "SL"]
@@ -464,20 +465,89 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     net_usdc = sum(t.get("pnl_usdc", 0.0) for t in trades)
     exp_usdc = net_usdc / n
 
+    # Sharpe ratio (per-trade, not annualized — trade durations are variable)
+    pnl_list = [t["pnl_pct"] for t in trades]
+    mean_pnl = net / n
+    std_pnl  = (sum((p - mean_pnl) ** 2 for p in pnl_list) / n) ** 0.5 if n > 1 else 0.0
+    sharpe   = mean_pnl / std_pnl if std_pnl > 0 else 0.0
+
+    # Max drawdown (cumulative P&L curve)
+    cumulative = 0.0
+    peak       = 0.0
+    max_dd     = 0.0
+    for p in pnl_list:
+        cumulative += p
+        if cumulative > peak:
+            peak = cumulative
+        dd = peak - cumulative
+        if dd > max_dd:
+            max_dd = dd
+
+    # Max consecutive losses
+    max_consec_loss = 0
+    _consec = 0
+    for t in trades:
+        if t["outcome"] == "SL":
+            _consec += 1
+            if _consec > max_consec_loss:
+                max_consec_loss = _consec
+        else:
+            _consec = 0
+
     return {
-        "n":               n,
-        "wins":            nw,
-        "losses":          nl,
-        "timeouts":        nt,
-        "breakeven_saves": len(be_saves),
-        "win_rate":        round(wr, 1),
-        "avg_tp_pct":      round(avg_win, 2),
-        "avg_sl_pct":      round(avg_loss, 2),
-        "avg_to_pct":      round(avg_to, 2),
-        "net_pct":         round(net, 2),
-        "expectancy":      round(exp, 2),
-        "net_usdc":        round(net_usdc, 2),
-        "expectancy_usdc": round(exp_usdc, 2),
+        "n":                n,
+        "wins":             nw,
+        "losses":           nl,
+        "timeouts":         nt,
+        "breakeven_saves":  len(be_saves),
+        "win_rate":         round(wr, 1),
+        "avg_tp_pct":       round(avg_win, 2),
+        "avg_sl_pct":       round(avg_loss, 2),
+        "avg_to_pct":       round(avg_to, 2),
+        "net_pct":          round(net, 2),
+        "expectancy":       round(exp, 2),
+        "net_usdc":         round(net_usdc, 2),
+        "expectancy_usdc":  round(exp_usdc, 2),
+        "sharpe":           round(sharpe, 3),
+        "max_drawdown_pct": round(max_dd, 2),
+        "max_consec_loss":  max_consec_loss,
+    }
+
+
+def monte_carlo(trades: list[dict[str, Any]], n_sims: int = 1000) -> dict[str, Any]:
+    """Bootstrap Monte Carlo on the trade list. Returns P5/P50/P95 for net_pct and max_dd."""
+    import random
+    if len(trades) < 3:
+        return {"n_sims": 0, "net_p5": 0.0, "net_p50": 0.0, "net_p95": 0.0,
+                "dd_p5": 0.0, "dd_p50": 0.0, "dd_p95": 0.0}
+    nets: list[float] = []
+    dds: list[float] = []
+    n = len(trades)
+    for _ in range(n_sims):
+        sample = random.choices(trades, k=n)
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for t in sample:
+            cum += t["pnl_pct"]
+            if cum > peak:
+                peak = cum
+            dd = peak - cum
+            if dd > max_dd:
+                max_dd = dd
+        nets.append(cum)
+        dds.append(max_dd)
+    nets.sort()
+    dds.sort()
+    p = lambda lst, pct: lst[int(len(lst) * pct / 100)]  # noqa: E731
+    return {
+        "n_sims": n_sims,
+        "net_p5":  round(p(nets, 5), 2),
+        "net_p50": round(p(nets, 50), 2),
+        "net_p95": round(p(nets, 95), 2),
+        "dd_p5":   round(p(dds, 5), 2),
+        "dd_p50":  round(p(dds, 50), 2),
+        "dd_p95":  round(p(dds, 95), 2),
     }
 
 
@@ -573,6 +643,23 @@ def main() -> None:
     _print_stats_row("TOTAL TRAIN", overall_train, train_trades_all)
     _print_stats_row("TOTAL TEST",  overall_test,  test_trades_all)
     print()
+
+    # ── Risk metrics ─────────────────────────────────────────────────────────
+    if test_trades_all:
+        s = overall_test
+        print("  Risk metrics (test set):")
+        print(f"    Sharpe:           {s['sharpe']:+.3f}  (per-trade, not annualized)")
+        print(f"    Max drawdown:     {s['max_drawdown_pct']:.2f}%")
+        print(f"    Max consec loss:  {s['max_consec_loss']}")
+        print()
+
+    # ── Monte Carlo (bootstrap) ──────────────────────────────────────────────
+    if len(test_trades_all) >= 3:
+        mc = monte_carlo(test_trades_all)
+        print(f"  Monte Carlo ({mc['n_sims']} sims):")
+        print(f"    Net P&L   P5:{mc['net_p5']:+.1f}%  P50:{mc['net_p50']:+.1f}%  P95:{mc['net_p95']:+.1f}%")
+        print(f"    Max DD    P5:{mc['dd_p5']:.1f}%   P50:{mc['dd_p50']:.1f}%   P95:{mc['dd_p95']:.1f}%")
+        print()
 
     # ── Signal distribution ───────────────────────────────────────────────────
     all_test_trades = test_trades_all

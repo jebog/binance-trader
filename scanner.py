@@ -1216,8 +1216,8 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         d_sma20   = calc_sma(d_closes, 20)
         daily_rsi_val  = round(d_rsi, 1)
         # bullish: daily RSI > 45 AND price above daily SMA20
-        # neutral: daily RSI 30-45 (recovery possible) — still allow STRONG
-        # bearish: daily price below daily SMA20 AND daily RSI < 35
+        # neutral: daily RSI ≥ 30 AND not bullish — still allow STRONG
+        # bearish: everything else (RSI < 30, OR RSI 30-45 below SMA) — blocks STRONG
         d_above_sma    = (d_sma20 is not None) and (d_closes[-1] > d_sma20)
         daily_bullish  = d_rsi > 45 and d_above_sma
         daily_neutral  = d_rsi >= 30 and not daily_bullish   # allow STRONG but block MODERATE
@@ -1563,8 +1563,7 @@ def _place_split_second_entry(
             "quantity": qty2,
             "newClientOrderId": f"agent-scanner-split2-{int(time.time())}",
         })
-        second_fill = (float(second_order.get("fills", [{}])[0].get("price", current_price))
-                       if second_order.get("fills") else current_price)
+        second_fill = _order_fill_price(second_order) or current_price
         second_qty = float(second_order.get("executedQty", qty2))
     except Exception as buy_err:
         # OCO was already cancelled — CRITICAL: position partially unprotected
@@ -1988,19 +1987,29 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
     try:
         if not active_trades:
             return
+
+        # T3-2: Timeout check — runs BEFORE the OCO loop so that trades with
+        # oco_id=None (no_oco state) are also age-checked. Timed-out trades
+        # are removed from active_trades so the OCO loop skips them.
+        if TRADE_TIMEOUT_ENABLED:
+            timed_out_ids: set[str] = set()
+            for trade in active_trades:
+                try:
+                    age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
+                    if age_h >= TRADE_TIMEOUT_H:
+                        _handle_trade_timeout(trade, trade["symbol"])
+                        timed_out_ids.add(str(trade.get("order_id", "")))
+                except Exception as _to_e:
+                    print(f"  ⚠ Timeout check failed for {trade.get('symbol', '?')}: {_to_e}")
+            if timed_out_ids:
+                active_trades = [t for t in active_trades if str(t.get("order_id", "")) not in timed_out_ids]
+
         oco_ids = {t["oco_id"]: t for t in active_trades if t.get("oco_id")}
         if not oco_ids:
             return
         for oco_id, trade in oco_ids.items():
             symbol = trade["symbol"]
             try:
-                # T3-2: Timeout check — runs before any API call to avoid wasted weight
-                if TRADE_TIMEOUT_ENABLED:
-                    age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
-                    if age_h >= TRADE_TIMEOUT_H:
-                        _handle_trade_timeout(trade, symbol)
-                        continue  # skip OCO fill check for this trade
-
                 # Check all orders for the symbol to find TP or SL fill.
                 # Scan all filled legs before deciding — prefer TP in edge case
                 # where both legs somehow register FILLED (race condition).
@@ -2088,8 +2097,8 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
                     trade["exit_price"] = ep
                     trade["pnl_pct"]    = final_pnl
                     trade["exit_time"]  = datetime.now().isoformat()
-            except Exception:
-                pass
+            except Exception as _te:
+                print(f"  ⚠ Trade outcome check failed for {symbol}: {_te}")
         # Persist updated trade statuses (tp_hit / sl_hit / partial_tp)
         resolved_by_order: dict[str, dict[str, Any]] = {
             str(t.get("order_id")): t for _, t in oco_ids.items()
@@ -2129,7 +2138,7 @@ def _handle_partial_tp1(trade: dict[str, Any], tp1_order: dict[str, Any]) -> Non
 
     Called from _check_sl_outcomes() when trade["tp1_order_id"] is found FILLED.
     All mutations are written back to the caller's in-memory trade dict; the
-    caller's persistence loop then flushes them to state.json.
+    caller's persistence loop then flushes them to state.db.
     """
     symbol   = trade["symbol"]
     tp1_fill = _order_fill_price(tp1_order) or trade.get("tp1_price")
@@ -3218,6 +3227,17 @@ def scan() -> None:
 
     # ── Check for SL outcomes from previous trades ───────────────────────────
     _check_sl_outcomes(_scan_conn)
+
+    # ── Re-alert for stuck positions (timeout_sell_failed / no_oco) ───────────
+    try:
+        _stuck = _scan_conn.execute(
+            "SELECT symbol, status FROM trades WHERE status IN ('timeout_sell_failed', 'no_oco')"
+        ).fetchall()
+        if _stuck:
+            _stuck_list = ", ".join(f"{r[0]}({r[1]})" for r in _stuck)
+            print(f"  ⚠ Stuck positions requiring manual intervention: {_stuck_list}")
+    except Exception:
+        pass
 
     # ── Split-entry: check pending second legs (T2-1) ─────────────────────────
     # Run before the main scan so second-leg fills are treated as open positions

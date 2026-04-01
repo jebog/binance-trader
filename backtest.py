@@ -338,6 +338,9 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             capital     = max(CAPITAL * VOL_SIZING_MIN, min(CAPITAL * VOL_SIZING_MAX, raw_capital))
         else:
             capital = float(CAPITAL)
+        # EXTREME signals capped at 50% for split-entry (mirrors scanner _calc_capital L2971)
+        if signal == "EXTREME":
+            capital = min(capital, CAPITAL * 0.5)
 
         open_trade = {
             "symbol":           symbol,
@@ -467,7 +470,7 @@ def main() -> None:
     print(f"  Execution: {partial_note}")
     print(f"  Sizing:    {vol_note}")
     print("  NOTE: No F&G or BTC dominance filter (not available historically)")
-    print("  SL/TP: ATR-based, SL=ATR×1.5 clamped [2%,6%], TP=SL×(3.5/1.5)")
+    print(f"  SL/TP: ATR-based, SL=ATR×{ATR_SL_MULT} clamped [{ATR_SL_MIN*100:.0f}%,{ATR_SL_MAX*100:.0f}%], TP=SL×({ATR_TP_MULT}/{ATR_SL_MULT})")
     print("  Max hold: 72 candles (3 days) → TIMEOUT at market")
     print("══════════════════════════════════════════════════════════════")
     print()

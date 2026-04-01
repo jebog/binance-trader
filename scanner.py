@@ -1129,6 +1129,13 @@ def get_fear_greed() -> tuple[int, str, bool]:
                 json.dump(state, f, indent=2)
         except Exception:
             pass
+        # SQLite dual-write
+        try:
+            _fg_conn = db_connect()
+            set_fg_cache(_fg_conn, value, classification)
+            _fg_conn.close()
+        except Exception:
+            pass
 
     # 1. Live fetch
     try:
@@ -1203,6 +1210,13 @@ def get_btc_dominance() -> Optional[float]:
         fresh["btc_dom_cache"] = {"value": dom, "ts": datetime.now().isoformat()}
         with open(STATE_FILE, "w") as f:
             json.dump(fresh, f, indent=2)
+        # SQLite dual-write
+        try:
+            _bdc_conn = db_connect()
+            set_btc_dom_cache(_bdc_conn, dom)
+            _bdc_conn.close()
+        except Exception:
+            pass
         return dom
     except Exception as e:
         print(f"  ⚠ BTC dominance fetch failed: {e}")
@@ -1532,6 +1546,13 @@ def _save_cooldown(symbol: str) -> None:
             json.dump(state, f, indent=2)
     except Exception:
         pass
+    # SQLite dual-write
+    try:
+        _cd_conn = db_connect()
+        save_cooldown(_cd_conn, symbol)
+        _cd_conn.close()
+    except Exception:
+        pass
 
 # ── Split-entry state helpers (T2-1) ─────────────────────────────────────────
 def _load_pending_second_entries() -> dict[str, Any]:
@@ -1559,6 +1580,13 @@ def _save_pending_second_entry(symbol: str, data: dict[str, Any]) -> None:
             json.dump(state, f, indent=2)
     except Exception as e:
         print(f"  ⚠ Could not persist pending second entry for {symbol}: {e}")
+    # SQLite dual-write
+    try:
+        _pse_conn = db_connect()
+        save_pending_second_entry(_pse_conn, symbol, data)
+        _pse_conn.close()
+    except Exception:
+        pass
 
 
 def _clear_pending_second_entry(symbol: str) -> None:
@@ -1575,6 +1603,13 @@ def _clear_pending_second_entry(symbol: str) -> None:
             json.dump(state, f, indent=2)
     except Exception as e:
         print(f"  ⚠ Could not clear pending second entry for {symbol}: {e}")
+    # SQLite dual-write
+    try:
+        _psc_conn = db_connect()
+        clear_pending_second_entry(_psc_conn, symbol)
+        _psc_conn.close()
+    except Exception:
+        pass
 
 
 def _place_split_second_entry(

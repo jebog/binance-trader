@@ -42,7 +42,6 @@ from textual.widgets import (
 # ── Import config + scanner functions ─────────────────────────────────────────
 # TeeLogger is guarded by `if __name__ == "__main__"` in scanner.py,
 # so this import does NOT hijack sys.stdout.
-from config import PAIR_SCORE_ENABLED
 from scanner import (
     LOG_FILE,
     MAX_DRAWDOWN_PCT,
@@ -54,19 +53,19 @@ from scanner import (
     _escape_md,
     _estimate_sl_tp_pct,
     _load_cooldowns,
-    _pair_score,
     analyze,
+    apply_correlation_cap,
+    build_market_context,
     db_connect,
     db_init,
     generate_dashboard,
-    get_all_trades,
-    get_btc_context,
-    get_fear_greed,
     get_open_positions,
     get_open_trades,
     get_portfolio,
     get_state_dict,
     place_buy_order,
+    run_position_management,
+    run_split_entry_checks,
     save_state,
     send_telegram,
 )
@@ -784,20 +783,12 @@ class ScannerApp(App):
 
         try:
             tlog("Fetching market context...")
-            fg_value, fg_class, _ = get_fear_greed()
-            btc_ctx = get_btc_context()
-            context = {
-                "fg_value":      fg_value,
-                "fg_class":      fg_class,
-                "btc_rsi":       btc_ctx["rsi"],
-                "btc_above_sma": btc_ctx["above_sma"],
-                "btc_price":     btc_ctx["price"],
-            }
-            self.call_from_thread(setattr, self, "fg_value",     fg_value)
-            self.call_from_thread(setattr, self, "fg_class",     fg_class)
-            self.call_from_thread(setattr, self, "btc_price",    btc_ctx["price"])
-            self.call_from_thread(setattr, self, "btc_rsi",      btc_ctx["rsi"])
-            self.call_from_thread(setattr, self, "btc_above_sma",btc_ctx["above_sma"])
+            context = build_market_context()
+            self.call_from_thread(setattr, self, "fg_value",     context["fg_value"])
+            self.call_from_thread(setattr, self, "fg_class",     context["fg_class"])
+            self.call_from_thread(setattr, self, "btc_price",    context["btc_price"])
+            self.call_from_thread(setattr, self, "btc_rsi",      context["btc_rsi"])
+            self.call_from_thread(setattr, self, "btc_above_sma",context["btc_above_sma"])
             self.call_from_thread(self._update_header_context)
 
             tlog("Fetching portfolio...")
@@ -805,6 +796,10 @@ class ScannerApp(App):
 
             tlog("Checking SL outcomes...")
             _check_sl_outcomes()
+
+            tlog("Position management...")
+            run_split_entry_checks()
+            run_position_management()
 
             tlog("Analyzing pairs...")
             results    = []
@@ -841,24 +836,10 @@ class ScannerApp(App):
                 finally:
                     self.call_from_thread(scan_bar.advance, 1)
 
-            # Correlation cap — mirrors scanner.py scan phase 2 (T4-3)
-            if len(candidates) >= 3:
-                if PAIR_SCORE_ENABLED:
-                    try:
-                        _ps_conn = db_connect()
-                        _ps_trades = get_all_trades(_ps_conn)
-                        _ps_conn.close()
-                    except Exception:
-                        _ps_trades = []
-                    _scores = {s["symbol"]: _pair_score(s["symbol"], _ps_trades) for s in candidates}
-                    candidates.sort(key=lambda s: _scores[s["symbol"]], reverse=True)
-                    reason = f"best score ({_scores[candidates[0]['symbol']]:.2f})"
-                else:
-                    candidates.sort(key=lambda s: s["rsi"])
-                    reason = "lowest RSI"
-                dropped = [s["symbol"] for s in candidates[1:]]
-                candidates = candidates[:1]
-                tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']} ({reason}), dropping {', '.join(dropped)}[/]")
+            # Correlation cap (shared helper — mirrors scanner.py exactly)
+            candidates, dropped, cap_reason = apply_correlation_cap(candidates)
+            if dropped:
+                tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']} ({cap_reason}), dropping {', '.join(dropped)}[/]")
 
             # Circuit breaker: mirror scanner.py guard (TUI scans are real orders too)
             if self._peak_usdc and portfolio:
@@ -894,16 +875,10 @@ class ScannerApp(App):
                 try:
                     _dash_conn = db_connect()
                     db_init(_dash_conn)
-                    dash_state = get_state_dict(_dash_conn)
+                    generate_dashboard(get_state_dict(_dash_conn))
                     _dash_conn.close()
-                    generate_dashboard(dash_state)
                 except Exception:
-                    try:
-                        with open(STATE_FILE) as f:
-                            dash_state = json.load(f)
-                        generate_dashboard(dash_state)
-                    except Exception:
-                        pass
+                    pass
 
             tlog(f"[green]Scan complete — {len(results)} pairs, {len(signals)} signal(s)[/]")
 

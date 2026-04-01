@@ -56,6 +56,7 @@ from config import (  # noqa: E402
     SPLIT_ENTRY_ENABLED, SPLIT_ENTRY_ATR_MULT, SPLIT_ENTRY_TTL_H,
     TRADE_TIMEOUT_ENABLED, TRADE_TIMEOUT_H,
     BREAKEVEN_ENABLED, BREAKEVEN_ATR_MULT,
+    PROGRESSIVE_TRAILING_ENABLED, PROGRESSIVE_TRAILING_STAGES,
     VOL_SIZING_ENABLED, TARGET_RISK_PCT, VOL_SIZING_MIN, VOL_SIZING_MAX,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
@@ -1137,6 +1138,146 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
                     break
             with open(STATE_FILE, "w") as _f:
                 json.dump(_be_patch2, _f, indent=2)
+        except Exception:
+            pass
+        return True
+
+
+# ── Progressive trailing stop (T4-4) ─────────────────────────────────────────
+def _check_progressive_trailing(trade: dict[str, Any], current_price: float, symbol: str) -> bool:
+    """Tighten trailing stop delta when price reaches successive ATR milestones.
+
+    Only fires after break-even has armed (breakeven_moved=True).
+    Each stage fires exactly once, guarded by trailing_stage index.
+    Mirrors _check_breakeven's cancel+re-place pattern.
+
+    Returns True if a stage was applied (for logging), False otherwise.
+    """
+    if not PROGRESSIVE_TRAILING_ENABLED:
+        return False
+    if not trade.get("breakeven_moved"):
+        return False   # wait for break-even first
+    current_stage = trade.get("trailing_stage", 0)
+    if current_stage >= len(PROGRESSIVE_TRAILING_STAGES):
+        return False   # all stages applied
+
+    sl_pct = trade.get("sl_pct")
+    if not sl_pct or ATR_SL_MULT <= 0:
+        return False
+    atr_pct = sl_pct / ATR_SL_MULT
+    entry   = trade.get("entry", 0.0)
+    if not entry:
+        return False
+
+    atr_mult_trigger, new_bps = PROGRESSIVE_TRAILING_STAGES[current_stage]
+    trigger_price = entry * (1 + atr_mult_trigger * atr_pct)
+    if current_price < trigger_price:
+        return False
+
+    # ── Cancel existing OCO ──────────────────────────────────────────────────
+    oco_id = trade.get("oco_id")
+    if not oco_id:
+        return False
+    try:
+        signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": oco_id})
+        print(f"  Cancelled OCO #{oco_id} for progressive trailing stage {current_stage + 1} on {symbol}")
+    except Exception as cancel_err:
+        print(f"  ⚠ Progressive trailing OCO cancel failed for {symbol} stage {current_stage + 1}: "
+              f"{cancel_err} — will retry next scan")
+        return False  # do NOT advance stage; retry next scan
+
+    # ── Re-fetch exchange precision ──────────────────────────────────────────
+    try:
+        info = get("/api/v3/exchangeInfo", {"symbol": symbol})
+        tick = 0.01
+        for f in info["symbols"][0]["filters"]:
+            if f["filterType"] == "PRICE_FILTER":
+                tick = float(f["tickSize"])
+        tick_prec = len(str(tick).rstrip("0").split(".")[-1])
+
+        be_sl    = trade.get("sl")   # current SL (entry after break-even)
+        tp_price = trade.get("tp")
+        qty      = trade.get("qty", 0)
+
+        # ── Place new OCO with tighter trailing delta ─────────────────────────
+        if new_bps > 0:
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":             symbol,
+                "side":               "SELL",
+                "quantity":           qty,
+                "aboveType":          "LIMIT_MAKER",
+                "abovePrice":         tp_price,
+                "belowType":          "STOP_LOSS",
+                "belowStopPrice":     be_sl,
+                "belowTrailingDelta": new_bps,
+                "belowTimeInForce":   "GTC",
+            })
+        else:
+            # Fixed stop: use STOP_LOSS_LIMIT at current be_sl
+            sl_limit = round(round(be_sl * 0.995 / tick) * tick, tick_prec)
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":           symbol,
+                "side":             "SELL",
+                "quantity":         qty,
+                "aboveType":        "LIMIT_MAKER",
+                "abovePrice":       tp_price,
+                "belowType":        "STOP_LOSS_LIMIT",
+                "belowStopPrice":   be_sl,
+                "belowPrice":       sl_limit,
+                "belowTimeInForce": "GTC",
+            })
+
+        trade["oco_id"]        = new_oco.get("orderListId")
+        trade["trailing_stage"] = current_stage + 1
+        stage_total = len(PROGRESSIVE_TRAILING_STAGES)
+        print(f"  🎯 Progressive trailing stage {current_stage + 1}/{stage_total} armed for {symbol} "
+              f"— delta {new_bps}bps at ${current_price:.4f} ({atr_mult_trigger}×ATR)")
+        send_telegram(
+            f"🎯 Trailing tightened `{symbol}` stage {current_stage + 1}/{stage_total}\n"
+            f"Delta: `{new_bps}bps` at `${current_price:.4f}` ({atr_mult_trigger}×ATR)"
+        )
+
+        # Surgical state flush
+        try:
+            _pt_patch: dict[str, Any] = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as _f:
+                    _pt_patch = json.load(_f)
+            for _t in (_pt_patch.get("trades") or []):
+                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                    _t["oco_id"]         = trade["oco_id"]
+                    _t["trailing_stage"] = trade["trailing_stage"]
+                    break
+            with open(STATE_FILE, "w") as _f:
+                json.dump(_pt_patch, _f, indent=2)
+        except Exception:
+            pass  # best-effort; main persistence loop will catch it
+
+        return True
+
+    except Exception as oco_err:
+        total = len(PROGRESSIVE_TRAILING_STAGES)
+        msg = (f"🚨 *PROGRESSIVE TRAILING OCO FAILED* — `{symbol}` stage "
+               f"{current_stage + 1}/{total} UNPROTECTED. "
+               f"Place OCO manually. Error: `{str(oco_err)[:200]}`")
+        print(f"  ✗ {msg}")
+        send_telegram(msg)
+        trade["status"]         = "no_oco"
+        trade["trailing_stage"] = current_stage + 1  # stop retrying this stage
+        # Surgical flush for the critical no_oco status
+        try:
+            _pt_patch2: dict[str, Any] = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as _f:
+                    _pt_patch2 = json.load(_f)
+            for _t in (_pt_patch2.get("trades") or []):
+                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                    _t["status"]         = "no_oco"
+                    _t["trailing_stage"] = trade["trailing_stage"]
+                    _t["oco_id"]         = None
+                    break
+            with open(STATE_FILE, "w") as _f:
+                json.dump(_pt_patch2, _f, indent=2)
         except Exception:
             pass
         return True
@@ -2517,6 +2658,29 @@ def scan() -> None:
                 _check_breakeven(_be_trade, _be_cp, _be_sym)
             except Exception as _be_e:
                 print(f"  ⚠ Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
+
+    # ── Progressive trailing: tighten stop at each ATR milestone (T4-4) ─────────
+    # Fires only for breakeven-armed trades; each stage cancels+replaces the OCO
+    # with a tighter trailing delta. Mirrors the break-even phase above.
+    if PROGRESSIVE_TRAILING_ENABLED:
+        _pt_state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE) as _f:
+                    _pt_state = json.load(_f)
+            except Exception:
+                pass
+        for _pt_trade in (_pt_state.get("trades") or []):
+            if _pt_trade.get("status") not in ("open", "partial_tp"):
+                continue
+            if not _pt_trade.get("breakeven_moved"):
+                continue   # micro-opt: skip trades where break-even hasn't fired
+            try:
+                _pt_sym = _pt_trade["symbol"]
+                _pt_cp  = float(get("/api/v3/ticker/price", {"symbol": _pt_sym})["price"])
+                _check_progressive_trailing(_pt_trade, _pt_cp, _pt_sym)
+            except Exception as _pt_e:
+                print(f"  ⚠ Progressive trailing check failed for {_pt_trade.get('symbol', '?')}: {_pt_e}")
 
     # ── Market context (fetched once per scan) ────────────────────────────────
     fg_value, fg_class, fg_fresh = get_fear_greed()

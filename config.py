@@ -51,6 +51,11 @@ ENTRY_REFINE_ENABLED     = True
 ENTRY_REFINE_15M_RSI_MAX = 45    # skip order if 15m RSI > this (momentum peaked on shorter TF)
 ENTRY_REFINE_15M_LIMIT   = 50    # candles to fetch: 14 seed + 35 Wilder steps → good convergence
 
+# ── Dynamic pair scoring (T4-3) ──────────────────────────────────────────────
+PAIR_SCORE_ENABLED    = True
+PAIR_SCORE_MIN_TRADES = 3     # minimum closed trades per symbol to use score (else neutral 0.5)
+PAIR_SCORE_LOOKBACK   = 20    # last N closed trades per symbol to consider
+
 # ── BTC dominance filter (T2-3) ───────────────────────────────────────────────
 BTC_DOM_ENABLED        = True
 BTC_DOM_CACHE_H        = 1       # cache lifetime hours (CoinGecko free tier: ~50 req/min)

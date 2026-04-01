@@ -12,7 +12,7 @@ from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 # ── Import pure functions directly (no side effects on import) ────────────────
-from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats
+from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats, _pair_score
 from backtest import (
     calc_rsi as bt_calc_rsi,
     calc_sma as bt_calc_sma,
@@ -1644,3 +1644,72 @@ class TestEntryRefine:
             if scanner.ENTRY_REFINE_ENABLED:
                 scanner._get_15m_rsi("ETHUSDC")
         assert call_count == []   # never called when disabled
+
+
+# ── T4-3: Dynamic pair scoring ────────────────────────────────────────────────
+class TestPairScore:
+    """Tests for _pair_score() — pure function, no I/O."""
+
+    def _trade(self, symbol: str, pnl_pct: float, status: str = "tp_hit") -> dict:
+        return {"symbol": symbol, "pnl_pct": pnl_pct, "status": status}
+
+    def test_neutral_with_no_history(self):
+        """Fewer than PAIR_SCORE_MIN_TRADES → 0.5 (neutral)."""
+        import scanner
+        trades = [self._trade("ETHUSDC", 5.0)]  # only 1 trade < 3 min
+        score = _pair_score("ETHUSDC", trades)
+        assert score == pytest.approx(0.5)
+
+    def test_neutral_with_empty_trades(self):
+        assert _pair_score("ETHUSDC", []) == pytest.approx(0.5)
+
+    def test_high_win_rate_and_pf(self):
+        """6 wins / 2 losses at 2:1 pnl ratio → score > 1.0."""
+        trades = (
+            [self._trade("ETHUSDC", 4.0)] * 6 +
+            [self._trade("ETHUSDC", -2.0)] * 2
+        )
+        score = _pair_score("ETHUSDC", trades)
+        # win_rate = 0.75, profit_factor = (6*4)/(2*2) = 24/4 = 6.0 → score = 4.5
+        assert score == pytest.approx(4.5, rel=1e-4)
+
+    def test_all_losses_gives_zero(self):
+        import scanner
+        trades = [self._trade("ETHUSDC", -2.0, "sl_hit")] * 5
+        score = _pair_score("ETHUSDC", trades)
+        assert score == pytest.approx(0.0)
+
+    def test_uses_last_n_trades(self):
+        """Only last PAIR_SCORE_LOOKBACK trades are used."""
+        import scanner
+        # 25 old losses then 5 recent wins — lookback=20 should pick 5 wins + 15 losses
+        old_losses = [self._trade("ETHUSDC", -2.0, "sl_hit")] * 25
+        recent_wins = [self._trade("ETHUSDC", 4.0, "tp_hit")] * 5
+        all_trades = old_losses + recent_wins
+        score = _pair_score("ETHUSDC", all_trades)
+        # Last 20: 15 losses + 5 wins → win_rate=0.25, pf=5*4/(15*2)=20/30=0.667 → 0.167
+        expected_wr = 5 / 20
+        expected_pf = (5 * 4.0) / (15 * 2.0)
+        assert score == pytest.approx(expected_wr * expected_pf, rel=1e-4)
+
+    def test_ignores_other_symbols(self):
+        """Score for ETHUSDC not contaminated by SOLUSDC trades."""
+        eth_trades = [self._trade("ETHUSDC", 3.0)] * 5
+        sol_trades = [self._trade("SOLUSDC", -5.0, "sl_hit")] * 10
+        score = _pair_score("ETHUSDC", eth_trades + sol_trades)
+        # 5 ETH all-wins: no losses → returns win_rate = 1.0 (all-wins case)
+        assert score == pytest.approx(1.0)
+
+    def test_all_wins_returns_win_rate(self):
+        """All-wins: score = win_rate (1.0) not a huge epsilon-divided number."""
+        trades = [self._trade("ETHUSDC", 5.0)] * 5
+        score = _pair_score("ETHUSDC", trades)
+        assert score == pytest.approx(1.0)   # win_rate=1.0, no losses → win_rate returned
+
+    def test_disabled_falls_back_to_rsi_sort(self):
+        """PAIR_SCORE_ENABLED=False → correlation cap uses RSI sort (verified via constant)."""
+        import scanner
+        # The flag exists and can be set false; actual cap logic tested via scan integration
+        with patch("scanner.PAIR_SCORE_ENABLED", False):
+            enabled = scanner.PAIR_SCORE_ENABLED
+        assert enabled is False

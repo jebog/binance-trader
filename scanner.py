@@ -308,8 +308,6 @@ def get_fear_greed() -> tuple[int, str, bool]:
 
     Priority: live fetch → cached value (< 25h old) → fallback 50 + Telegram warning.
     """
-    from datetime import timedelta
-
     def _read_cache():
         try:
             if os.path.exists(STATE_FILE):
@@ -640,7 +638,6 @@ def _save_cooldown(symbol: str) -> None:
             with open(STATE_FILE) as f:
                 state = json.load(f)
         cooldowns = state.get("cooldowns") or {}
-        from datetime import timedelta
         cooldowns[symbol] = (datetime.now() + timedelta(hours=SL_COOLDOWN_H)).isoformat()
         state["cooldowns"] = cooldowns
         with open(STATE_FILE, "w") as f:
@@ -1435,15 +1432,9 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
     cutoff    = now - timedelta(days=7)
     trades    = state.get("trades") or []
     portfolio = state.get("portfolio")
-    # Try to get F&G from context embedded in history
-    fg_str = ""
-    for h in reversed(state.get("history") or []):
-        for sig in h.get("signals") or []:
-            if "fg_value" in sig:
-                fg_str = f"\n*Fear & Greed:* `{sig['fg_value']}`"
-                break
-        if fg_str:
-            break
+    fg_cache  = state.get("fg_cache") or {}
+    fg_val    = fg_cache.get("value")
+    fg_str    = f"\n*Fear & Greed:* `{fg_val}`" if fg_val is not None else ""
 
     # 7-day closed trades
     window = []
@@ -1465,7 +1456,7 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
     )
     win_usdc  = sum((t.get("pnl_pct") or 0) / 100 * (t.get("capital") or CAPITAL) for t in wins)
     loss_usdc = sum((t.get("pnl_pct") or 0) / 100 * (t.get("capital") or CAPITAL) for t in losses)
-    deployed  = len(window) * CAPITAL if window else CAPITAL
+    deployed  = sum(t.get("capital") or CAPITAL for t in window) or CAPITAL
     net_pct   = net_usdc / deployed * 100 if deployed else 0.0
 
     # Open positions
@@ -1801,9 +1792,13 @@ def scan() -> None:
             last_digest = _digest_state.get("last_digest_date", "")
             if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
                 _send_daily_digest(_digest_state)
-                _digest_state["last_digest_date"] = str(now.date())
+                # Surgical patch: re-read freshest state after send_telegram() network call
+                # to avoid overwriting concurrent cooldown writes with a stale snapshot.
+                with open(STATE_FILE) as _df:
+                    _patch = json.load(_df)
+                _patch["last_digest_date"] = str(now.date())
                 with open(STATE_FILE, "w") as _df:
-                    json.dump(_digest_state, _df, indent=2)
+                    json.dump(_patch, _df, indent=2)
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
 

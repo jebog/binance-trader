@@ -49,3 +49,6 @@ generate_guide.py
 guide_trading_debutants.pdf
 ve-full.png
 ve-hero.png
+state.db
+state.db-shm
+state.db-wal

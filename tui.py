@@ -44,6 +44,7 @@ from textual.widgets import (
 # so this import does NOT hijack sys.stdout.
 from scanner import (
     LOG_FILE,
+    MAX_DRAWDOWN_PCT,
     MAX_POSITIONS,
     PAIRS,
     STATE_FILE,
@@ -276,7 +277,8 @@ class PairCard(Widget):
 
 
 class PortfolioWidget(Static):
-    def render_portfolio(self, portfolio: dict, open_pnl: float | None = None) -> str:
+    def render_portfolio(self, portfolio: dict, open_pnl: float | None = None,
+                         peak_usdc: float | None = None) -> str:
         if not portfolio or not portfolio.get("assets"):
             return "[dim]No portfolio data — press [S] to scan[/]"
 
@@ -287,6 +289,13 @@ class PortfolioWidget(Static):
         if open_pnl is not None:
             pnl_col = M_GREEN if open_pnl >= 0 else M_RED
             lines.append(f"[dim]Open P&L:[/] [{pnl_col}]{open_pnl:+.2f} USDC[/]")
+
+        if peak_usdc and total is not None and peak_usdc > total:
+            dd_pct = (peak_usdc - total) / peak_usdc * 100
+            if dd_pct >= 15:
+                lines.append(f"[bold {M_RED}]🛑 HALTED {dd_pct:.1f}% drawdown[/]")
+            elif dd_pct >= 10:
+                lines.append(f"[dark_orange]⚠ Drawdown: {dd_pct:.1f}%[/]")
         lines.append("")
 
         for a in portfolio["assets"]:
@@ -307,8 +316,9 @@ class PortfolioWidget(Static):
             )
         return "\n".join(lines)
 
-    def update_portfolio(self, portfolio: dict, open_pnl: float | None = None) -> None:
-        self.update(self.render_portfolio(portfolio, open_pnl=open_pnl))
+    def update_portfolio(self, portfolio: dict, open_pnl: float | None = None,
+                         peak_usdc: float | None = None) -> None:
+        self.update(self.render_portfolio(portfolio, open_pnl=open_pnl, peak_usdc=peak_usdc))
 
 
 class CooldownWidget(Static):
@@ -525,6 +535,7 @@ class ScannerApp(App):
         self._cooldowns:         dict       = {}
         self._trades:            list[dict] = []
         self._open_pnl:          float | None = None  # aggregate unrealized P&L from last scan
+        self._peak_usdc:         float | None = None  # portfolio high-water mark for drawdown display
         self._scan_ctx:          dict       = {}   # NOT _context — shadows Textual internal
         self._notified_outcomes: set        = set()  # (oco_id|time, status) — no re-toast
         self._scan_bar:          ProgressBar | None = None  # captured on main thread in watch_scanning
@@ -649,6 +660,7 @@ class ScannerApp(App):
         self._trades    = state.get("trades") or []
         if state.get("portfolio"):
             self._portfolio = state["portfolio"]
+        self._peak_usdc = state.get("peak_portfolio_usdc")
 
         self.last_scan = (state.get("last_scan") or "")[:19]
 
@@ -682,7 +694,7 @@ class ScannerApp(App):
         self.query_one("#equity-widget",   EquityWidget).refresh_equity(self._trades)
         if self._portfolio:
             self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(
-                self._portfolio, open_pnl=self._open_pnl
+                self._portfolio, open_pnl=self._open_pnl, peak_usdc=self._peak_usdc
             )
             # Swap LoadingIndicator → portfolio on first data arrival
             switcher = self.query_one("#left-switcher", ContentSwitcher)
@@ -810,6 +822,15 @@ class ScannerApp(App):
                 candidates = candidates[:1]
                 tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']}, dropping {', '.join(dropped)}[/]")
 
+            # Circuit breaker: mirror scanner.py guard (TUI scans are real orders too)
+            if self._peak_usdc and portfolio:
+                _cb_current = portfolio.get("total_usdc")
+                if _cb_current is not None:
+                    _cb_dd = (self._peak_usdc - _cb_current) / self._peak_usdc
+                    if _cb_dd >= MAX_DRAWDOWN_PCT:
+                        tlog(f"[bold red]🛑 CIRCUIT BREAKER: {_cb_dd*100:.1f}% drawdown — no orders placed[/]")
+                        candidates = []
+
             # Per-symbol guards
             signals = []
             for result in candidates:
@@ -884,7 +905,7 @@ class ScannerApp(App):
         # Update portfolio panel and dismiss LoadingIndicator immediately
         if msg.portfolio:
             self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(
-                msg.portfolio, open_pnl=msg.open_pnl
+                msg.portfolio, open_pnl=msg.open_pnl, peak_usdc=self._peak_usdc
             )
             switcher = self.query_one("#left-switcher", ContentSwitcher)
             if switcher.current == "portfolio-loading":

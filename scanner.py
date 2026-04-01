@@ -47,7 +47,7 @@ from config import (  # noqa: E402
     TELEGRAM_CHAT_ID,
     WEBHOOK_URL,
     PAIRS, CAPITAL,
-    MAX_POSITIONS, SL_COOLDOWN_H,
+    MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -175,6 +175,7 @@ def save_state(
     portfolio: Optional[dict[str, Any]] = None,
     fg_regime: Optional[str] = None,
     open_pnl: Optional[float] = None,
+    cb_alert_sent_at: Optional[str] = None,
 ) -> None:
     """Save last scan results to state.json for the dashboard."""
     try:
@@ -190,10 +191,19 @@ def save_state(
             state["fg_cache"]      = old.get("fg_cache")                     # preserve F&G cache
             state["portfolio"]     = old.get("portfolio")                  # preserve last portfolio
             state["sent_signals"]  = old.get("sent_signals") or {}         # preserve dedup ledger
-            state["fg_regime"]     = fg_regime or old.get("fg_regime")      # preserve regime state
-            state["open_pnl"]      = open_pnl if open_pnl is not None else old.get("open_pnl")
+            state["fg_regime"]        = fg_regime or old.get("fg_regime")     # preserve regime state
+            state["open_pnl"]         = open_pnl if open_pnl is not None else old.get("open_pnl")
+            state["peak_portfolio_usdc"] = old.get("peak_portfolio_usdc")   # updated below
+            state["cb_alert_sent_at"] = cb_alert_sent_at or old.get("cb_alert_sent_at")
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
+        # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
+        current_total = portfolio["total_usdc"] if portfolio else None
+        old_peak: float = state.get("peak_portfolio_usdc") or 0.0
+        if current_total is not None and current_total > old_peak:
+            state["peak_portfolio_usdc"] = current_total
+        elif old_peak > 0:
+            state["peak_portfolio_usdc"] = old_peak
         if signals:
             state["history"].append({"time": state["last_scan"], "signals": signals})
         if new_trades:
@@ -603,6 +613,24 @@ def _save_sent_signals(sent_signals: dict[str, str]) -> None:
     except Exception:
         pass
 
+def _order_fill_price(order: dict[str, Any]) -> Optional[float]:
+    """Return actual avg fill price from a FILLED Binance order object.
+
+    Uses cummulativeQuoteQty / executedQty (accurate for trailing stops);
+    falls back to the order's price field.
+    """
+    try:
+        qty   = float(order.get("executedQty") or 0)
+        quote = float(order.get("cummulativeQuoteQty") or 0)
+        if qty > 0:
+            return quote / qty
+    except Exception:
+        pass
+    try:
+        return float(order["price"])
+    except Exception:
+        return None
+
 def _save_cooldown(symbol: str) -> None:
     """Record a SL-cooldown for symbol for SL_COOLDOWN_H hours."""
     try:
@@ -641,22 +669,38 @@ def _check_sl_outcomes() -> None:
                 all_orders = signed_get("/api/v3/allOrders", {"symbol": symbol, "limit": 10})
                 tp_filled = False
                 sl_filled = False
+                filled_tp_order: Optional[dict[str, Any]] = None
+                filled_sl_order: Optional[dict[str, Any]] = None
                 for o in all_orders:
                     if (o.get("status") == "FILLED"
                             and str(o.get("orderListId")) == str(oco_id)):
                         if o.get("type") == "LIMIT_MAKER":
                             tp_filled = True
+                            filled_tp_order = o
                         elif o.get("type") in ("STOP_LOSS_LIMIT", "STOP_LOSS"):
                             sl_filled = True
+                            filled_sl_order = o
                 if tp_filled:
                     print(f"  ✓ TP hit detected for {symbol}")
                     send_telegram(f"✅ TP hit on `{symbol}` — target reached")
-                    trade["status"] = "tp_hit"
+                    trade["status"]     = "tp_hit"
+                    ep = (_order_fill_price(filled_tp_order)
+                          if filled_tp_order else trade.get("tp"))
+                    trade["exit_price"] = ep
+                    entry = trade.get("entry")
+                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
+                    trade["exit_time"] = datetime.now().isoformat()
                 elif sl_filled:
                     print(f"  ⚠ SL hit detected for {symbol} — cooldown {SL_COOLDOWN_H}h")
                     send_telegram(f"🔴 SL hit on `{symbol}` — pausing signals {SL_COOLDOWN_H}h")
                     _save_cooldown(symbol)
-                    trade["status"] = "sl_hit"
+                    trade["status"]     = "sl_hit"
+                    ep = (_order_fill_price(filled_sl_order)
+                          if filled_sl_order else trade.get("sl"))
+                    trade["exit_price"] = ep
+                    entry = trade.get("entry")
+                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
+                    trade["exit_time"] = datetime.now().isoformat()
             except Exception:
                 pass
         # Persist updated trade statuses (tp_hit / sl_hit)
@@ -665,7 +709,10 @@ def _check_sl_outcomes() -> None:
         for t in (state.get("trades") or []):
             resolved = oco_ids.get(t.get("oco_id"))
             if resolved and resolved.get("status") in ("tp_hit", "sl_hit"):
-                t["status"] = resolved["status"]
+                t["status"]     = resolved["status"]
+                t["exit_price"] = resolved.get("exit_price")
+                t["pnl_pct"]    = resolved.get("pnl_pct")
+                t["exit_time"]  = resolved.get("exit_time")
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -1469,6 +1516,31 @@ def scan() -> None:
         print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} (lowest RSI), "
               f"dropping: {', '.join(dropped)}")
 
+    # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────
+    peak_usdc    = _scan_state.get("peak_portfolio_usdc") or 0.0
+    current_usdc = portfolio["total_usdc"] if portfolio else None
+    cb_alert_ts: Optional[str] = None  # set if alert fires this scan
+    if peak_usdc and current_usdc:
+        drawdown_pct = (peak_usdc - current_usdc) / peak_usdc
+        if drawdown_pct >= MAX_DRAWDOWN_PCT:
+            # Deduplicate: only fire Telegram once every 4 hours
+            cb_last = _scan_state.get("cb_alert_sent_at") or ""
+            cb_cooldown_expired = (
+                not cb_last
+                or (datetime.now() - datetime.fromisoformat(cb_last)).total_seconds() >= 4 * 3600
+            )
+            if cb_cooldown_expired:
+                cb_msg = (
+                    f"🛑 *Circuit breaker triggered*\n"
+                    f"Drawdown: `{drawdown_pct*100:.1f}%` from peak\n"
+                    f"Peak: `${peak_usdc:,.0f}` → Now: `${current_usdc:,.0f}`\n"
+                    f"New orders halted until portfolio recovers."
+                )
+                send_telegram(cb_msg)
+                cb_alert_ts = datetime.now().isoformat()
+            print(f"  🛑 CIRCUIT BREAKER: {drawdown_pct*100:.1f}% drawdown — no orders placed")
+            candidates = []
+
     # ── Phase 3: Per-symbol guards (open position, cooldown, max positions) ──
     for result in candidates:
         symbol = result["symbol"]
@@ -1483,7 +1555,8 @@ def scan() -> None:
 
     save_state(all_results, [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                                "signal_strength": s["signal_strength"]} for s in signals],
-               portfolio=portfolio, fg_regime=new_fg_regime, open_pnl=open_pnl_usdc)
+               portfolio=portfolio, fg_regime=new_fg_regime, open_pnl=open_pnl_usdc,
+               cb_alert_sent_at=cb_alert_ts)
 
     # ── Telegram scan summary ─────────────────────────────────────────────────
     if all_results:

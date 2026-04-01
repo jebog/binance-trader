@@ -99,6 +99,9 @@ TARGET_RISK_PCT    = 0.015  # target 1.5% portfolio risk per trade (= 1×ATR as 
 VOL_SIZING_MIN     = 0.25   # floor: never below 25% of CAPITAL
 VOL_SIZING_MAX     = 1.00   # ceiling: never above 100% of CAPITAL
 
+# ── Persistence ───────────────────────────────────────────────
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.db")
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

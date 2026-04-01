@@ -98,13 +98,14 @@ ASSET_COLORS = {
 
 # ── Custom messages ───────────────────────────────────────────────────────────
 class ScanComplete(Message):
-    def __init__(self, results, signals, context, portfolio, positions):
+    def __init__(self, results, signals, context, portfolio, positions, open_pnl=None):
         super().__init__()
         self.results   = results
         self.signals   = signals
         self.context   = context
         self.portfolio = portfolio
         self.positions = positions
+        self.open_pnl  = open_pnl   # aggregate unrealized P&L in USDC (None if no positions)
 
 class StateUpdated(Message):
     def __init__(self, state):
@@ -275,13 +276,18 @@ class PairCard(Widget):
 
 
 class PortfolioWidget(Static):
-    def render_portfolio(self, portfolio: dict) -> str:
+    def render_portfolio(self, portfolio: dict, open_pnl: float | None = None) -> str:
         if not portfolio or not portfolio.get("assets"):
             return "[dim]No portfolio data — press [S] to scan[/]"
 
         total   = portfolio["total_usdc"]
         fetched = (portfolio.get("fetched_at") or "")[:16]
-        lines   = [f"[bold {M_TEAL}]${total:,.2f}[/] [dim]USDC[/]  [dim]{fetched}[/]\n"]
+        lines   = [f"[bold {M_TEAL}]${total:,.2f}[/] [dim]USDC[/]  [dim]{fetched}[/]"]
+
+        if open_pnl is not None:
+            pnl_col = M_GREEN if open_pnl >= 0 else M_RED
+            lines.append(f"[dim]Open P&L:[/] [{pnl_col}]{open_pnl:+.2f} USDC[/]")
+        lines.append("")
 
         for a in portfolio["assets"]:
             pct      = a["pct"]
@@ -301,8 +307,8 @@ class PortfolioWidget(Static):
             )
         return "\n".join(lines)
 
-    def update_portfolio(self, portfolio: dict) -> None:
-        self.update(self.render_portfolio(portfolio))
+    def update_portfolio(self, portfolio: dict, open_pnl: float | None = None) -> None:
+        self.update(self.render_portfolio(portfolio, open_pnl=open_pnl))
 
 
 class CooldownWidget(Static):
@@ -518,6 +524,7 @@ class ScannerApp(App):
         self._positions:         list[dict] = []
         self._cooldowns:         dict       = {}
         self._trades:            list[dict] = []
+        self._open_pnl:          float | None = None  # aggregate unrealized P&L from last scan
         self._scan_ctx:          dict       = {}   # NOT _context — shadows Textual internal
         self._notified_outcomes: set        = set()  # (oco_id|time, status) — no re-toast
         self._scan_bar:          ProgressBar | None = None  # captured on main thread in watch_scanning
@@ -566,7 +573,7 @@ class ScannerApp(App):
 
                 with TabPane("Positions", id="tab-positions"):
                     positions_table = DataTable(id="positions-table", show_cursor=False)
-                    positions_table.add_columns("Symbol", "Qty", "Entry", "Current", "TP", "SL", "P&L")
+                    positions_table.add_columns("Symbol", "Qty", "Entry", "Current", "TP", "SL", "P&L", "Held")
                     yield positions_table
 
                 with TabPane("History", id="tab-history"):
@@ -674,7 +681,9 @@ class ScannerApp(App):
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
         self.query_one("#equity-widget",   EquityWidget).refresh_equity(self._trades)
         if self._portfolio:
-            self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(self._portfolio)
+            self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(
+                self._portfolio, open_pnl=self._open_pnl
+            )
             # Swap LoadingIndicator → portfolio on first data arrival
             switcher = self.query_one("#left-switcher", ContentSwitcher)
             if switcher.current == "portfolio-loading":
@@ -765,6 +774,7 @@ class ScannerApp(App):
             cooldowns  = _load_cooldowns()
             positions  = get_open_positions()
             open_count = len(positions)
+            open_pnl   = sum(p["pnl"] for p in positions if p.get("pnl") is not None) or None
             scan_bar   = self._scan_bar  # reference captured on main thread in watch_scanning
 
             for symbol in PAIRS:
@@ -845,7 +855,8 @@ class ScannerApp(App):
             self.call_from_thread(
                 self.post_message,
                 ScanComplete(results=results, signals=signals, context=context,
-                             portfolio=portfolio or {}, positions=positions),
+                             portfolio=portfolio or {}, positions=positions,
+                             open_pnl=open_pnl),
             )
 
         except Exception as e:
@@ -858,6 +869,7 @@ class ScannerApp(App):
         self._pair_results = msg.results
         self._portfolio    = msg.portfolio
         self._positions    = msg.positions
+        self._open_pnl     = msg.open_pnl
         self._scan_ctx      = msg.context
         self.last_scan     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -869,7 +881,9 @@ class ScannerApp(App):
 
         # Update portfolio panel and dismiss LoadingIndicator immediately
         if msg.portfolio:
-            self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(msg.portfolio)
+            self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(
+                msg.portfolio, open_pnl=msg.open_pnl
+            )
             switcher = self.query_one("#left-switcher", ContentSwitcher)
             if switcher.current == "portfolio-loading":
                 switcher.current = "portfolio-widget"
@@ -966,8 +980,16 @@ class ScannerApp(App):
             tp       = f"${p['tp']:.4f}"       if p.get("tp")      else "—"
             sl       = f"${p['sl']:.4f}"       if p.get("sl")      else "—"
             qty      = str(p.get("qty") or "—")
+            # "Held" — time since entry (hours or days)
+            held_str = "—"
+            if p.get("time"):
+                try:
+                    delta_h = (datetime.now() - datetime.fromisoformat(p["time"])).total_seconds() / 3600
+                    held_str = f"{delta_h/24:.1f}d" if delta_h >= 48 else f"{delta_h:.0f}h"
+                except Exception:
+                    pass
             table.add_row(
-                p["symbol"], qty, entry, cur, tp, sl, pnl_cell,
+                p["symbol"], qty, entry, cur, tp, sl, pnl_cell, held_str,
             )
 
     def _refresh_history_table(self, trades: list[dict]) -> None:

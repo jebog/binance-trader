@@ -174,6 +174,7 @@ def save_state(
     new_trades: Optional[list[dict[str, Any]]] = None,
     portfolio: Optional[dict[str, Any]] = None,
     fg_regime: Optional[str] = None,
+    open_pnl: Optional[float] = None,
 ) -> None:
     """Save last scan results to state.json for the dashboard."""
     try:
@@ -190,6 +191,7 @@ def save_state(
             state["portfolio"]     = old.get("portfolio")                  # preserve last portfolio
             state["sent_signals"]  = old.get("sent_signals") or {}         # preserve dedup ledger
             state["fg_regime"]     = fg_regime or old.get("fg_regime")      # preserve regime state
+            state["open_pnl"]      = open_pnl if open_pnl is not None else old.get("open_pnl")
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         if signals:
@@ -510,6 +512,7 @@ def get_open_positions() -> list[dict[str, Any]]:
             "sl":      trade.get("sl"),
             "pnl":     pnl,
             "pnl_pct": pnl_pct,
+            "time":    trade.get("time"),   # entry timestamp for "held" calculation
         })
     return positions
 
@@ -1434,7 +1437,10 @@ def scan() -> None:
     signals = []
     all_results = []
     cooldowns = _load_cooldowns()
-    open_count = len(get_open_positions())
+    _open_pos   = get_open_positions()
+    open_count  = len(_open_pos)
+    _pnl_vals     = [p["pnl"] for p in _open_pos if p.get("pnl") is not None]
+    open_pnl_usdc = sum(_pnl_vals) if _pnl_vals else None
 
     # ── Phase 1: Analyze all pairs, collect raw candidates ───────────────────
     candidates = []
@@ -1477,7 +1483,7 @@ def scan() -> None:
 
     save_state(all_results, [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                                "signal_strength": s["signal_strength"]} for s in signals],
-               portfolio=portfolio, fg_regime=new_fg_regime)
+               portfolio=portfolio, fg_regime=new_fg_regime, open_pnl=open_pnl_usdc)
 
     # ── Telegram scan summary ─────────────────────────────────────────────────
     if all_results:
@@ -1510,10 +1516,9 @@ def scan() -> None:
                 f"{icon} `{pair:<5}` ${r['price']:<10.4f} RSI:`{r['rsi']:<5}` 24h:`{r['change24h']:+.2f}%`"
                 + (f"  *{r['signal_strength']}*" if r["signal_strength"] != "NONE" else "")
             )
-        positions = get_open_positions()
-        if positions:
+        if _open_pos:
             lines.append("\n📈 *Positions*")
-            for p in positions:
+            for p in _open_pos:
                 pair    = p["symbol"].replace("USDC", "")
                 pnl_str = (f"{p['pnl_pct']:+.2f}%  `{'%.2f' % p['pnl']}$`"
                            if p["pnl"] is not None else "n/a")

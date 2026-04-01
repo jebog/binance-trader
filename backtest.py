@@ -8,6 +8,8 @@ Filters:   RSI divergence filter (T2-2) applied when DIVERGENCE_ENABLED.
            No Fear & Greed or BTC dominance filter (not available historically).
 Execution: Partial TP at TP1 (T2-4) when PARTIAL_TP_ENABLED.
            Volatility-adjusted capital sizing (T3-4) when VOL_SIZING_ENABLED.
+           Break-even stop (T3-1) when BREAKEVEN_ENABLED.
+           Progressive trailing tightening (T4-4) when PROGRESSIVE_TRAILING_ENABLED.
 Data:      Binance public klines API, 1h, 1000 candles (~41 days) per pair.
 """
 
@@ -27,6 +29,8 @@ from config import (
     ATR_SL_MIN,
     ATR_SL_MULT,
     ATR_TP_MULT,
+    BREAKEVEN_ATR_MULT,
+    BREAKEVEN_ENABLED,
     CAPITAL,
     DIVERGENCE_ENABLED,
     DIVERGENCE_LOOKBACK,
@@ -35,9 +39,12 @@ from config import (
     PARTIAL_TP1_ATR_MULT,
     PARTIAL_TP1_QTY_PCT,
     PARTIAL_TP_ENABLED,
+    PROGRESSIVE_TRAILING_ENABLED,
+    PROGRESSIVE_TRAILING_STAGES,
     STOP_LOSS,
     TAKE_PROFIT,
     TARGET_RISK_PCT,
+    TRAILING_DELTA,
     VOL_SIZING_ENABLED,
     VOL_SIZING_MAX,
     VOL_SIZING_MIN,
@@ -202,6 +209,32 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
                     open_trade["tp1_exit_price"]     = tp1_price
                     open_trade["tp1_candle_idx"]     = i   # track candle for same-candle guard
 
+            # T3-1: break-even stop — move SL to entry once price reaches trigger
+            _atr_pct_raw = open_trade.get("atr_pct_raw") or 0.0
+            if BREAKEVEN_ENABLED and not open_trade.get("breakeven_moved") and _atr_pct_raw:
+                be_trigger = open_trade["entry"] * (1 + BREAKEVEN_ATR_MULT * _atr_pct_raw)
+                if high >= be_trigger:
+                    open_trade["breakeven_moved"] = True
+                    open_trade["peak_high_be"]    = high
+                    if open_trade["entry"] > sl_price:
+                        sl_price = open_trade["entry"]
+
+            # T4-4: progressive trailing — tighten delta at successive ATR milestones
+            if (PROGRESSIVE_TRAILING_ENABLED and TRAILING_DELTA > 0
+                    and open_trade.get("breakeven_moved") and _atr_pct_raw):
+                _peak = max(open_trade.get("peak_high_be") or open_trade["entry"], high)
+                open_trade["peak_high_be"] = _peak
+                _stage = open_trade.get("trailing_stage", 0)
+                for _idx, (_atr_mult, _new_bps) in enumerate(PROGRESSIVE_TRAILING_STAGES):
+                    if _stage <= _idx and _peak >= open_trade["entry"] * (1 + _atr_mult * _atr_pct_raw):
+                        _stage = _idx + 1
+                open_trade["trailing_stage"] = _stage
+                if _stage > 0:
+                    _, _current_bps = PROGRESSIVE_TRAILING_STAGES[_stage - 1]
+                    _trailing_sl = _peak * (1 - _current_bps / 10000)
+                    if _trailing_sl > sl_price:
+                        sl_price = _trailing_sl
+
             tp_hit = high >= tp_price
             sl_hit = low  <= sl_price
 
@@ -315,9 +348,13 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             "tp_pct":           round(tp_pct * 100, 3),
             "entry_candle_idx": entry_candle_idx,
             "atr":              round(atr, 8) if atr else None,
+            "atr_pct_raw":      atr_pct_raw,
             "capital":          round(capital, 2),
             "tp1_price":        tp1_price,
             "partial_tp1_hit":  False,
+            "breakeven_moved":  False,
+            "trailing_stage":   0,
+            "peak_high_be":     None,
         }
 
     # If a trade is still open at end of data, force-close at last candle

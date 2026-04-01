@@ -1697,10 +1697,14 @@ class TestPairScore:
         eth_trades = [self._trade("ETHUSDC", 3.0)] * 5
         sol_trades = [self._trade("SOLUSDC", -5.0, "sl_hit")] * 10
         score = _pair_score("ETHUSDC", eth_trades + sol_trades)
-        # Only 5 ETH trades < PAIR_SCORE_MIN_TRADES=3 if default is 3; 5 > 3 → scoring
-        # win_rate=1.0, gross_loss=0 → profit_factor=inf
-        # but since losses=[] → profit_factor = 0/1e-9 effectively inf
-        assert score > 1.0   # positive score from all-wins
+        # 5 ETH all-wins: no losses → returns win_rate = 1.0 (all-wins case)
+        assert score == pytest.approx(1.0)
+
+    def test_all_wins_returns_win_rate(self):
+        """All-wins: score = win_rate (1.0) not a huge epsilon-divided number."""
+        trades = [self._trade("ETHUSDC", 5.0)] * 5
+        score = _pair_score("ETHUSDC", trades)
+        assert score == pytest.approx(1.0)   # win_rate=1.0, no losses → win_rate returned
 
     def test_disabled_falls_back_to_rsi_sort(self):
         """PAIR_SCORE_ENABLED=False → correlation cap uses RSI sort (verified via constant)."""

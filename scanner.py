@@ -2414,9 +2414,12 @@ def _pair_score(symbol: str, trades: list[dict[str, Any]]) -> float:
     wins   = [t["pnl_pct"] for t in closed if t["pnl_pct"] > 0]
     losses = [t["pnl_pct"] for t in closed if t["pnl_pct"] < 0]
     win_rate     = len(wins) / len(closed)
-    gross_profit = sum(wins)         if wins   else 0.0
-    gross_loss   = abs(sum(losses))  if losses else 1e-9   # avoid div/0
-    profit_factor = gross_profit / gross_loss
+    if not losses:
+        # All wins: profit_factor is undefined; use win_rate as the score
+        # (avoids 1/epsilon ≈ 5e8 which dwarfs any realistic competitor score)
+        return win_rate
+    gross_profit  = sum(wins) if wins else 0.0
+    profit_factor = gross_profit / abs(sum(losses))
     return win_rate * profit_factor
 
 
@@ -2596,10 +2599,12 @@ def scan() -> None:
                 if os.path.exists(STATE_FILE):
                     with open(STATE_FILE) as _sf:
                         _score_trades = json.load(_sf).get("trades", [])
-            except Exception:
-                pass
-            candidates.sort(key=lambda s: _pair_score(s["symbol"], _score_trades), reverse=True)
-            reason = f"best score ({_pair_score(candidates[0]['symbol'], _score_trades):.2f})"
+            except Exception as _se:
+                print(f"  ⚠ Pair score: state read failed ({_se}) — falling back to neutral 0.5")
+            # Cache scores to avoid re-computing during sort and for log message
+            _scores = {s["symbol"]: _pair_score(s["symbol"], _score_trades) for s in candidates}
+            candidates.sort(key=lambda s: _scores[s["symbol"]], reverse=True)
+            reason = f"best score ({_scores[candidates[0]['symbol']]:.2f})"
         else:
             candidates.sort(key=lambda s: s["rsi"])
             reason = "lowest RSI"

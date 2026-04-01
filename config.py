@@ -65,6 +65,10 @@ SPLIT_ENTRY_TTL_H    = 48     # expire pending entry after 48h (Telegram notice 
 TRADE_TIMEOUT_ENABLED = True
 TRADE_TIMEOUT_H       = 72     # force-exit any position open longer than 72h
 
+# ── Break-even stop (T3-1) ────────────────────────────────────────────────────
+BREAKEVEN_ENABLED  = True
+BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + BREAKEVEN_ATR_MULT × atr_pct)
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

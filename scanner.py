@@ -53,6 +53,7 @@ from config import (  # noqa: E402
     PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
     SPLIT_ENTRY_ENABLED, SPLIT_ENTRY_ATR_MULT, SPLIT_ENTRY_TTL_H,
     TRADE_TIMEOUT_ENABLED, TRADE_TIMEOUT_H,
+    BREAKEVEN_ENABLED, BREAKEVEN_ATR_MULT,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -979,9 +980,10 @@ def _place_split_second_entry(
             "order_id": second_order.get("orderId"),
             "oco_id":   None,
             "status":   "no_oco",
-            "split_entry": True,
-            "sl_pct":   sl_pct,
-            "tp_pct":   tp_pct,
+            "split_entry":     True,
+            "sl_pct":          sl_pct,
+            "tp_pct":          tp_pct,
+            "breakeven_moved": False,
         }
 
     print(f"  Split entry combined OCO #{combined_oco.get('orderListId')}: "
@@ -1002,10 +1004,135 @@ def _place_split_second_entry(
         "order_id": second_order.get("orderId"),
         "oco_id":   combined_oco.get("orderListId"),
         "status":   "open",
-        "split_entry": True,
-        "sl_pct":   sl_pct,
-        "tp_pct":   tp_pct,
+        "split_entry":     True,
+        "sl_pct":          sl_pct,
+        "tp_pct":          tp_pct,
+        "breakeven_moved": False,
     }
+
+
+# ── Break-even stop (T3-1) ───────────────────────────────────────────────────
+def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -> bool:
+    """If price has risen ≥ BREAKEVEN_ATR_MULT × ATR above entry, move SL to entry.
+
+    Cancels existing OCO and re-issues it with SL = entry price (break-even).
+    Only fires once per trade (guarded by breakeven_moved flag).
+
+    Returns True if break-even was applied (for logging), False otherwise.
+    """
+    if not BREAKEVEN_ENABLED or trade.get("breakeven_moved"):
+        return False
+    sl_pct = trade.get("sl_pct")
+    if not sl_pct or ATR_SL_MULT <= 0:
+        return False
+    atr_pct = sl_pct / ATR_SL_MULT
+    entry   = trade.get("entry", 0.0)
+    if not entry:
+        return False
+    trigger = entry * (1 + BREAKEVEN_ATR_MULT * atr_pct)
+    if current_price < trigger:
+        return False
+
+    # ── Cancel existing OCO ──────────────────────────────────────────────────
+    oco_id = trade.get("oco_id")
+    if not oco_id:
+        return False  # no OCO to cancel (e.g. no_oco state corruption) — nothing to do
+    try:
+        signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": oco_id})
+        print(f"  Cancelled OCO #{oco_id} for break-even on {symbol}")
+    except Exception as cancel_err:
+        print(f"  ⚠ Break-even OCO cancel failed for {symbol}: {cancel_err} — will retry next scan")
+        return False  # do NOT set breakeven_moved; retry next scan
+
+    # ── Re-fetch exchange precision ──────────────────────────────────────────
+    try:
+        info = get("/api/v3/exchangeInfo", {"symbol": symbol})
+        tick = 0.01
+        for f in info["symbols"][0]["filters"]:
+            if f["filterType"] == "PRICE_FILTER":
+                tick = float(f["tickSize"])
+        tick_prec = len(str(tick).rstrip("0").split(".")[-1])
+
+        be_sl    = round(round(entry / tick) * tick, tick_prec)
+        tp_price = trade.get("tp")   # unchanged
+        qty      = trade.get("qty", 0)
+
+        # ── Place new OCO at break-even SL ───────────────────────────────────
+        if TRAILING_DELTA > 0:
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":             symbol,
+                "side":               "SELL",
+                "quantity":           qty,
+                "aboveType":          "LIMIT_MAKER",
+                "abovePrice":         tp_price,
+                "belowType":          "STOP_LOSS",
+                "belowStopPrice":     be_sl,
+                "belowTrailingDelta": TRAILING_DELTA,
+                "belowTimeInForce":   "GTC",
+            })
+        else:
+            sl_limit = round(round(be_sl * 0.995 / tick) * tick, tick_prec)
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":           symbol,
+                "side":             "SELL",
+                "quantity":         qty,
+                "aboveType":        "LIMIT_MAKER",
+                "abovePrice":       tp_price,
+                "belowType":        "STOP_LOSS_LIMIT",
+                "belowStopPrice":   be_sl,
+                "belowPrice":       sl_limit,
+                "belowTimeInForce": "GTC",
+            })
+
+        trade["breakeven_moved"] = True
+        trade["sl"]              = be_sl
+        trade["oco_id"]          = new_oco.get("orderListId")
+        print(f"  🛡 Break-even armed for {symbol} — SL moved to entry ${entry:.4f}")
+        send_telegram(f"🛡 Break-even armed for `{symbol}` — SL moved to entry `${entry:.4f}`")
+
+        # Surgical state flush — prevent double-processing on crash
+        try:
+            _be_patch: dict[str, Any] = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as _f:
+                    _be_patch = json.load(_f)
+            for _t in (_be_patch.get("trades") or []):
+                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                    _t["breakeven_moved"] = True
+                    _t["sl"]              = trade["sl"]
+                    _t["oco_id"]          = trade["oco_id"]
+                    break
+            with open(STATE_FILE, "w") as _f:
+                json.dump(_be_patch, _f, indent=2)
+        except Exception:
+            pass  # best-effort; main persistence loop will catch it
+
+        return True
+
+    except Exception as oco_err:
+        msg = (f"🚨 *BREAKEVEN OCO FAILED* — `{symbol}` position UNPROTECTED. "
+               f"Place OCO manually. Error: `{str(oco_err)[:200]}`")
+        print(f"  ✗ {msg}")
+        send_telegram(msg)
+        trade["status"] = "no_oco"
+        trade["breakeven_moved"] = True  # stop retrying — manual intervention needed
+        # Surgical flush for the critical no_oco status
+        try:
+            _be_patch2: dict[str, Any] = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as _f:
+                    _be_patch2 = json.load(_f)
+            for _t in (_be_patch2.get("trades") or []):
+                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                    _t["status"]          = "no_oco"
+                    _t["breakeven_moved"] = True
+                    _t["oco_id"]          = None   # OCO was cancelled; stale ID is dead
+                    break
+            with open(STATE_FILE, "w") as _f:
+                json.dump(_be_patch2, _f, indent=2)
+        except Exception:
+            pass
+        return True
 
 
 # ── Trade timeout handler (T3-2) ─────────────────────────────────────────────
@@ -1446,18 +1573,19 @@ def place_buy_order(
         return order, None, trade_partial
 
     trade = {
-        "time":        datetime.now().isoformat(),
-        "symbol":      symbol,
-        "entry":       fill_price,
-        "tp":          tp_price,
-        "sl":          sl_price,
-        "qty":         actual_qty,
-        "capital":     capital,
-        "order_id":    order.get("orderId"),
-        "oco_id":      oco.get("orderListId"),
-        "status":      "open",
-        "sl_pct":      sl_pct,
-        "tp_pct":      tp_pct,
+        "time":            datetime.now().isoformat(),
+        "symbol":          symbol,
+        "entry":           fill_price,
+        "tp":              tp_price,
+        "sl":              sl_price,
+        "qty":             actual_qty,
+        "capital":         capital,
+        "order_id":        order.get("orderId"),
+        "oco_id":          oco.get("orderListId"),
+        "status":          "open",
+        "sl_pct":          sl_pct,
+        "tp_pct":          tp_pct,
+        "breakeven_moved": False,
     }
 
     # ── Partial TP1 standalone LIMIT_MAKER (T2-4) ────────────────────────────
@@ -2221,6 +2349,26 @@ def scan() -> None:
                             print(f"  ⚠ Could not persist split-entry trade: {_e}")
             except Exception as _split_e:
                 print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
+
+    # ── Break-even stop: check open trades (T3-1) ───────────────────────────────
+    # Fetch current price for each open trade; if price ≥ entry + 1×ATR, move SL to entry.
+    if BREAKEVEN_ENABLED:
+        _be_state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE) as _f:
+                    _be_state = json.load(_f)
+            except Exception:
+                pass
+        for _be_trade in (_be_state.get("trades") or []):
+            if _be_trade.get("status") not in ("open", "partial_tp"):
+                continue
+            try:
+                _be_sym = _be_trade["symbol"]
+                _be_cp  = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
+                _check_breakeven(_be_trade, _be_cp, _be_sym)
+            except Exception as _be_e:
+                print(f"  ⚠ Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
 
     # ── Market context (fetched once per scan) ────────────────────────────────
     fg_value, fg_class, fg_fresh = get_fear_greed()

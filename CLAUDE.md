@@ -3,11 +3,13 @@
 ## What this project does
 
 Automated Binance spot trading scanner. Every 30 minutes it:
-1. Fetches Fear & Greed index + BTC context (RSI, SMA)
-2. Analyzes 6 USDC pairs with RSI/SMA/volume/momentum signals
+1. Fetches Fear & Greed index + BTC context (RSI, SMA, dominance)
+2. Analyzes 6 USDC pairs with RSI/SMA/volume/momentum/divergence signals
 3. Classifies signals as EXTREME / STRONG / MODERATE
 4. In cron mode: sends a Telegram alert and waits for CONFIRM/SKIP reply
 5. On CONFIRM: places a market buy + OCO (TP + trailing stop)
+   - EXTREME quality: buys 50% now, arms a split-entry second leg at 1×ATR below fill
+   - PARTIAL_TP_ENABLED: places a standalone TP1 LIMIT_MAKER at 1×ATR for half the qty
 6. Generates an HTML dashboard and updates state.json
 7. At 8am: sends a daily Telegram digest (7-day P&L summary, open positions, F&G)
 
@@ -52,6 +54,26 @@ ATR_TP_MULT    = 3.5       # TP = ATR × 3.5
 ATR_SL_MIN/MAX = 0.02/0.06 # SL clamped to [2%, 6%]
 STOP_LOSS      = 0.03      # fallback if ATR unavailable
 TAKE_PROFIT    = 0.075     # fallback
+
+# T2-2: RSI divergence filter
+DIVERGENCE_ENABLED     = True
+DIVERGENCE_LOOKBACK    = 20     # candles to scan for swing lows
+DIVERGENCE_SWING_DEPTH = 0.005  # swing low must be ≥ 0.5% below neighbors
+
+# T2-3: BTC dominance filter
+BTC_DOM_ENABLED        = True
+BTC_DOM_CACHE_H        = 1      # CoinGecko cache lifetime (hours)
+BTC_DOM_RISE_THRESHOLD = 0.005  # 0.5% scan-over-scan rise = "rising"
+
+# T2-4: Partial TP
+PARTIAL_TP_ENABLED   = True
+PARTIAL_TP1_ATR_MULT = 1.0    # TP1 at entry × (1 + 1×ATR%)
+PARTIAL_TP1_QTY_PCT  = 0.50   # fraction closed at TP1
+
+# T2-1: Split entry (EXTREME quality only)
+SPLIT_ENTRY_ENABLED  = True
+SPLIT_ENTRY_ATR_MULT = 1.0    # second entry triggers at first_fill × (1 - 1×ATR%)
+SPLIT_ENTRY_TTL_H    = 48     # expire pending entry after 48h
 ```
 
 ---
@@ -82,11 +104,15 @@ The launchd job (`~/Library/LaunchAgents/com.trading.scanner.plist`) runs cron m
 
 | Tier | 1h RSI | Extra conditions |
 |------|--------|-----------------|
-| EXTREME | < 25 | No daily filter — deep panic caught regardless |
-| STRONG | < 32 | above 1h SMA20 + daily NOT bearish (daily RSI ≥ 30 or price above daily SMA) |
-| MODERATE | < 40 | above 1h SMA20 + vol surge + momentum up + daily bullish (RSI > 45 AND above daily SMA) |
+| EXTREME | < 25 | No daily/divergence/dom filter — deep panic caught regardless |
+| STRONG | < 32 | above 1h SMA20 + daily NOT bearish + divergence not confirmed weak |
+| MODERATE | < 40 | above 1h SMA20 + vol surge + momentum up + daily bullish + divergence ok + BTC.D not rising |
 
 F&G < 20 (Extreme Fear) blocks MODERATE signals. BTC RSI < 30 + below SMA blocks STRONG signals.
+
+**Tier 2 signal filters (all fail-open — ambiguous or API-down → allow):**
+- **RSI divergence (T2-2)**: blocks STRONG/MODERATE when price makes a lower low AND RSI also makes a lower low (confirmed weakness). `detect_bullish_divergence()` returns `True` (divergence ok), `False` (block), `None` (allow).
+- **BTC dominance (T2-3)**: blocks MODERATE when BTC.D rises >0.5% scan-over-scan. `get_btc_dominance()` caches CoinGecko result 1h. Returns `None` on failure → fail-open.
 
 ### Multi-timeframe (daily trend filter)
 
@@ -99,26 +125,38 @@ The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTRE
 
 ### Scan phases (scanner.py `scan()` and tui.py `action_trigger_scan`)
 
-1. **Fetch context** — Fear & Greed, BTC RSI/SMA/price; fire F&G regime-change alert if threshold crossed
-2. **Fetch portfolio** — live Binance balances
-3. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit (writes `exit_price`, `pnl_pct`, `exit_time`), save cooldowns
-4. **Analyze all pairs** — collect candidates (buy_signal == True)
-5. **Correlation cap** — if ≥ 3 candidates, keep only lowest RSI (avoid concentrated BTC exposure)
-6. **Circuit breaker** — if drawdown from `peak_portfolio_usdc` ≥ `MAX_DRAWDOWN_PCT`, clear candidates and halt
-7. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
-8. **Place orders** — market buy → OCO (LIMIT_MAKER TP + STOP_LOSS trailing)
-9. **Daily digest** — if `now.hour == DIGEST_HOUR` and not yet sent today, fire 7-day summary to Telegram
+1. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit/partial_tp; detect TP1 fills; compute weighted P&L for partial_tp exits
+2. **Split-entry check (T2-1)** — check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
+3. **Fetch context** — Fear & Greed, BTC RSI/SMA/price, BTC dominance; fire F&G regime-change alert if threshold crossed
+4. **Fetch portfolio** — live Binance balances
+5. **Analyze all pairs** — collect candidates; apply divergence (T2-2) and dom-rising (T2-3) gates inside `analyze()`
+6. **Correlation cap** — if ≥ 3 candidates, keep only lowest RSI (avoid concentrated BTC exposure)
+7. **Circuit breaker** — if drawdown from `peak_portfolio_usdc` ≥ `MAX_DRAWDOWN_PCT`, clear candidates and halt
+8. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
+9. **Place orders** — `_place_and_arm()`: market buy → OCO → TP1 LIMIT_MAKER (T2-4) → arm split-entry pending (T2-1 EXTREME quality)
+10. **Daily digest** — if `now.hour == DIGEST_HOUR` and not yet sent today, fire 7-day summary to Telegram
 
 ### State machine per trade
 
 ```
-open → tp_hit   (LIMIT_MAKER filled) → exit_price/pnl_pct/exit_time written
-     → sl_hit   (STOP_LOSS trailing filled) → SL cooldown SL_COOLDOWN_H hours
-                                            → exit_price/pnl_pct/exit_time written
-     → no_oco   (market fill succeeded but OCO API call failed → 🚨 Telegram alert)
+open ──► tp_hit        (LIMIT_MAKER or final OCO TP filled) → exit_price/pnl_pct/exit_time written
+     ──► sl_hit        (STOP_LOSS trailing filled) → SL cooldown SL_COOLDOWN_H hours
+     ──► partial_tp    (TP1 LIMIT_MAKER filled, T2-4) → original OCO cancelled, new OCO for remaining qty
+     │       └──► tp_hit / sl_hit   (final OCO fills; P&L = weighted avg of TP1 50% + exit 50%)
+     ──► no_oco        (market buy OK but OCO failed → 🚨 Telegram alert)
+     ──► partial_tp_no_oco  (TP1 filled + cancel or re-OCO failed → 🚨 Telegram alert)
 ```
 
 `exit_price` is computed from the actual Binance fill (`cummulativeQuoteQty / executedQty`) via `_order_fill_price()` — not the stored activation price, which is wrong for trailing stops.
+
+**Split-entry (T2-1) parallel state** — stored in `state.json["pending_second_entries"]`, not in `trades`:
+```
+first_half_open + pending_second_entry ──► trigger price hit → cancel first OCO → buy second half
+                                                              → combined OCO at weighted-avg entry
+                                       ──► TTL expired (48h) → cleared, Telegram notice
+                                       ──► cancel fails → pending preserved for retry
+                                       ──► second buy fails after cancel → CRITICAL alert, pending cleared
+```
 
 ### Two-timer TUI architecture
 
@@ -134,12 +172,15 @@ open → tp_hit   (LIMIT_MAKER filled) → exit_price/pnl_pct/exit_time written
 | F&G regime change | `fg_regime` in state.json — only fires when bucket changes |
 | Circuit breaker | `cb_alert_sent_at` in state.json — suppressed for 4h |
 | Daily digest | `last_digest_date` in state.json — once per calendar day |
+| Partial TP1 hit | One-shot — fires on state transition to `partial_tp` |
+| Split entry armed | One-shot on first-half placement |
+| Split entry expired | One-shot on TTL clearance |
 
 ### state.json key reference
 
 | Key | Written by | Purpose |
 |-----|-----------|---------|
-| `trades` | `save_state`, `_check_sl_outcomes` | All trades (last 100). Open: `status="open"`. Closed: `exit_price`, `pnl_pct`, `exit_time` populated |
+| `trades` | `save_state`, `_check_sl_outcomes` | All trades (last 100). Statuses: `open`, `partial_tp`, `partial_tp_no_oco`, `tp_hit`, `sl_hit`, `no_oco` |
 | `portfolio` | `save_state` | Latest Binance balance snapshot |
 | `peak_portfolio_usdc` | `save_state` | High-water mark for drawdown calculation |
 | `fg_regime` | `save_state` | Last F&G regime bucket (`extreme_fear` / `fear` / `neutral` / `greed` / `extreme_greed`) |
@@ -149,6 +190,18 @@ open → tp_hit   (LIMIT_MAKER filled) → exit_price/pnl_pct/exit_time written
 | `cooldowns` | `_save_cooldown` | SL cooldown expiry timestamps per symbol |
 | `cb_alert_sent_at` | `save_state` | Timestamp of last circuit breaker Telegram alert |
 | `last_digest_date` | digest block in `scan` | ISO date of last morning digest send |
+| `btc_dom_cache` | `get_btc_dominance` | CoinGecko dominance value + timestamp (1h cache, T2-3) |
+| `btc_dom_prev` | scan surgical patch | Previous scan's BTC.D value for rise-detection (T2-3) |
+| `pending_second_entries` | `_save/clear_pending_second_entry` | `{symbol: {first_fill, first_qty, first_oco_id, atr_pct, sl_pct, tp_pct, capital_half, time}}` (T2-1) |
+
+**Trade dict extra fields (Tier 2):**
+
+| Field | Set by | Meaning |
+|-------|--------|---------|
+| `sl_pct`, `tp_pct` | `place_buy_order` | Percentage SL/TP used (for downstream TP1 math) |
+| `tp1_order_id`, `tp1_price`, `tp1_qty` | `place_buy_order` | Partial TP1 LIMIT_MAKER details (T2-4) |
+| `partial_tp1` | `_handle_partial_tp1` | `{exit_price, pnl_pct, exit_time}` for the first half exit |
+| `split_entry` | `_place_split_second_entry` | `True` when trade is the combined second-leg result |
 
 ---
 
@@ -171,6 +224,14 @@ open → tp_hit   (LIMIT_MAKER filled) → exit_price/pnl_pct/exit_time written
 **Surgical patch for `last_digest_date`** — The digest block re-reads state.json *after* `send_telegram()` completes before writing `last_digest_date`. This avoids overwriting concurrent cooldown writes that may have occurred during the network call.
 
 **F&G `is_fresh` guard** — `get_fear_greed()` returns `(value, classification, is_fresh: bool)`. Regime-change alerts only fire when `is_fresh=True` to prevent spurious alerts from the stale `(50, "Neutral")` fallback.
+
+**Divergence warm-up buffer (T2-2)** — RSI series for `detect_bullish_divergence()` is computed with `lb = lookback + 14 + 28` candles so the oldest retained value has ≥28 Wilder smoothing steps (~13% seed contamination). Never reduce this buffer.
+
+**`signed_delete` params in query string** — Binance DELETE endpoints read params from the URL query string, not the body. `signed_delete()` appends params to the URL; do not refactor to send them as `data=`.
+
+**`_place_split_second_entry` sentinel returns** — Returns `None` (cancel failed → caller preserves pending entry for retry), a `{"status":"critical_fail"}` dict (second buy failed after cancel → caller clears pending), or a normal trade dict (success). Never treat all `None`/falsy returns the same way.
+
+**`partial_tp` counts as open** — `_check_sl_outcomes` uses `active_statuses = ("open", "partial_tp")`. `partial_tp_no_oco` is intentionally excluded (manual intervention required, no scanner supervision).
 
 ---
 
@@ -232,6 +293,35 @@ python3 backtest.py
 # TUI left panel "BACKTEST" section reads this file automatically
 ```
 
+### Disable the divergence filter
+Set `DIVERGENCE_ENABLED = False` in `config.py`. `analyze()` will skip the RSI series computation entirely.
+
+### Disable the BTC dominance filter
+Set `BTC_DOM_ENABLED = False` in `config.py`. `get_btc_dominance()` returns `None` immediately; no CoinGecko call is made.
+
+### Disable partial TP1
+Set `PARTIAL_TP_ENABLED = False` in `config.py`. The standalone TP1 LIMIT_MAKER placement is skipped; the full position remains protected by the OCO until TP2 or SL.
+
+### Disable split entry
+Set `SPLIT_ENTRY_ENABLED = False` in `config.py`. EXTREME quality signals still use `CAPITAL/2` (the falling-knife cap applies to all EXTREME signals regardless). No second-leg pending entry is armed.
+
+### Clear a stuck pending split entry
+```python
+import json
+with open("state.json") as f: s = json.load(f)
+s["pending_second_entries"].pop("ETHUSDC", None)  # or s["pending_second_entries"] = {} to clear all
+with open("state.json", "w") as f: json.dump(s, f, indent=2)
+```
+
+### Clear stale BTC dominance cache
+```python
+import json
+with open("state.json") as f: s = json.load(f)
+s.pop("btc_dom_cache", None)
+s.pop("btc_dom_prev", None)
+with open("state.json", "w") as f: json.dump(s, f, indent=2)
+```
+
 ---
 
 ## What NOT to do
@@ -244,3 +334,7 @@ python3 backtest.py
 - **Never rename `_scan_ctx` back to `_context`** — it shadows a Textual internal method
 - **Never use `trade["sl"]` or `trade["tp"]` as exit price** — use `_order_fill_price()` on the filled order object; activation price is wrong for trailing stops
 - **Never do a full `json.dump` of a stale state snapshot** after a Telegram send — always re-read state.json first (surgical patch pattern)
+- **Never treat all falsy returns from `_place_split_second_entry` the same** — `None` means preserve pending (retry); `{"status":"critical_fail"}` means clear pending (unrecoverable)
+- **Never put `signed_delete` params in the request body** — Binance DELETE reads the query string only
+- **Never reduce `DIVERGENCE_LOOKBACK + 14 + 28` warm-up buffer** — fewer than 28 Wilder smoothing steps corrupts the oldest RSI values
+- **Never add `partial_tp_no_oco` to `active_statuses`** — these positions need manual intervention; the scanner should not monitor them automatically

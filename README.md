@@ -1,6 +1,6 @@
 # Binance Trading Scanner
 
-Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, places confirmed market orders with automatic ATR-based OCO exit brackets, and sends a daily 8am Telegram digest. Includes a max-drawdown circuit breaker that halts new orders if the portfolio drops >15% from its peak.
+Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, filters with RSI divergence and BTC dominance, places confirmed market orders with ATR-based OCO exit brackets, partial take-profit at 1×ATR, and split entries for EXTREME quality signals. Sends a daily 8am Telegram digest. Includes a max-drawdown circuit breaker that halts new orders if the portfolio drops >15% from its peak.
 
 ---
 
@@ -206,22 +206,27 @@ EXTREME signals bypass the daily filter — deep oversold readings are entries r
 
 | Filter | Source | Effect |
 |--------|--------|--------|
-| **Fear & Greed Index** | alternative.me | Blocks MODERATE entries when F&G ≥ 60; blocks STRONG when F&G ≥ 75 |
-| **BTC SMA20** | Binance 1h klines | Blocks MODERATE entries when BTC is below its 1h SMA20 |
+| **Fear & Greed Index** | alternative.me | Blocks MODERATE when F&G ≥ 60; blocks STRONG when F&G ≥ 75 |
+| **BTC SMA20** | Binance 1h klines | Blocks MODERATE when BTC is below its 1h SMA20 |
 | **BTC RSI** | Binance 1h klines | Halves STRONG position size to $100 when BTC RSI < 35 |
+| **BTC dominance** (T2-3) | CoinGecko /global | Blocks MODERATE when BTC.D rises >0.5% scan-over-scan (fail-open on API error) |
 
-Both are fetched once and shared across all pairs. F&G is cached in `state.json` for 25 hours. If the live fetch fails, the cache is used. If the cache is also expired, neutral 50 is used and a Telegram warning is sent.
+F&G is cached 25h. BTC.D is cached 1h. Fail-open on any API failure — signals are never blocked by unavailable external data.
 
 ### Signal tiers
 
 | Tier | Condition | Capital |
 |------|-----------|---------|
-| **EXTREME** (quality) | RSI < 25 AND above SMA20 AND F&G < 40 | $200 |
-| **EXTREME** (crash)   | RSI < 25 AND (below SMA20 OR F&G ≥ 40) | $100 — falling knife, halved |
-| **STRONG**            | RSI < 32 AND above SMA20 AND F&G < 75 | $200 (or $100 if BTC RSI < 35) |
-| **MODERATE**          | RSI < 40 AND above SMA20 AND vol surge AND momentum AND F&G < 60 AND BTC above SMA | $200 |
+| **EXTREME** (quality) | RSI < 25 AND above SMA20 AND F&G < 40 | $100 — first split leg; second fires at 1×ATR below entry |
+| **EXTREME** (crash)   | RSI < 25 AND (below SMA20 OR F&G ≥ 40) | $100 — falling knife, no split entry |
+| **STRONG**            | RSI < 32 AND above SMA20 AND F&G < 75 AND divergence ok | $200 (or $100 if BTC RSI < 35) |
+| **MODERATE**          | RSI < 40 AND above SMA20 AND vol surge AND momentum AND F&G < 60 AND BTC above SMA AND divergence ok AND BTC.D not rising | $200 |
 
-EXTREME always qualifies regardless of BTC context — deep oversold readings are entries even in fear. Position size is halved when the setup is a falling-knife pattern (below SMA or high F&G).
+EXTREME always bypasses the daily trend filter, divergence filter, and BTC dominance filter — deep panic is always worth entering.
+
+**Additional signal-quality filters (T2-2 / T2-3):**
+- **RSI Divergence** — if the last two price swing lows form a lower low but RSI also forms a lower low, STRONG and MODERATE are blocked. If divergence is detected (RSI makes a higher low while price makes a lower low) or data is ambiguous, signals proceed.
+- **BTC Dominance surge** — if BTC.D rose >0.5% since the previous scan, MODERATE is blocked (altcoins tend to bleed when dominance surges).
 
 ### Per-scan guards
 
@@ -296,6 +301,18 @@ All settings live in `config.py` — edit only this file, never `scanner.py` dir
 | `ATR_SL_MAX` | `0.06` | ATR-based SL ceiling (6%) |
 | `INTERVAL` | `"1h"` | Candle interval |
 | `KLINE_LIMIT` | `100` | Candles fetched per pair (must be ≥ 2 × RSI period to converge) |
+| `DIVERGENCE_ENABLED` | `True` | Enable RSI divergence filter (T2-2) |
+| `DIVERGENCE_LOOKBACK` | `20` | Candles to scan for swing lows |
+| `DIVERGENCE_SWING_DEPTH` | `0.005` | Minimum swing depth (0.5%) for a local low to qualify |
+| `BTC_DOM_ENABLED` | `True` | Enable BTC dominance filter (T2-3) |
+| `BTC_DOM_CACHE_H` | `1` | CoinGecko cache lifetime in hours |
+| `BTC_DOM_RISE_THRESHOLD` | `0.005` | Dominance rise % to trigger MODERATE block |
+| `PARTIAL_TP_ENABLED` | `True` | Enable partial TP1 at 1×ATR (T2-4) |
+| `PARTIAL_TP1_ATR_MULT` | `1.0` | TP1 distance = ATR × this multiplier |
+| `PARTIAL_TP1_QTY_PCT` | `0.50` | Fraction of position closed at TP1 |
+| `SPLIT_ENTRY_ENABLED` | `True` | Enable split entry for EXTREME quality signals (T2-1) |
+| `SPLIT_ENTRY_ATR_MULT` | `1.0` | Second entry trigger = first_fill × (1 − ATR × this) |
+| `SPLIT_ENTRY_TTL_H` | `48` | Expire pending second entry after this many hours |
 
 **ATR floor note:** When ATR < `ATR_SL_MIN / ATR_SL_MULT`, SL is floored to `ATR_SL_MIN` but TP still scales from the floored SL. The apparent R/R improves beyond what the raw ATR justifies — a conservative bias in flat/low-volatility markets.
 
@@ -327,30 +344,49 @@ signal confirmed
        │      └─ Fallback (ATR disabled or klines missing):
        │          sl_pct = STOP_LOSS (3%), tp_pct = TAKE_PROFIT (7.5%)
        │
-       └─ 6. OCO order
-              ├─ TP leg: LIMIT_MAKER at fill × (1 + tp_pct)
-              └─ SL leg:
-                  ├─ Trailing (TRAILING_DELTA > 0):
-                  │   STOP_LOSS with belowTrailingDelta = 150 bps
-                  │   activates at fill × (1 − sl_pct)
-                  └─ Fixed:
-                      STOP_LOSS_LIMIT, limit = stop_price × 0.995
+       ├─ 6. OCO order
+       │      ├─ TP leg: LIMIT_MAKER at fill × (1 + tp_pct)
+       │      └─ SL leg:
+       │          ├─ Trailing (TRAILING_DELTA > 0):
+       │          │   STOP_LOSS with belowTrailingDelta = 150 bps
+       │          │   activates at fill × (1 − sl_pct)
+       │          └─ Fixed:
+       │              STOP_LOSS_LIMIT, limit = stop_price × 0.995
+       │
+       ├─ 7. Partial TP1 LIMIT_MAKER (if PARTIAL_TP_ENABLED)
+       │      Standalone SELL LIMIT_MAKER for qty × 50% at fill × (1 + 1×ATR%)
+       │      Failure is non-fatal — full position still protected by OCO
+       │
+       └─ 8. Arm split entry (if SPLIT_ENTRY_ENABLED + EXTREME quality)
+              Stores {first_fill, first_qty, first_oco_id, atr_pct, …} in
+              state.json["pending_second_entries"][symbol]
+              Trigger: current_price ≤ first_fill × (1 − 1×ATR%)
+              TTL: 48 hours
 ```
+
+### Partial TP flow (T2-4)
+
+When the TP1 LIMIT_MAKER fills, `_handle_partial_tp1()` is called:
+1. Record TP1 exit: `exit_price`, `pnl_pct`, stored in `trade["partial_tp1"]`
+2. Cancel the original full-position OCO via DELETE `/api/v3/orderList`
+3. Place a new OCO for the remaining 50% at the original TP2 and SL prices
+4. Trade status → `partial_tp` (still counted as open)
+
+When the final OCO fills, P&L = `TP1_pnl × 0.5 + final_pnl × 0.5` (weighted average).
 
 ### SL outcome tracking
 
-After each scan, `_check_sl_outcomes()` queries `allOrders` for every open trade's OCO ID:
+After each scan, `_check_sl_outcomes()` queries `allOrders` for every open/partial_tp trade's OCO ID:
 
 - `LIMIT_MAKER` filled → `tp_hit` status, no cooldown
 - `STOP_LOSS_LIMIT` / `STOP_LOSS` filled → `sl_hit` status + SL cooldown set
-- Both filled (race condition) → TP takes precedence
+- TP1 `LIMIT_MAKER` (standalone) filled → `partial_tp` transition, new OCO placed
+- Both OCO legs filled (race condition) → TP takes precedence
 
-On either outcome, three fields are written to the trade record in `state.json`:
-- `exit_price` — actual avg fill price from `cummulativeQuoteQty / executedQty` (correct for trailing stops)
-- `pnl_pct` — `(exit_price − entry) / entry × 100`
+On terminal outcome, three fields are written to the trade record in `state.json`:
+- `exit_price` — actual avg fill price from `cummulativeQuoteQty / executedQty`
+- `pnl_pct` — `(exit_price − entry) / entry × 100` (weighted avg for partial_tp trades)
 - `exit_time` — ISO timestamp of the outcome detection
-
-These fields power the daily digest P&L summary and the drawdown circuit breaker.
 
 ---
 
@@ -415,6 +451,12 @@ Generated by `generate_dashboard()` at the end of each scan. Self-contained sing
 | Circuit breaker | Drawdown %, peak vs current portfolio; at most once per 4 hours |
 | Daily digest (8am) | 7-day closed trade summary (wins/losses/net P&L), portfolio total, F&G, open positions with time-held |
 | F&G cache expired | Warning that sentiment filter is inactive |
+| Partial TP1 hit (T2-4) | Symbol, TP1 fill price, pnl%, TP2 target |
+| Partial TP1 re-OCO failed (T2-4) | 🚨 CRITICAL — remaining qty unprotected |
+| Split entry armed (T2-1) | Symbol, trigger price, TTL |
+| Split entry complete (T2-1) | Avg entry, TP, SL, combined OCO ID |
+| Split entry expired (T2-1) | Symbol, TTL hit |
+| Split second buy failed (T2-1) | 🚨 CRITICAL — first half unprotected |
 | Order error | Sanitised exception message (Markdown-safe) |
 
 ### Setup

@@ -626,6 +626,26 @@ class TestVolSizing:
         assert capital_weak_btc == scanner.CAPITAL / 2
         assert capital_norm_btc == scanner.CAPITAL
 
+    def test_vol_sizing_no_klines_falls_back_to_stop_loss(self):
+        """VOL_SIZING_ENABLED=True but no closed_klines: uses STOP_LOSS as ATR proxy (fallback)."""
+        import scanner
+        # No closed_klines → _estimate_sl_tp_pct returns (STOP_LOSS, TAKE_PROFIT)
+        # atr_pct = STOP_LOSS / ATR_SL_MULT = 0.03/1.5 = 0.02
+        # raw = 200 * 0.015 / 0.02 = 150 → clamped to [50, 200] → 150
+        s = {"signal_strength": "STRONG", "extreme_quality": False}  # no closed_klines
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        expected = scanner.CAPITAL * scanner.TARGET_RISK_PCT / (scanner.STOP_LOSS / scanner.ATR_SL_MULT)
+        expected = max(scanner.CAPITAL * scanner.VOL_SIZING_MIN,
+                       min(scanner.CAPITAL * scanner.VOL_SIZING_MAX, expected))
+        assert capital == pytest.approx(expected, rel=1e-4)
+
+    def test_vol_sizing_extreme_no_klines_respects_half_cap(self):
+        """EXTREME with no klines: formula runs via STOP_LOSS fallback, still capped at CAPITAL/2."""
+        import scanner
+        s = {"signal_strength": "EXTREME", "extreme_quality": True}
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital <= scanner.CAPITAL * 0.5
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _is_btc_dom_rising — unit tests (T2-3)

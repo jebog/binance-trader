@@ -2181,7 +2181,9 @@ def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
     """Central capital-sizing rule — single source of truth.
 
     With VOL_SIZING_ENABLED=True (T3-4):
-      Continuous Kelly-style formula: CAPITAL × TARGET_RISK_PCT / ATR%.
+      Continuous Kelly-style formula: CAPITAL × TARGET_RISK_PCT / (clamped_sl_pct / ATR_SL_MULT).
+      Uses the clamped SL% (bounded by ATR_SL_MIN/MAX) rather than raw ATR, so wide ATRs
+      that are already floored by ATR_SL_MAX do not undersize the position further.
       Clamped to [CAPITAL×VOL_SIZING_MIN, CAPITAL×VOL_SIZING_MAX].
       EXTREME signals additionally capped at CAPITAL×0.5 for split-entry.
 

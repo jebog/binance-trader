@@ -421,6 +421,49 @@ class TestAnalyzeSignalTiers:
         assert result["signal_strength"] == "EXTREME"
         assert result["extreme_quality"] is True
 
+    # ── Divergence gate integration (T2-2) ─────────────────────────────────────
+
+    def test_divergence_false_blocks_strong_signal(self):
+        # When detect_bullish_divergence returns False (confirmed weakness),
+        # a STRONG-eligible RSI should be blocked.
+        import scanner
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=30.0, fg=50, btc_above=True, daily_rsi=40.0,
+        )
+        # Verify baseline: without divergence filter STRONG would fire
+        assert result["signal_strength"] in ("STRONG", "NONE")
+
+        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+            result2 = self._run_analyze_rsi_controlled(
+                h1_rsi=30.0, fg=50, btc_above=True, daily_rsi=40.0,
+            )
+        assert result2["signal_strength"] == "NONE", (
+            "STRONG must be blocked when divergence=False (confirmed weakness)"
+        )
+
+    def test_divergence_false_blocks_moderate_signal(self):
+        # When detect_bullish_divergence returns False, MODERATE is blocked.
+        import scanner
+        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+            result = self._run_analyze_rsi_controlled(
+                h1_rsi=38.0, fg=50, btc_above=True, daily_rsi=50.0,
+                vol_surge=True, above_sma=True, momentum_up=True,
+            )
+        assert result["signal_strength"] == "NONE", (
+            "MODERATE must be blocked when divergence=False (confirmed weakness)"
+        )
+
+    def test_divergence_false_does_not_block_extreme(self):
+        # EXTREME bypasses the divergence gate — deep panic is always worth catching.
+        import scanner
+        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+            result = self._run_analyze_rsi_controlled(
+                h1_rsi=22.0, fg=30, btc_above=True, daily_rsi=50.0,
+            )
+        assert result["signal_strength"] == "EXTREME", (
+            "EXTREME must fire even when divergence=False"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _calc_capital — capital sizing rules
@@ -566,10 +609,11 @@ class TestDetectBullishDivergence:
         assert detect_bullish_divergence(closes, rsi_series) is None
 
     def test_only_one_swing_returns_none(self):
-        # Only one swing low found → can't compare → None
+        # Only one qualifying swing low found → can't compare → None
+        # The dip is 1.5% which clears the 0.5% threshold; only 1 swing exists.
         closes     = [100.0] * 20
         rsi_series = [50.0]  * 20
-        closes[9], closes[10], closes[11] = 100.5, 99.0, 100.5   # one dip, < 0.5% depth
+        closes[9], closes[10], closes[11] = 100.5, 99.0, 100.5
         assert detect_bullish_divergence(closes, rsi_series) is None
 
     def test_price_higher_low_returns_none(self):

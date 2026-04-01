@@ -428,7 +428,9 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     rsi_series: Optional[list[float]] = None
     div_result: Optional[bool] = None
     if DIVERGENCE_ENABLED:
-        lb  = DIVERGENCE_LOOKBACK + 14 + 5   # +14 Wilder warm-up, +5 margin
+        # Buffer = lookback + period + 28 smoothing steps (≈2×period → ~13% seed influence)
+        # so the oldest retained RSI value has at least 28 Wilder steps after seeding.
+        lb  = DIVERGENCE_LOOKBACK + 14 + 28
         win = closes[-lb:]
         rsi_series = [calc_rsi(win[:i]) for i in range(14, len(win) + 1)]
         rsi_series = rsi_series[-DIVERGENCE_LOOKBACK:]

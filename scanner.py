@@ -49,6 +49,7 @@ from config import (  # noqa: E402
     PAIRS, CAPITAL,
     MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
     DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
+    BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -197,6 +198,8 @@ def save_state(
             state["peak_portfolio_usdc"] = old.get("peak_portfolio_usdc")   # updated below
             state["cb_alert_sent_at"]  = cb_alert_sent_at or old.get("cb_alert_sent_at")
             state["last_digest_date"]  = old.get("last_digest_date")
+            state["btc_dom_cache"]     = old.get("btc_dom_cache")   # preserve CoinGecko cache
+            state["btc_dom_prev"]      = old.get("btc_dom_prev")    # preserve last dominance value
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
@@ -413,6 +416,67 @@ def get_btc_context() -> dict[str, Any]:  # {rsi: float, above_sma: bool, price:
         print(f"  ⚠ BTC context fetch failed: {e}")
         return {"rsi": 50.0, "above_sma": True, "price": 0}
 
+# ── BTC dominance helpers (T2-3) ─────────────────────────────────────────────
+COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
+
+def get_btc_dominance() -> Optional[float]:
+    """Return current BTC dominance % (0-100), or None on any failure (fail-open).
+
+    Caches the result in state.json["btc_dom_cache"] for BTC_DOM_CACHE_H hours to
+    avoid hammering CoinGecko's free tier across repeated scans.
+    """
+    if not BTC_DOM_ENABLED:
+        return None
+    try:
+        state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        cache = state.get("btc_dom_cache") or {}
+        cached_at = cache.get("ts")
+        if cached_at:
+            age_h = (datetime.now() - datetime.fromisoformat(cached_at)).total_seconds() / 3600
+            if age_h < BTC_DOM_CACHE_H:
+                return float(cache["value"])
+        req  = urllib.request.Request(COINGECKO_GLOBAL, headers={"Accept": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+        dom  = float(data["data"]["market_cap_percentage"]["btc"])
+        # Surgical patch: re-read state to avoid clobbering concurrent writes
+        fresh: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                fresh = json.load(f)
+        fresh["btc_dom_cache"] = {"value": dom, "ts": datetime.now().isoformat()}
+        with open(STATE_FILE, "w") as f:
+            json.dump(fresh, f, indent=2)
+        return dom
+    except Exception as e:
+        print(f"  ⚠ BTC dominance fetch failed: {e}")
+        return None
+
+
+def _is_btc_dom_rising(current: Optional[float]) -> bool:
+    """Return True when BTC.D has risen > BTC_DOM_RISE_THRESHOLD since last scan.
+
+    Fail-open: returns False when current is None (CoinGecko down) or when there
+    is no previous value on record (first run — no meaningful comparison yet).
+    """
+    if current is None:
+        return False
+    try:
+        state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        prev = state.get("btc_dom_prev")
+        if prev is None:
+            return False  # first run — no baseline to compare
+        return float(current) > float(prev) * (1 + BTC_DOM_RISE_THRESHOLD)
+    except Exception:
+        return False  # fail-open on any state read error
+
+
 # ── Signal logic ─────────────────────────────────────────────────────────────
 def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     klines = get("/api/v3/klines", {"symbol": symbol, "interval": INTERVAL, "limit": KLINE_LIMIT})
@@ -464,8 +528,9 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         daily_neutral  = False
         daily_bearish  = False
 
-    fg        = context["fg_value"]        # 0-100
-    btc_above = context["btc_above_sma"]
+    fg             = context["fg_value"]        # 0-100
+    btc_above      = context["btc_above_sma"]
+    btc_dom_rising = context.get("btc_dom_rising", False)   # True → BTC.D surging (T2-3)
 
     # ── RSI divergence gate (T2-2) ────────────────────────────────────────────
     # Block STRONG/MODERATE when price AND RSI both make lower lows (confirmed weakness).
@@ -493,10 +558,11 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     # MODERATE: requires clean setup + healthy market regime + daily not bearish
     moderate_signal = (
         rsi < 40 and above_sma and vol_surge and momentum_up
-        and fg < 60          # skip when market is greedy
-        and btc_above        # skip when BTC in downtrend
-        and daily_bullish    # requires confirmed daily uptrend for MODERATE
-        and divergence_ok    # skip when RSI confirms weakness (T2-2)
+        and fg < 60               # skip when market is greedy
+        and btc_above             # skip when BTC in downtrend
+        and daily_bullish         # requires confirmed daily uptrend for MODERATE
+        and divergence_ok         # skip when RSI confirms weakness (T2-2)
+        and not btc_dom_rising    # skip when BTC dominance is surging (T2-3)
     )
 
     ticker     = get("/api/v3/ticker/24hr", {"symbol": symbol})
@@ -524,7 +590,8 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         "buy_signal":       extreme_signal or strong_signal or moderate_signal,
         "signal_strength":  strength,
         "extreme_quality":  extreme_quality,
-        "divergence":       div_result,   # True/False/None; None = ambiguous/disabled
+        "divergence":       div_result,      # True/False/None; None = ambiguous/disabled
+        "btc_dom_rising":   btc_dom_rising, # True when BTC.D surging (T2-3)
         "closed_klines":    closed,  # passed to place_buy_order for ATR-based SL/TP
     }
 
@@ -1595,11 +1662,28 @@ def scan() -> None:
     # Bootstrap old_regime to current value on first run to suppress spurious alert
     old_fg_regime: str = _scan_state.get("fg_regime") or _fg_regime(fg_value)
     btc_ctx = get_btc_context()
+    btc_dom        = get_btc_dominance() if BTC_DOM_ENABLED else None
+    btc_dom_rising = _is_btc_dom_rising(btc_dom) if BTC_DOM_ENABLED else False
     context = {"fg_value": fg_value, "fg_class": fg_class,
                 "btc_rsi": btc_ctx["rsi"], "btc_above_sma": btc_ctx["above_sma"],
-                "btc_price": btc_ctx["price"]}
+                "btc_price": btc_ctx["price"],
+                "btc_dom": btc_dom, "btc_dom_rising": btc_dom_rising}
+    dom_str = f"{btc_dom:.1f}%{'↑' if btc_dom_rising else ''}" if btc_dom is not None else "n/a"
     print(f"  F&G: {fg_value} ({fg_class})  |  BTC: ${btc_ctx['price']:,.0f}  RSI:{btc_ctx['rsi']}  "
-          f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}")
+          f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}  |  BTC.D:{dom_str}")
+    # Surgical patch: save btc_dom_prev for the *next* scan's comparison.
+    # Re-read state after network calls to avoid clobbering concurrent writes.
+    if BTC_DOM_ENABLED and btc_dom is not None:
+        try:
+            _dom_state: dict[str, Any] = {}
+            if os.path.exists(STATE_FILE):
+                with open(STATE_FILE) as f:
+                    _dom_state = json.load(f)
+            _dom_state["btc_dom_prev"] = btc_dom
+            with open(STATE_FILE, "w") as f:
+                json.dump(_dom_state, f, indent=2)
+        except Exception as e:
+            print(f"  ⚠ Could not persist btc_dom_prev: {e}")
 
     # ── F&G regime-change alert (fires once per threshold crossing) ───────────
     # Skip when F&G data is stale (fallback 50/"Neutral") to avoid spurious alerts

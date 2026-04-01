@@ -46,6 +46,11 @@ DIVERGENCE_ENABLED     = True
 DIVERGENCE_LOOKBACK    = 20     # candles to scan for swing lows
 DIVERGENCE_SWING_DEPTH = 0.005  # swing low must be ≥ 0.5% below both neighbors
 
+# ── BTC dominance filter (T2-3) ───────────────────────────────────────────────
+BTC_DOM_ENABLED        = True
+BTC_DOM_CACHE_H        = 1       # cache lifetime hours (CoinGecko free tier: ~50 req/min)
+BTC_DOM_RISE_THRESHOLD = 0.005   # 0.5% scan-over-scan rise = "rising dominance"
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

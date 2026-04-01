@@ -266,18 +266,20 @@ def signed_post(path: str, params: dict[str, Any]) -> Any:
         raise Exception(f"HTTP {e.code} — {body}") from None
 
 def signed_delete(path: str, params: dict[str, Any]) -> Any:
-    """Authenticated DELETE request — used to cancel OCO order lists."""
+    """Authenticated DELETE request — used to cancel OCO order lists.
+
+    Binance DELETE endpoints read params from the query string, not the body.
+    """
     params["timestamp"] = int(time.time() * 1000)
     query = urllib.parse.urlencode(params)
     sig = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
     params["signature"] = sig
-    data = urllib.parse.urlencode(params).encode()
+    full_url = BASE_URL + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(
-        BASE_URL + path, data=data, method="DELETE",
+        full_url, data=None, method="DELETE",
         headers={
             "User-Agent": "binance-spot/1.1.0 (Scanner)",
             "X-MBX-APIKEY": API_KEY,
-            "Content-Type": "application/x-www-form-urlencoded",
         }
     )
     try:
@@ -855,8 +857,26 @@ def _check_sl_outcomes() -> None:
                     )
                     if tp1_filled_order:
                         _handle_partial_tp1(trade, tp1_filled_order)
-                        # After _handle_partial_tp1 the trade is now partial_tp or
-                        # partial_tp_no_oco. Skip OCO terminal-state checks this cycle —
+                        # Immediately flush the partial_tp transition to state.json
+                        # (surgical patch) so that a crash before the main persistence
+                        # loop does not cause double-processing on the next scan.
+                        try:
+                            _patch: dict[str, Any] = {}
+                            if os.path.exists(STATE_FILE):
+                                with open(STATE_FILE) as _f:
+                                    _patch = json.load(_f)
+                            for _t in (_patch.get("trades") or []):
+                                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                                    _t["status"]     = trade["status"]
+                                    _t["partial_tp1"] = trade.get("partial_tp1")
+                                    _t["oco_id"]     = trade.get("oco_id")
+                                    _t["qty"]        = trade.get("qty")
+                                    break
+                            with open(STATE_FILE, "w") as _f:
+                                json.dump(_patch, _f, indent=2)
+                        except Exception:
+                            pass  # best-effort; main persistence loop is the authoritative write
+                        # Skip OCO terminal-state checks this cycle —
                         # TP2/SL will be caught on the next scan.
                         continue
 
@@ -971,16 +991,26 @@ def _handle_partial_tp1(trade: dict[str, Any], tp1_order: dict[str, Any]) -> Non
     try:
         # Re-fetch exchange info for tick/step precision
         info = get("/api/v3/exchangeInfo", {"symbol": symbol})
-        step = 1.0
-        tick = 0.01
+        step    = 1.0
+        tick    = 0.01
+        min_qty = 0.0
         for f in info["symbols"][0]["filters"]:
             if f["filterType"] == "LOT_SIZE":
-                step = float(f["stepSize"])
+                step    = float(f["stepSize"])
+                min_qty = float(f["minQty"])
             elif f["filterType"] == "PRICE_FILTER":
                 tick = float(f["tickSize"])
         qty_prec  = len(str(step).rstrip('0').split('.')[-1])
         tick_prec = len(str(tick).rstrip('0').split('.')[-1])
         remaining_qty = round(math.floor(remaining_qty / step) * step, qty_prec)
+
+        if remaining_qty == 0 or remaining_qty < min_qty:
+            msg = (f"🚨 *Partial TP1 re-OCO skipped* — `{symbol}` remaining qty "
+                   f"{remaining_qty} < min_qty {min_qty}. Manual close required.")
+            print(f"  ✗ {msg}")
+            send_telegram(msg)
+            trade["status"] = "partial_tp_no_oco"
+            return
 
         if TRAILING_DELTA > 0:
             new_oco = signed_post("/api/v3/orderList/oco", {

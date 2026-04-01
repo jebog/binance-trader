@@ -290,7 +290,7 @@ def calc_sma(closes: list[float], period: int = 20) -> Optional[float]:
     return sum(closes[-period:]) / period
 
 # ── Market context ───────────────────────────────────────────────────────────
-def get_fear_greed() -> tuple[int, str]:
+def get_fear_greed() -> tuple[int, str, bool]:
     """Fetch Crypto Fear & Greed index — with state.json cache (valid 25h).
 
     Priority: live fetch → cached value (< 25h old) → fallback 50 + Telegram warning.
@@ -331,7 +331,7 @@ def get_fear_greed() -> tuple[int, str]:
             entry = json.loads(r.read())["data"][0]
             value, classification = int(entry["value"]), entry["value_classification"]
             _write_cache(value, classification)
-            return value, classification
+            return value, classification, True
     except Exception as e:
         print(f"  ⚠ Fear & Greed fetch failed: {e}")
 
@@ -339,12 +339,12 @@ def get_fear_greed() -> tuple[int, str]:
     cached = _read_cache()
     if cached:
         print(f"  ↩ Using cached F&G: {cached[0]} ({cached[1]})")
-        return cached
+        return cached[0], cached[1], True
 
-    # 3. Stale/missing cache — neutral but warn
+    # 3. Stale/missing cache — neutral sentinel, regime alerts suppressed
     print("  ⚠ F&G cache expired or missing — using neutral 50, filters may be inactive")
     send_telegram("⚠️ F&G cache expired — sentiment filter inactive, using neutral 50")
-    return 50, "Neutral"
+    return 50, "Neutral", False  # is_fresh=False → regime check skipped in scan()
 
 def get_btc_context() -> dict[str, Any]:  # {rsi: float, above_sma: bool, price: float}
     """Fetch BTC 1h RSI + SMA trend as a market regime filter."""
@@ -1335,7 +1335,7 @@ def _check_fg_regime_change(fg_value: int, fg_class: str, old_regime: str) -> st
 
     messages: dict[str, str] = {
         "extreme_fear": f"🔴 *F&G: Extreme Fear* (`{fg_value}`)\nMODERATE signals are now *blocked*.",
-        "fear":         f"🟡 *F&G: Fear* (`{fg_value}`)\nLeft Extreme Fear — MODERATE signals *re-enabled*.",
+        "fear":         f"🟡 *F&G: Fear* (`{fg_value}`)\nEntered Fear zone (20–29).",
         "neutral":      f"🟢 *F&G: Neutral* (`{fg_value}`)\nF&G recovering past the Fear zone.",
         "greed":        f"⚡ *F&G: Greed* (`{fg_value}`)\nMarket turning greedy — tighten risk.",
         "extreme_greed": f"🚨 *F&G: Extreme Greed* (`{fg_value}`)\nConsider reducing exposure.",
@@ -1397,10 +1397,14 @@ def scan() -> None:
     sent_signals: dict[str, str] = _scan_state.get("sent_signals") or {}
 
     # ── Check for SL outcomes from previous trades ───────────────────────────
+    # Must run after _scan_state is loaded so old_fg_regime is not overwritten.
+    # _check_sl_outcomes() calls save_state() internally with fg_regime=None,
+    # which preserves the existing regime value already on disk.
     _check_sl_outcomes()
 
     # ── Market context (fetched once per scan) ────────────────────────────────
-    fg_value, fg_class = get_fear_greed()
+    fg_value, fg_class, fg_fresh = get_fear_greed()
+    # Bootstrap old_regime to current value on first run to suppress spurious alert
     old_fg_regime: str = _scan_state.get("fg_regime") or _fg_regime(fg_value)
     btc_ctx = get_btc_context()
     context = {"fg_value": fg_value, "fg_class": fg_class,
@@ -1410,7 +1414,11 @@ def scan() -> None:
           f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}")
 
     # ── F&G regime-change alert (fires once per threshold crossing) ───────────
-    new_fg_regime = _check_fg_regime_change(fg_value, fg_class, old_fg_regime)
+    # Skip when F&G data is stale (fallback 50/"Neutral") to avoid spurious alerts
+    if fg_fresh:
+        new_fg_regime = _check_fg_regime_change(fg_value, fg_class, old_fg_regime)
+    else:
+        new_fg_regime = old_fg_regime   # preserve regime — data unavailable
 
     # ── Portfolio snapshot ────────────────────────────────────────────────────
     portfolio = get_portfolio()
@@ -1616,7 +1624,8 @@ def scan() -> None:
         if new_trades:
             save_state(all_results, [{"symbol": s["symbol"], "price": s["price"],
                                       "rsi": s["rsi"], "signal_strength": s["signal_strength"]}
-                                     for s in signals], new_trades, fg_regime=new_fg_regime)
+                                     for s in signals], new_trades)
+                                     # fg_regime already persisted by the earlier save_state call
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
         if os.path.exists(STATE_FILE):

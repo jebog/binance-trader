@@ -79,6 +79,9 @@ PROGRESSIVE_TRAILING_ENABLED = True
 # After break-even arms, tighten trailing delta at each ATR milestone.
 # Format: list of (atr_mult_trigger, new_trailing_delta_bps).
 # Stages apply in order; each fires exactly once (guarded by trailing_stage index).
+# WARNING: Do not reorder or remove stages while open trades are active.
+# Active trades track progress via an integer stage index; reordering changes
+# which trigger/bps pair applies next, potentially tightening the stop prematurely.
 PROGRESSIVE_TRAILING_STAGES: list[tuple[float, int]] = [
     (1.5, 100),   # at +1.5×ATR: tighten to 100bps (1.0%)
     (2.0,  75),   # at +2.0×ATR: tighten to  75bps (0.75%)

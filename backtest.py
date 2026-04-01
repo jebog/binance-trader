@@ -393,7 +393,7 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
 def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     if not trades:
         return {
-            "n": 0, "wins": 0, "losses": 0, "timeouts": 0,
+            "n": 0, "wins": 0, "losses": 0, "timeouts": 0, "breakeven_saves": 0,
             "win_rate": 0.0, "avg_tp_pct": 0.0, "avg_sl_pct": 0.0,
             "avg_to_pct": 0.0, "net_pct": 0.0, "expectancy": 0.0,
             "net_usdc": 0.0, "expectancy_usdc": 0.0,
@@ -401,6 +401,8 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     wins     = [t for t in trades if t["outcome"] == "TP"]
     losses   = [t for t in trades if t["outcome"] == "SL"]
     timeouts = [t for t in trades if t["outcome"] == "TIMEOUT"]
+    # Breakeven saves: SL exits where break-even floor caught the trade at or above entry
+    be_saves = [t for t in losses if t.get("breakeven_moved") and t["exit_price"] >= t["entry"]]
 
     n        = len(trades)
     nw       = len(wins)
@@ -418,17 +420,18 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     exp_usdc = net_usdc / n
 
     return {
-        "n":              n,
-        "wins":           nw,
-        "losses":         nl,
-        "timeouts":       nt,
-        "win_rate":       round(wr, 1),
-        "avg_tp_pct":     round(avg_win, 2),
-        "avg_sl_pct":     round(avg_loss, 2),
-        "avg_to_pct":     round(avg_to, 2),
-        "net_pct":        round(net, 2),
-        "expectancy":     round(exp, 2),
-        "net_usdc":       round(net_usdc, 2),
+        "n":               n,
+        "wins":            nw,
+        "losses":          nl,
+        "timeouts":        nt,
+        "breakeven_saves": len(be_saves),
+        "win_rate":        round(wr, 1),
+        "avg_tp_pct":      round(avg_win, 2),
+        "avg_sl_pct":      round(avg_loss, 2),
+        "avg_to_pct":      round(avg_to, 2),
+        "net_pct":         round(net, 2),
+        "expectancy":      round(exp, 2),
+        "net_usdc":        round(net_usdc, 2),
         "expectancy_usdc": round(exp_usdc, 2),
     }
 
@@ -440,8 +443,9 @@ def _print_stats_row(label: str, s: dict[str, Any], trades: list[dict[str, Any]]
     c   = Counter(t["signal"] for t in trades)
     sig = " ".join(f"{k[0]}{k[1:3].lower()}:{c[k]}" for k in ["EXTREME","STRONG","MODERATE"] if c[k]) or "—"
     to_note = f"  TO:{s['timeouts']}" if s["timeouts"] else ""
+    be_note = f"  BE:{s['breakeven_saves']}" if s.get("breakeven_saves") else ""
     print(
-        f"  {label:<12}  {s['n']:>2} trades  {s['wins']}W/{s['losses']}L{to_note:<6}"
+        f"  {label:<12}  {s['n']:>2} trades  {s['wins']}W/{s['losses']}L{to_note}{be_note:<8}"
         f"  WR:{s['win_rate']:.1f}%  AvgTP:{s['avg_tp_pct']:+.1f}%  "
         f"AvgSL:{s['avg_sl_pct']:+.1f}%  Net:{s['net_pct']:+.1f}%{suffix}  [{sig}]"
     )
@@ -556,8 +560,10 @@ def main() -> None:
             "partial_tp1_qty_pct":   PARTIAL_TP1_QTY_PCT,
             "vol_sizing_enabled":    VOL_SIZING_ENABLED,
             "target_risk_pct":       TARGET_RISK_PCT,
-            "divergence_enabled":    DIVERGENCE_ENABLED,
-            "note":                  "No F&G or BTC dominance filter (not available historically)",
+            "divergence_enabled":             DIVERGENCE_ENABLED,
+            "breakeven_enabled":              BREAKEVEN_ENABLED,
+            "progressive_trailing_enabled":   PROGRESSIVE_TRAILING_ENABLED,
+            "note":                           "No F&G or BTC dominance filter (not available historically)",
         },
         "overall_train": overall_train,
         "overall_test":  overall_test,

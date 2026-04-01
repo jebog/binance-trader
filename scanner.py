@@ -876,11 +876,14 @@ def save_state(
     fg_regime: Optional[str] = None,
     open_pnl: Optional[float] = None,
     cb_alert_sent_at: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Save last scan results to state.db."""
+    _own_conn = conn is None
     try:
-        conn = db_connect()
-        db_init(conn)
+        if _own_conn:
+            conn = db_connect()
+            db_init(conn)
         now_iso = datetime.now().isoformat()
         save_scan_results(conn, results, signals)
         if signals:
@@ -903,7 +906,8 @@ def save_state(
         if cb_alert_sent_at is not None:
             set_kv(conn, "cb_alert_sent_at", cb_alert_sent_at)
         set_kv(conn, "last_scan", now_iso)
-        conn.close()
+        if _own_conn:
+            conn.close()
     except Exception as _e:
         print(f"  ⚠ SQLite save_state failed: {_e}")
 
@@ -1648,7 +1652,8 @@ def _place_split_second_entry(
 
 
 # ── Break-even stop (T3-1) ───────────────────────────────────────────────────
-def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -> bool:
+def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str,
+                     conn: Optional[sqlite3.Connection] = None) -> bool:
     """If price has risen ≥ BREAKEVEN_ATR_MULT × ATR above entry, move SL to entry.
 
     Cancels existing OCO and re-issues it with SL = entry price (break-even).
@@ -1728,10 +1733,11 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
 
         # Flush to DB — prevent double-processing on crash
         try:
-            _be_conn = db_connect()
-            update_trade_fields(_be_conn, str(trade.get("order_id", "")),
+            _be_c = conn if conn is not None else db_connect()
+            update_trade_fields(_be_c, str(trade.get("order_id", "")),
                                 breakeven_moved=True, sl=trade["sl"], oco_id=trade["oco_id"])
-            _be_conn.close()
+            if conn is None:
+                _be_c.close()
         except Exception:
             pass  # best-effort; _check_sl_outcomes will catch it next scan
 
@@ -1746,17 +1752,19 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
         trade["breakeven_moved"] = True  # stop retrying — manual intervention needed
         # Flush critical no_oco status to DB
         try:
-            _be_conn2 = db_connect()
-            update_trade_fields(_be_conn2, str(trade.get("order_id", "")),
+            _be_c2 = conn if conn is not None else db_connect()
+            update_trade_fields(_be_c2, str(trade.get("order_id", "")),
                                 status="no_oco", breakeven_moved=True, oco_id=None)
-            _be_conn2.close()
+            if conn is None:
+                _be_c2.close()
         except Exception:
             pass
         return True
 
 
 # ── Progressive trailing stop (T4-4) ─────────────────────────────────────────
-def _check_progressive_trailing(trade: dict[str, Any], current_price: float, symbol: str) -> bool:
+def _check_progressive_trailing(trade: dict[str, Any], current_price: float, symbol: str,
+                                conn: Optional[sqlite3.Connection] = None) -> bool:
     """Tighten trailing stop delta when price reaches successive ATR milestones.
 
     Only fires after break-even has armed (breakeven_moved=True).
@@ -1851,10 +1859,11 @@ def _check_progressive_trailing(trade: dict[str, Any], current_price: float, sym
 
         # Flush to DB — prevent re-firing this stage on next scan
         try:
-            _pt_conn = db_connect()
-            update_trade_fields(_pt_conn, str(trade.get("order_id", "")),
+            _pt_c = conn if conn is not None else db_connect()
+            update_trade_fields(_pt_c, str(trade.get("order_id", "")),
                                 oco_id=trade["oco_id"], trailing_stage=trade["trailing_stage"])
-            _pt_conn.close()
+            if conn is None:
+                _pt_c.close()
         except Exception:
             pass  # best-effort; _check_sl_outcomes will catch it next scan
 
@@ -1871,11 +1880,12 @@ def _check_progressive_trailing(trade: dict[str, Any], current_price: float, sym
         trade["trailing_stage"] = current_stage + 1  # stop retrying this stage
         # Flush critical no_oco status to DB
         try:
-            _pt_conn2 = db_connect()
-            update_trade_fields(_pt_conn2, str(trade.get("order_id", "")),
+            _pt_c2 = conn if conn is not None else db_connect()
+            update_trade_fields(_pt_c2, str(trade.get("order_id", "")),
                                 status="no_oco", trailing_stage=trade["trailing_stage"],
                                 oco_id=None)
-            _pt_conn2.close()
+            if conn is None:
+                _pt_c2.close()
         except Exception:
             pass
         return True
@@ -1945,16 +1955,19 @@ def _handle_trade_timeout(trade: dict[str, Any], symbol: str) -> None:
         trade["status"] = "timeout_sell_failed"
 
 
-def _check_sl_outcomes() -> None:
+def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
     """Check closed OCO orders — if stop leg filled, trigger SL cooldown.
     Also checks for partial TP1 fills (T2-4) on trades with tp1_order_id.
     Also handles trade timeout (T3-2) — force-exit positions open > TRADE_TIMEOUT_H.
     """
+    _own_conn = conn is None
     try:
-        _so_conn = db_connect()
-        db_init(_so_conn)
-        active_trades = get_open_trades(_so_conn)
-        _so_conn.close()
+        if _own_conn:
+            conn = db_connect()
+            db_init(conn)
+        active_trades = get_open_trades(conn)
+        if _own_conn:
+            conn.close()
     except Exception as _e:
         print(f"  ⚠ _check_sl_outcomes: DB read failed: {_e}")
         return
@@ -2009,13 +2022,11 @@ def _check_sl_outcomes() -> None:
                         try:
                             _oid = str(trade.get("order_id", ""))
                             if _oid:
-                                _c = db_connect()
-                                update_trade_fields(_c, _oid,
+                                update_trade_fields(conn, _oid,
                                     status=trade["status"],
                                     partial_tp1=trade.get("partial_tp1"),
                                     oco_id=trade.get("oco_id"),
                                     qty=trade.get("qty"))
-                                _c.close()
                         except Exception:
                             pass
                         # Skip OCO terminal-state checks this cycle —
@@ -2071,7 +2082,6 @@ def _check_sl_outcomes() -> None:
         }
         # SQLite: targeted UPDATE per resolved trade
         try:
-            _conn = db_connect()
             for order_id, resolved in resolved_by_order.items():
                 if resolved.get("status") not in ("open",):
                     fields: dict[str, Any] = {
@@ -2086,8 +2096,7 @@ def _check_sl_outcomes() -> None:
                         fields["oco_id"] = resolved["oco_id"]
                     if resolved.get("qty") is not None:
                         fields["qty"] = resolved["qty"]
-                    update_trade_fields(_conn, order_id, **fields)
-            _conn.close()
+                    update_trade_fields(conn, order_id, **fields)
         except Exception as _e:
             print(f"  ⚠ SQLite trade outcome write failed: {_e}")
     except Exception as e:
@@ -3179,14 +3188,15 @@ def scan() -> None:
     print(f"  SL: -{STOP_LOSS*100:.0f}% | TP: +{TAKE_PROFIT*100:.0f}%")
     print(f"{'='*55}")
 
+    # ── Single scan-scoped connection (WAL mode: concurrent TUI reads are safe) ──
+    _scan_conn = db_connect()
+    db_init(_scan_conn)
+
     # ── Load persisted state from SQLite (dedup ledger + regime tracking) ───────
-    _sq = db_connect()
-    db_init(_sq)
-    sent_signals: dict[str, str] = load_sent_signals(_sq)
-    _sq.close()
+    sent_signals: dict[str, str] = load_sent_signals(_scan_conn)
 
     # ── Check for SL outcomes from previous trades ───────────────────────────
-    _check_sl_outcomes()
+    _check_sl_outcomes(_scan_conn)
 
     # ── Split-entry: check pending second legs (T2-1) ─────────────────────────
     # Run before the main scan so second-leg fills are treated as open positions
@@ -3226,9 +3236,7 @@ def scan() -> None:
                         # Persist combined trade immediately so the correlation cap
                         # and open-position guard count it in this scan.
                         try:
-                            _se_conn = db_connect()
-                            insert_trade(_se_conn, trade)
-                            _se_conn.close()
+                            insert_trade(_scan_conn, trade)
                         except Exception as _e:
                             print(f"  ⚠ Could not persist split-entry trade: {_e}")
             except Exception as _split_e:
@@ -3238,16 +3246,14 @@ def scan() -> None:
     # Fetch current price for each open trade; if price ≥ entry + 1×ATR, move SL to entry.
     if BREAKEVEN_ENABLED:
         try:
-            _be_conn = db_connect()
-            _be_trades = get_open_trades(_be_conn)
-            _be_conn.close()
+            _be_trades = get_open_trades(_scan_conn)
         except Exception:
             _be_trades = []
         for _be_trade in _be_trades:
             try:
                 _be_sym = _be_trade["symbol"]
                 _be_cp  = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
-                _check_breakeven(_be_trade, _be_cp, _be_sym)
+                _check_breakeven(_be_trade, _be_cp, _be_sym, _scan_conn)
             except Exception as _be_e:
                 print(f"  ⚠ Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
 
@@ -3256,9 +3262,7 @@ def scan() -> None:
     # with a tighter trailing delta. Mirrors the break-even phase above.
     if PROGRESSIVE_TRAILING_ENABLED:
         try:
-            _pt_conn = db_connect()
-            _pt_trades = get_open_trades(_pt_conn)
-            _pt_conn.close()
+            _pt_trades = get_open_trades(_scan_conn)
         except Exception:
             _pt_trades = []
         for _pt_trade in _pt_trades:
@@ -3267,7 +3271,7 @@ def scan() -> None:
             try:
                 _pt_sym = _pt_trade["symbol"]
                 _pt_cp  = float(get("/api/v3/ticker/price", {"symbol": _pt_sym})["price"])
-                _check_progressive_trailing(_pt_trade, _pt_cp, _pt_sym)
+                _check_progressive_trailing(_pt_trade, _pt_cp, _pt_sym, _scan_conn)
             except Exception as _pt_e:
                 print(f"  ⚠ Progressive trailing check failed for {_pt_trade.get('symbol', '?')}: {_pt_e}")
 
@@ -3275,9 +3279,7 @@ def scan() -> None:
     fg_value, fg_class, fg_fresh = get_fear_greed()
     # Bootstrap old_regime to current value on first run to suppress spurious alert
     try:
-        _r_conn = db_connect()
-        old_fg_regime: str = get_kv(_r_conn, "fg_regime") or _fg_regime(fg_value)
-        _r_conn.close()
+        old_fg_regime: str = get_kv(_scan_conn, "fg_regime") or _fg_regime(fg_value)
     except Exception:
         old_fg_regime = _fg_regime(fg_value)
     btc_ctx = get_btc_context()
@@ -3293,9 +3295,7 @@ def scan() -> None:
     # Save btc_dom_prev for the *next* scan's comparison.
     if BTC_DOM_ENABLED and btc_dom is not None:
         try:
-            _bdp_conn = db_connect()
-            set_kv(_bdp_conn, "btc_dom_prev", str(btc_dom))
-            _bdp_conn.close()
+            set_kv(_scan_conn, "btc_dom_prev", str(btc_dom))
         except Exception as e:
             print(f"  ⚠ Could not persist btc_dom_prev: {e}")
 
@@ -3349,9 +3349,7 @@ def scan() -> None:
         if PAIR_SCORE_ENABLED:
             _score_trades: list[dict[str, Any]] = []
             try:
-                _ps_conn = db_connect()
-                _score_trades = get_all_trades(_ps_conn)
-                _ps_conn.close()
+                _score_trades = get_all_trades(_scan_conn)
             except Exception as _se:
                 print(f"  ⚠ Pair score: state read failed ({_se}) — falling back to neutral 0.5")
             # Cache scores to avoid re-computing during sort and for log message
@@ -3368,10 +3366,8 @@ def scan() -> None:
 
     # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────
     try:
-        _cb_conn = db_connect()
-        _peak_str = get_kv(_cb_conn, "peak_portfolio_usdc")
+        _peak_str = get_kv(_scan_conn, "peak_portfolio_usdc")
         peak_usdc: float = float(_peak_str) if _peak_str else 0.0
-        _cb_conn.close()
     except Exception:
         peak_usdc = 0.0
     current_usdc = portfolio["total_usdc"] if portfolio else None
@@ -3381,9 +3377,7 @@ def scan() -> None:
         if drawdown_pct >= MAX_DRAWDOWN_PCT:
             # Deduplicate: only fire Telegram once every 4 hours
             try:
-                _cbl_conn = db_connect()
-                cb_last = get_kv(_cbl_conn, "cb_alert_sent_at") or ""
-                _cbl_conn.close()
+                cb_last = get_kv(_scan_conn, "cb_alert_sent_at") or ""
             except Exception:
                 cb_last = ""
             cb_cooldown_expired = (
@@ -3417,16 +3411,14 @@ def scan() -> None:
     save_state(all_results, [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                                "signal_strength": s["signal_strength"]} for s in signals],
                portfolio=portfolio, fg_regime=new_fg_regime, open_pnl=open_pnl_usdc,
-               cb_alert_sent_at=cb_alert_ts)
+               cb_alert_sent_at=cb_alert_ts, conn=_scan_conn)
 
     # ── Telegram scan summary ─────────────────────────────────────────────────
     if all_results:
         # Build performance line from closed trades in state.db
         perf_line = ""
         try:
-            _pl_conn = db_connect()
-            closed = get_closed_trades(_pl_conn)
-            _pl_conn.close()
+            closed = get_closed_trades(_scan_conn)
             if closed:
                 wins  = sum(1 for t in closed if t.get("status") == "tp_hit")
                 total = len(closed)
@@ -3490,9 +3482,7 @@ def scan() -> None:
             _sent_ts = datetime.now().isoformat()
             sent_signals[dedup_key] = _sent_ts
             try:
-                _ss_conn = db_connect()
-                save_sent_signal(_ss_conn, dedup_key, _sent_ts)
-                _ss_conn.close()
+                save_sent_signal(_scan_conn, dedup_key, _sent_ts)
             except Exception:
                 pass
 
@@ -3603,31 +3593,27 @@ def scan() -> None:
         if new_trades:
             save_state(all_results, [{"symbol": s["symbol"], "price": s["price"],
                                       "rsi": s["rsi"], "signal_strength": s["signal_strength"]}
-                                     for s in signals], new_trades)
+                                     for s in signals], new_trades,
+                                     conn=_scan_conn)
                                      # fg_regime already persisted by the earlier save_state call
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
-        _d_conn = db_connect()
-        db_init(_d_conn)
-        generate_dashboard(get_state_dict(_d_conn))
-        _d_conn.close()
+        generate_dashboard(get_state_dict(_scan_conn))
     except Exception as e:
         print(f"  ⚠ Dashboard generation failed: {e}")
 
     # ── Daily digest (8am, once per calendar day) ─────────────────────────────
     try:
         now = datetime.now()
-        _dd_conn = db_connect()
-        db_init(_dd_conn)
-        last_digest = get_kv(_dd_conn, "last_digest_date") or ""
+        last_digest = get_kv(_scan_conn, "last_digest_date") or ""
         if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
-            _send_daily_digest(get_state_dict(_dd_conn))
+            _send_daily_digest(get_state_dict(_scan_conn))
             # set_kv after send_telegram() — WAL mode means no concurrent-write concern
-            set_kv(_dd_conn, "last_digest_date", str(now.date()))
-        _dd_conn.close()
+            set_kv(_scan_conn, "last_digest_date", str(now.date()))
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
 
+    _scan_conn.close()
     print(f"\n{'='*55}\n")
 
 if __name__ == "__main__":

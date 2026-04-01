@@ -179,7 +179,7 @@ def _make_klines(closes: list[float], vol: float = 1000.0) -> list[list]:
 
 def _neutral_context() -> dict:
     """Neutral market context — passes all market filters."""
-    return {"fg_value": 30, "btc_rsi": 50.0, "btc_above_sma": True}
+    return {"fg_value": 30, "btc_rsi": 50.0, "btc_above_sma": True, "btc_dom_rising": False}
 
 
 class TestAnalyzeSignalTiers:
@@ -240,6 +240,7 @@ class TestAnalyzeSignalTiers:
         vol_surge: bool = True,
         above_sma: bool = True,
         momentum_up: bool = True,
+        btc_dom_rising: bool = False,
     ) -> dict:
         """
         Test signal tier logic with a controlled RSI value and daily regime.
@@ -290,7 +291,10 @@ class TestAnalyzeSignalTiers:
         d_klines.append(d_klines[-1][:])
 
         ticker = {"priceChangePercent": "0.5"}
-        context = {"fg_value": fg, "btc_rsi": 50.0, "btc_above_sma": btc_above}
+        context = {
+            "fg_value": fg, "btc_rsi": 50.0, "btc_above_sma": btc_above,
+            "btc_dom_rising": btc_dom_rising,
+        }
 
         def fake_get(path, params=None):
             if "ticker" in path:
@@ -399,7 +403,8 @@ class TestAnalyzeSignalTiers:
         expected_keys = {
             "symbol", "price", "rsi", "daily_rsi", "sma20", "above_sma",
             "vol_surge", "momentum", "change24h", "buy_signal",
-            "signal_strength", "extreme_quality", "divergence", "closed_klines",
+            "signal_strength", "extreme_quality", "divergence", "btc_dom_rising",
+            "closed_klines",
         }
         assert set(result.keys()) == expected_keys
 
@@ -464,6 +469,49 @@ class TestAnalyzeSignalTiers:
             "EXTREME must fire even when divergence=False"
         )
 
+    # ── BTC dominance gate integration (T2-3) ──────────────────────────────────
+
+    def test_btc_dom_rising_blocks_moderate(self):
+        # btc_dom_rising=True in context → MODERATE blocked (altcoins bleed).
+        # RSI=37 puts us squarely in MODERATE band; all other conditions satisfied.
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+            btc_dom_rising=True,
+        )
+        assert result["signal_strength"] == "NONE", (
+            "MODERATE must be blocked when BTC dominance is rising"
+        )
+
+    def test_btc_dom_not_rising_allows_moderate(self):
+        # btc_dom_rising=False → no block from dominance filter.
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=37.0, fg=30, btc_above=True, daily_rsi=55.0,
+            vol_surge=True, above_sma=True, momentum_up=True,
+            btc_dom_rising=False,
+        )
+        assert result["signal_strength"] == "MODERATE"
+
+    def test_btc_dom_rising_does_not_block_strong(self):
+        # STRONG (rsi<32) is unaffected by BTC dominance filter — only MODERATE is blocked.
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=30.0, fg=30, btc_above=True, daily_rsi=40.0,
+            btc_dom_rising=True,
+        )
+        assert result["signal_strength"] == "STRONG", (
+            "STRONG must not be blocked by BTC dominance filter"
+        )
+
+    def test_btc_dom_rising_does_not_block_extreme(self):
+        # EXTREME ignores the BTC dominance filter entirely.
+        result = self._run_analyze_rsi_controlled(
+            h1_rsi=22.0, fg=30, btc_above=True, daily_rsi=50.0,
+            btc_dom_rising=True,
+        )
+        assert result["signal_strength"] == "EXTREME", (
+            "EXTREME must fire even when BTC dominance is rising"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _calc_capital — capital sizing rules
@@ -497,6 +545,67 @@ class TestCalcCapital:
         s = {"signal_strength": "MODERATE", "extreme_quality": False}
         assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL  # weak BTC irrelevant for MODERATE
         assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL  # same result with neutral BTC
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _is_btc_dom_rising — unit tests (T2-3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestIsBtcDomRising:
+    """Unit tests for _is_btc_dom_rising().
+
+    The function reads btc_dom_prev from state.json.  We patch os.path.exists
+    and builtins.open to inject controlled state without touching the filesystem.
+    """
+
+    def _run(self, current, prev_value=None):
+        import scanner, json as _json, builtins
+
+        state = {}
+        if prev_value is not None:
+            state["btc_dom_prev"] = prev_value
+
+        fake_open = MagicMock()
+        fake_open.return_value.__enter__ = lambda s: s
+        fake_open.return_value.__exit__ = MagicMock(return_value=False)
+        fake_open.return_value.read = MagicMock(return_value=_json.dumps(state))
+        fake_open.return_value.__iter__ = MagicMock(return_value=iter([]))
+        # json.load needs a file-like with .read()
+        import io
+        fake_file = io.StringIO(_json.dumps(state))
+
+        with patch("scanner.os.path.exists", return_value=True), \
+             patch("builtins.open", return_value=fake_file):
+            return scanner._is_btc_dom_rising(current)
+
+    def test_none_current_returns_false(self):
+        # CoinGecko down → fail-open
+        import scanner
+        assert scanner._is_btc_dom_rising(None) is False
+
+    def test_no_prev_returns_false(self):
+        # First run — no baseline to compare
+        assert self._run(current=55.0, prev_value=None) is False
+
+    def test_rising_above_threshold_returns_true(self):
+        # 55.0 vs 50.0 → rise = 10% >> 0.5% threshold
+        assert self._run(current=55.0, prev_value=50.0) is True
+
+    def test_falling_returns_false(self):
+        # 48.0 vs 50.0 → falling dominance
+        assert self._run(current=48.0, prev_value=50.0) is False
+
+    def test_below_threshold_returns_false(self):
+        # 50.1 vs 50.0 → rise = 0.2% < 0.5% threshold
+        assert self._run(current=50.1, prev_value=50.0) is False
+
+    def test_clearly_below_threshold_returns_false(self):
+        # 50.1 vs 50.0 → rise = 0.2%, well below 0.5% threshold
+        assert self._run(current=50.1, prev_value=50.0) is False
+
+    def test_well_above_threshold_returns_true(self):
+        # 50.5 vs 50.0 → rise = 1.0% > 0.5% threshold
+        assert self._run(current=50.5, prev_value=50.0) is True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -877,7 +877,37 @@ def save_state(
     open_pnl: Optional[float] = None,
     cb_alert_sent_at: Optional[str] = None,
 ) -> None:
-    """Save last scan results to state.json for the dashboard."""
+    """Save last scan results to state.json and state.db (dual-write during migration)."""
+    # ── SQLite writes ─────────────────────────────────────────────────────────
+    try:
+        conn = db_connect()
+        now_iso = datetime.now().isoformat()
+        save_scan_results(conn, results, signals)
+        if signals:
+            append_scan_history(conn, now_iso, signals)
+        if new_trades:
+            for t in new_trades:
+                insert_trade(conn, t)
+        if portfolio:
+            save_portfolio(conn, portfolio)
+            current_total = portfolio.get("total_usdc")
+            if current_total is not None:
+                old_peak_str = get_kv(conn, "peak_portfolio_usdc")
+                old_peak = float(old_peak_str) if old_peak_str else 0.0
+                if current_total > old_peak:
+                    set_kv(conn, "peak_portfolio_usdc", str(current_total))
+        if fg_regime is not None:
+            set_kv(conn, "fg_regime", fg_regime)
+        if open_pnl is not None:
+            set_kv(conn, "open_pnl", str(open_pnl))
+        if cb_alert_sent_at is not None:
+            set_kv(conn, "cb_alert_sent_at", cb_alert_sent_at)
+        set_kv(conn, "last_scan", now_iso)
+        conn.close()
+    except Exception as _e:
+        print(f"  ⚠ SQLite save_state failed: {_e}")
+
+    # ── Legacy state.json write (kept during migration) ───────────────────────
     try:
         state: dict[str, Any] = {"last_scan": datetime.now().isoformat(), "results": results, "signals": signals,
                  "history": [], "trades": [], "cooldowns": {}, "fg_cache": None,
@@ -903,11 +933,11 @@ def save_state(
             state["portfolio"] = portfolio                            # overwrite with fresh data
         # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
         current_total = portfolio["total_usdc"] if portfolio else None
-        old_peak: float = state.get("peak_portfolio_usdc") or 0.0
-        if current_total is not None and current_total > old_peak:
+        old_peak_j: float = state.get("peak_portfolio_usdc") or 0.0
+        if current_total is not None and current_total > old_peak_j:
             state["peak_portfolio_usdc"] = current_total
-        elif old_peak > 0:
-            state["peak_portfolio_usdc"] = old_peak
+        elif old_peak_j > 0:
+            state["peak_portfolio_usdc"] = old_peak_j
         if signals:
             state["history"].append({"time": state["last_scan"], "signals": signals})
         if new_trades:
@@ -2097,9 +2127,22 @@ def _check_sl_outcomes() -> None:
                     )
                     if tp1_filled_order:
                         _handle_partial_tp1(trade, tp1_filled_order)
-                        # Immediately flush the partial_tp transition to state.json
-                        # (surgical patch) so that a crash before the main persistence
-                        # loop does not cause double-processing on the next scan.
+                        # Flush partial_tp transition immediately — prevents double-processing
+                        # on the next scan if the scanner crashes before the main loop.
+                        # SQLite write (targeted UPDATE):
+                        try:
+                            _oid = str(trade.get("order_id", ""))
+                            if _oid:
+                                _c = db_connect()
+                                update_trade_fields(_c, _oid,
+                                    status=trade["status"],
+                                    partial_tp1=trade.get("partial_tp1"),
+                                    oco_id=trade.get("oco_id"),
+                                    qty=trade.get("qty"))
+                                _c.close()
+                        except Exception:
+                            pass
+                        # Legacy state.json surgical patch (kept during migration):
                         try:
                             _patch: dict[str, Any] = {}
                             if os.path.exists(STATE_FILE):
@@ -2164,14 +2207,34 @@ def _check_sl_outcomes() -> None:
             except Exception:
                 pass
         # Persist updated trade statuses (tp_hit / sl_hit / partial_tp)
-        # Re-read state.json after all API calls to avoid clobbering concurrent writes.
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        # Build lookup by order_id (oco_ids key is oco_id, not a stable trade key;
-        # use order_id as tiebreaker when multiple trades share a symbol — rare).
         resolved_by_order: dict[str, dict[str, Any]] = {
             str(t.get("order_id")): t for _, t in oco_ids.items()
         }
+        # SQLite: targeted UPDATE per resolved trade
+        try:
+            _conn = db_connect()
+            for order_id, resolved in resolved_by_order.items():
+                if resolved.get("status") not in ("open",):
+                    fields: dict[str, Any] = {
+                        "status":     resolved["status"],
+                        "exit_price": resolved.get("exit_price"),
+                        "pnl_pct":    resolved.get("pnl_pct"),
+                        "exit_time":  resolved.get("exit_time"),
+                    }
+                    if resolved.get("partial_tp1"):
+                        fields["partial_tp1"] = resolved["partial_tp1"]
+                    if resolved.get("oco_id") is not None:
+                        fields["oco_id"] = resolved["oco_id"]
+                    if resolved.get("qty") is not None:
+                        fields["qty"] = resolved["qty"]
+                    update_trade_fields(_conn, order_id, **fields)
+            _conn.close()
+        except Exception as _e:
+            print(f"  ⚠ SQLite trade outcome write failed: {_e}")
+
+        # Legacy state.json write (re-read after all API calls to avoid clobbering).
+        with open(STATE_FILE) as f:
+            state = json.load(f)
         for t in (state.get("trades") or []):
             resolved = resolved_by_order.get(str(t.get("order_id")))
             if resolved and resolved.get("status") not in ("open",):
@@ -3330,6 +3393,12 @@ def scan() -> None:
                         _clear_pending_second_entry(sym)
                         # Persist combined trade immediately so the correlation cap
                         # and open-position guard count it in this scan.
+                        try:
+                            _se_conn = db_connect()
+                            insert_trade(_se_conn, trade)
+                            _se_conn.close()
+                        except Exception as _e:
+                            print(f"  ⚠ Could not persist split-entry trade to SQLite: {_e}")
                         try:
                             _se_state: dict[str, Any] = {}
                             if os.path.exists(STATE_FILE):

@@ -49,6 +49,7 @@ from config import (  # noqa: E402
     PAIRS, CAPITAL,
     MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
     ENTRY_REFINE_ENABLED, ENTRY_REFINE_15M_RSI_MAX, ENTRY_REFINE_15M_LIMIT,
+    PAIR_SCORE_ENABLED, PAIR_SCORE_MIN_TRADES, PAIR_SCORE_LOOKBACK,
     DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
     BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
     PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
@@ -2395,6 +2396,30 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
     send_telegram(msg)
     print("  📊 Morning digest sent")
 
+# ── Dynamic pair scoring (T4-3) ──────────────────────────────────────────────
+def _pair_score(symbol: str, trades: list[dict[str, Any]]) -> float:
+    """Composite score = win_rate × profit_factor from last PAIR_SCORE_LOOKBACK closed trades.
+
+    Returns 0.5 (neutral) when fewer than PAIR_SCORE_MIN_TRADES are available.
+    Higher score = historically better-performing pair → preferred in correlation cap.
+    """
+    closed = [
+        t for t in trades
+        if t.get("symbol") == symbol
+        and t.get("status") in ("tp_hit", "sl_hit", "timeout")
+        and t.get("pnl_pct") is not None
+    ][-PAIR_SCORE_LOOKBACK:]
+    if len(closed) < PAIR_SCORE_MIN_TRADES:
+        return 0.5   # neutral — insufficient history
+    wins   = [t["pnl_pct"] for t in closed if t["pnl_pct"] > 0]
+    losses = [t["pnl_pct"] for t in closed if t["pnl_pct"] < 0]
+    win_rate     = len(wins) / len(closed)
+    gross_profit = sum(wins)         if wins   else 0.0
+    gross_loss   = abs(sum(losses))  if losses else 1e-9   # avoid div/0
+    profit_factor = gross_profit / gross_loss
+    return win_rate * profit_factor
+
+
 # ── Main scan ────────────────────────────────────────────────────────────────
 def scan() -> None:
     print(f"\n--- {datetime.now().strftime('%a. %d %b %Y %H:%M:%S')} ---")
@@ -2565,10 +2590,22 @@ def scan() -> None:
     # ETH/ADA/DOGE/BNB/SOL/XRP are 0.75–0.95 BTC-correlated: ≥3 simultaneous
     # signals = amplified BTC exposure, not independent opportunities. Cap at 1.
     if len(candidates) >= 3:
-        candidates.sort(key=lambda s: s["rsi"])
+        if PAIR_SCORE_ENABLED:
+            _score_trades: list[dict[str, Any]] = []
+            try:
+                if os.path.exists(STATE_FILE):
+                    with open(STATE_FILE) as _sf:
+                        _score_trades = json.load(_sf).get("trades", [])
+            except Exception:
+                pass
+            candidates.sort(key=lambda s: _pair_score(s["symbol"], _score_trades), reverse=True)
+            reason = f"best score ({_pair_score(candidates[0]['symbol'], _score_trades):.2f})"
+        else:
+            candidates.sort(key=lambda s: s["rsi"])
+            reason = "lowest RSI"
         dropped = [s["symbol"] for s in candidates[1:]]
         candidates = candidates[:1]
-        print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} (lowest RSI), "
+        print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} ({reason}), "
               f"dropping: {', '.join(dropped)}")
 
     # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────

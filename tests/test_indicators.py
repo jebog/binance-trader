@@ -654,20 +654,16 @@ class TestVolSizing:
 class TestIsBtcDomRising:
     """Unit tests for _is_btc_dom_rising().
 
-    The function reads btc_dom_prev from state.json.  We patch os.path.exists
-    and builtins.open to inject controlled state without touching the filesystem.
+    The function now reads btc_dom_prev from SQLite via get_kv.
+    We patch scanner.db_connect and scanner.get_kv to inject controlled values.
     """
 
     def _run(self, current, prev_value=None):
-        import scanner, json as _json
-        from unittest.mock import mock_open
+        import scanner
 
-        state = {}
-        if prev_value is not None:
-            state["btc_dom_prev"] = prev_value
-
-        with patch("scanner.os.path.exists", return_value=True), \
-             patch("builtins.open", mock_open(read_data=_json.dumps(state))):
+        mock_conn = MagicMock()
+        with patch("scanner.db_connect", return_value=mock_conn), \
+             patch("scanner.get_kv", return_value=str(prev_value) if prev_value is not None else None):
             return scanner._is_btc_dom_rising(current)
 
     def test_none_current_returns_false(self):

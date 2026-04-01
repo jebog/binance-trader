@@ -183,7 +183,7 @@ def notify_mac(title: str, message: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 #  SQLite persistence layer
 #
-#  state.db is the canonical store; state.json is kept as a legacy fallback
+#  state.db is the canonical persistence store (state.json no longer written)
 #  until the migration is complete (feature/sqlite-cleanup removes it).
 #  All helpers below use an explicit Connection argument so callers control
 #  connection lifetime. WAL mode lets the TUI's 5s reader and the scanner's
@@ -877,10 +877,10 @@ def save_state(
     open_pnl: Optional[float] = None,
     cb_alert_sent_at: Optional[str] = None,
 ) -> None:
-    """Save last scan results to state.json and state.db (dual-write during migration)."""
-    # ── SQLite writes ─────────────────────────────────────────────────────────
+    """Save last scan results to state.db."""
     try:
         conn = db_connect()
+        db_init(conn)
         now_iso = datetime.now().isoformat()
         save_scan_results(conn, results, signals)
         if signals:
@@ -906,50 +906,6 @@ def save_state(
         conn.close()
     except Exception as _e:
         print(f"  ⚠ SQLite save_state failed: {_e}")
-
-    # ── Legacy state.json write (kept during migration) ───────────────────────
-    try:
-        state: dict[str, Any] = {"last_scan": datetime.now().isoformat(), "results": results, "signals": signals,
-                 "history": [], "trades": [], "cooldowns": {}, "fg_cache": None,
-                 "portfolio": None, "logs": []}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                old = json.load(f)
-            state["history"]   = (old.get("history")   or [])[-49:]  # keep last 50
-            state["trades"]    = (old.get("trades")    or [])[-99:]  # keep last 100
-            state["cooldowns"] = old.get("cooldowns")  or {}         # preserve SL cooldowns
-            state["fg_cache"]      = old.get("fg_cache")                     # preserve F&G cache
-            state["portfolio"]     = old.get("portfolio")                  # preserve last portfolio
-            state["sent_signals"]  = old.get("sent_signals") or {}         # preserve dedup ledger
-            state["fg_regime"]        = fg_regime or old.get("fg_regime")     # preserve regime state
-            state["open_pnl"]         = open_pnl if open_pnl is not None else old.get("open_pnl")
-            state["peak_portfolio_usdc"] = old.get("peak_portfolio_usdc")   # updated below
-            state["cb_alert_sent_at"]  = cb_alert_sent_at or old.get("cb_alert_sent_at")
-            state["last_digest_date"]  = old.get("last_digest_date")
-            state["btc_dom_cache"]     = old.get("btc_dom_cache")             # preserve CoinGecko cache
-            state["btc_dom_prev"]      = old.get("btc_dom_prev")             # preserve last dominance value
-            state["pending_second_entries"] = old.get("pending_second_entries") or {}  # preserve split-entry pending legs
-        if portfolio:
-            state["portfolio"] = portfolio                            # overwrite with fresh data
-        # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
-        current_total = portfolio["total_usdc"] if portfolio else None
-        old_peak_j: float = state.get("peak_portfolio_usdc") or 0.0
-        if current_total is not None and current_total > old_peak_j:
-            state["peak_portfolio_usdc"] = current_total
-        elif old_peak_j > 0:
-            state["peak_portfolio_usdc"] = old_peak_j
-        if signals:
-            state["history"].append({"time": state["last_scan"], "signals": signals})
-        if new_trades:
-            state["trades"].extend(new_trades)
-        # Embed last 200 lines of log into state.json
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f:
-                state["logs"] = f.readlines()[-200:]
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
 
 BASE_URL = "https://api.binance.com"
 
@@ -1102,34 +1058,22 @@ def detect_bullish_divergence(
 
 # ── Market context ───────────────────────────────────────────────────────────
 def get_fear_greed() -> tuple[int, str, bool]:
-    """Fetch Crypto Fear & Greed index — with state.json cache (valid 25h).
+    """Fetch Crypto Fear & Greed index — with SQLite cache (valid 25h).
 
     Priority: live fetch → cached value (< 25h old) → fallback 50 + Telegram warning.
     """
     def _read_cache():
         try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as f:
-                    fg = json.load(f).get("fg_cache")
-                if fg and (datetime.now() - datetime.fromisoformat(fg["ts"])) < timedelta(hours=25):
-                    return int(fg["value"]), fg["classification"]
+            _rc_conn = db_connect()
+            fg = get_fg_cache(_rc_conn)
+            _rc_conn.close()
+            if fg and (datetime.now() - datetime.fromisoformat(fg["ts"])) < timedelta(hours=25):
+                return int(fg["value"]), fg["classification"]
         except Exception:
             pass
         return None
 
     def _write_cache(value, classification):
-        try:
-            state = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as f:
-                    state = json.load(f)
-            state["fg_cache"] = {"value": value, "classification": classification,
-                                 "ts": datetime.now().isoformat()}
-            with open(STATE_FILE, "w") as f:
-                json.dump(state, f, indent=2)
-        except Exception:
-            pass
-        # SQLite dual-write
         try:
             _fg_conn = db_connect()
             set_fg_cache(_fg_conn, value, classification)
@@ -1182,41 +1126,26 @@ COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 def get_btc_dominance() -> Optional[float]:
     """Return current BTC dominance % (0-100), or None on any failure (fail-open).
 
-    Caches the result in state.json["btc_dom_cache"] for BTC_DOM_CACHE_H hours to
+    Caches the result in the btc_dom_cache SQLite table for BTC_DOM_CACHE_H hours to
     avoid hammering CoinGecko's free tier across repeated scans.
     """
     if not BTC_DOM_ENABLED:
         return None
     try:
-        state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        cache = state.get("btc_dom_cache") or {}
-        cached_at = cache.get("ts")
-        if cached_at:
-            age_h = (datetime.now() - datetime.fromisoformat(cached_at)).total_seconds() / 3600
+        _bdc_conn = db_connect()
+        db_init(_bdc_conn)
+        cache = get_btc_dom_cache(_bdc_conn)
+        if cache:
+            age_h = (datetime.now() - datetime.fromisoformat(cache["ts"])).total_seconds() / 3600
             if age_h < BTC_DOM_CACHE_H:
+                _bdc_conn.close()
                 return float(cache["value"])
         req  = urllib.request.Request(COINGECKO_GLOBAL, headers={"Accept": "application/json"})
         resp = urllib.request.urlopen(req, timeout=10)
         data = json.loads(resp.read().decode())
         dom  = float(data["data"]["market_cap_percentage"]["btc"])
-        # Surgical patch: re-read state to avoid clobbering concurrent writes
-        fresh: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                fresh = json.load(f)
-        fresh["btc_dom_cache"] = {"value": dom, "ts": datetime.now().isoformat()}
-        with open(STATE_FILE, "w") as f:
-            json.dump(fresh, f, indent=2)
-        # SQLite dual-write
-        try:
-            _bdc_conn = db_connect()
-            set_btc_dom_cache(_bdc_conn, dom)
-            _bdc_conn.close()
-        except Exception:
-            pass
+        set_btc_dom_cache(_bdc_conn, dom)
+        _bdc_conn.close()
         return dom
     except Exception as e:
         print(f"  ⚠ BTC dominance fetch failed: {e}")
@@ -1232,11 +1161,9 @@ def _is_btc_dom_rising(current: Optional[float]) -> bool:
     if current is None:
         return False
     try:
-        state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        prev = state.get("btc_dom_prev")
+        _br_conn = db_connect()
+        prev = get_kv(_br_conn, "btc_dom_prev")
+        _br_conn.close()
         if prev is None:
             return False  # first run — no baseline to compare
         return float(current) > float(prev) * (1 + BTC_DOM_RISE_THRESHOLD)
@@ -1380,7 +1307,7 @@ def has_open_position(symbol: str) -> bool:
 
 # ── Portfolio ────────────────────────────────────────────────────────────────
 def get_open_positions() -> list[dict[str, Any]]:
-    """Return open positions with live P&L, sourced from OCO list + state.json trades."""
+    """Return open positions with live P&L, sourced from OCO list + state.db trades."""
     try:
         ocos = signed_get("/api/v3/openOrderList", {})
     except Exception:
@@ -1390,18 +1317,18 @@ def get_open_positions() -> list[dict[str, Any]]:
 
     active_symbols = {oco["symbol"] for oco in ocos}
 
-    # Most recent trade per symbol for entry/TP/SL/qty
+    # Most recent open trade per symbol for entry/TP/SL/qty
     trades_by_symbol = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-            for trade in reversed(state.get("trades") or []):
-                sym = trade.get("symbol")
-                if sym in active_symbols and sym not in trades_by_symbol:
-                    trades_by_symbol[sym] = trade
-        except Exception:
-            pass
+    try:
+        _op_conn = db_connect()
+        db_init(_op_conn)
+        for trade in reversed(get_open_trades(_op_conn)):
+            sym = trade.get("symbol")
+            if sym in active_symbols and sym not in trades_by_symbol:
+                trades_by_symbol[sym] = trade
+        _op_conn.close()
+    except Exception:
+        pass
 
     positions = []
     for symbol in sorted(active_symbols):
@@ -1489,30 +1416,15 @@ def get_portfolio() -> Optional[dict[str, Any]]:
 
 # ── Cooldown helpers ─────────────────────────────────────────────────────────
 def _load_cooldowns() -> dict[str, str]:
-    """Return {symbol: expiry_iso} from state.json, pruning expired entries."""
-    if not os.path.exists(STATE_FILE):
-        return {}
+    """Return {symbol: expiry_iso}, pruning expired entries."""
     try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        now = datetime.now()
-        return {sym: exp for sym, exp in (state.get("cooldowns") or {}).items()
-                if datetime.fromisoformat(exp) > now}
+        _lc_conn = db_connect()
+        result = load_cooldowns(_lc_conn)
+        _lc_conn.close()
+        return result
     except Exception:
         return {}
 
-def _save_sent_signals(sent_signals: dict[str, str]) -> None:
-    """Patch sent_signals into state.json without touching other fields."""
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        state["sent_signals"] = sent_signals
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
 
 def _order_fill_price(order: dict[str, Any]) -> Optional[float]:
     """Return actual avg fill price from a FILLED Binance order object.
@@ -1535,19 +1447,6 @@ def _order_fill_price(order: dict[str, Any]) -> Optional[float]:
 def _save_cooldown(symbol: str) -> None:
     """Record a SL-cooldown for symbol for SL_COOLDOWN_H hours."""
     try:
-        state = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        cooldowns = state.get("cooldowns") or {}
-        cooldowns[symbol] = (datetime.now() + timedelta(hours=SL_COOLDOWN_H)).isoformat()
-        state["cooldowns"] = cooldowns
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
-    # SQLite dual-write
-    try:
         _cd_conn = db_connect()
         save_cooldown(_cd_conn, symbol)
         _cd_conn.close()
@@ -1556,60 +1455,34 @@ def _save_cooldown(symbol: str) -> None:
 
 # ── Split-entry state helpers (T2-1) ─────────────────────────────────────────
 def _load_pending_second_entries() -> dict[str, Any]:
-    """Return pending_second_entries dict from state.json (empty dict on any failure)."""
+    """Return pending_second_entries dict from state.db (empty dict on any failure)."""
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                return json.load(f).get("pending_second_entries") or {}
+        _lp_conn = db_connect()
+        result = load_pending_second_entries(_lp_conn)
+        _lp_conn.close()
+        return result
     except Exception:
-        pass
-    return {}
+        return {}
 
 
 def _save_pending_second_entry(symbol: str, data: dict[str, Any]) -> None:
-    """Surgical patch: write a single pending second entry to state.json."""
-    try:
-        state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        pending = state.get("pending_second_entries") or {}
-        pending[symbol] = data
-        state["pending_second_entries"] = pending
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        print(f"  ⚠ Could not persist pending second entry for {symbol}: {e}")
-    # SQLite dual-write
+    """Write a single pending second entry to state.db."""
     try:
         _pse_conn = db_connect()
         save_pending_second_entry(_pse_conn, symbol, data)
         _pse_conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ Could not persist pending second entry for {symbol}: {e}")
 
 
 def _clear_pending_second_entry(symbol: str) -> None:
-    """Surgical patch: remove a pending second entry from state.json."""
-    try:
-        state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                state = json.load(f)
-        pending = state.get("pending_second_entries") or {}
-        pending.pop(symbol, None)
-        state["pending_second_entries"] = pending
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        print(f"  ⚠ Could not clear pending second entry for {symbol}: {e}")
-    # SQLite dual-write
+    """Remove a pending second entry from state.db."""
     try:
         _psc_conn = db_connect()
         clear_pending_second_entry(_psc_conn, symbol)
         _psc_conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠ Could not clear pending second entry for {symbol}: {e}")
 
 
 def _place_split_second_entry(
@@ -1853,22 +1726,14 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
         print(f"  🛡 Break-even armed for {symbol} — SL moved to entry ${entry:.4f}")
         send_telegram(f"🛡 Break-even armed for `{symbol}` — SL moved to entry `${entry:.4f}`")
 
-        # Surgical state flush — prevent double-processing on crash
+        # Flush to DB — prevent double-processing on crash
         try:
-            _be_patch: dict[str, Any] = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as _f:
-                    _be_patch = json.load(_f)
-            for _t in (_be_patch.get("trades") or []):
-                if str(_t.get("order_id")) == str(trade.get("order_id")):
-                    _t["breakeven_moved"] = True
-                    _t["sl"]              = trade["sl"]
-                    _t["oco_id"]          = trade["oco_id"]
-                    break
-            with open(STATE_FILE, "w") as _f:
-                json.dump(_be_patch, _f, indent=2)
+            _be_conn = db_connect()
+            update_trade_fields(_be_conn, str(trade.get("order_id", "")),
+                                breakeven_moved=True, sl=trade["sl"], oco_id=trade["oco_id"])
+            _be_conn.close()
         except Exception:
-            pass  # best-effort; main persistence loop will catch it
+            pass  # best-effort; _check_sl_outcomes will catch it next scan
 
         return True
 
@@ -1879,20 +1744,12 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
         send_telegram(msg)
         trade["status"] = "no_oco"
         trade["breakeven_moved"] = True  # stop retrying — manual intervention needed
-        # Surgical flush for the critical no_oco status
+        # Flush critical no_oco status to DB
         try:
-            _be_patch2: dict[str, Any] = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as _f:
-                    _be_patch2 = json.load(_f)
-            for _t in (_be_patch2.get("trades") or []):
-                if str(_t.get("order_id")) == str(trade.get("order_id")):
-                    _t["status"]          = "no_oco"
-                    _t["breakeven_moved"] = True
-                    _t["oco_id"]          = None   # OCO was cancelled; stale ID is dead
-                    break
-            with open(STATE_FILE, "w") as _f:
-                json.dump(_be_patch2, _f, indent=2)
+            _be_conn2 = db_connect()
+            update_trade_fields(_be_conn2, str(trade.get("order_id", "")),
+                                status="no_oco", breakeven_moved=True, oco_id=None)
+            _be_conn2.close()
         except Exception:
             pass
         return True
@@ -1992,21 +1849,14 @@ def _check_progressive_trailing(trade: dict[str, Any], current_price: float, sym
             f"Delta: `{new_bps}bps` at `${current_price:.4f}` ({atr_mult_trigger}×ATR)"
         )
 
-        # Surgical state flush
+        # Flush to DB — prevent re-firing this stage on next scan
         try:
-            _pt_patch: dict[str, Any] = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as _f:
-                    _pt_patch = json.load(_f)
-            for _t in (_pt_patch.get("trades") or []):
-                if str(_t.get("order_id")) == str(trade.get("order_id")):
-                    _t["oco_id"]         = trade["oco_id"]
-                    _t["trailing_stage"] = trade["trailing_stage"]
-                    break
-            with open(STATE_FILE, "w") as _f:
-                json.dump(_pt_patch, _f, indent=2)
+            _pt_conn = db_connect()
+            update_trade_fields(_pt_conn, str(trade.get("order_id", "")),
+                                oco_id=trade["oco_id"], trailing_stage=trade["trailing_stage"])
+            _pt_conn.close()
         except Exception:
-            pass  # best-effort; main persistence loop will catch it
+            pass  # best-effort; _check_sl_outcomes will catch it next scan
 
         return True
 
@@ -2019,20 +1869,13 @@ def _check_progressive_trailing(trade: dict[str, Any], current_price: float, sym
         send_telegram(msg)
         trade["status"]         = "no_oco"
         trade["trailing_stage"] = current_stage + 1  # stop retrying this stage
-        # Surgical flush for the critical no_oco status
+        # Flush critical no_oco status to DB
         try:
-            _pt_patch2: dict[str, Any] = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as _f:
-                    _pt_patch2 = json.load(_f)
-            for _t in (_pt_patch2.get("trades") or []):
-                if str(_t.get("order_id")) == str(trade.get("order_id")):
-                    _t["status"]         = "no_oco"
-                    _t["trailing_stage"] = trade["trailing_stage"]
-                    _t["oco_id"]         = None
-                    break
-            with open(STATE_FILE, "w") as _f:
-                json.dump(_pt_patch2, _f, indent=2)
+            _pt_conn2 = db_connect()
+            update_trade_fields(_pt_conn2, str(trade.get("order_id", "")),
+                                status="no_oco", trailing_stage=trade["trailing_stage"],
+                                oco_id=None)
+            _pt_conn2.close()
         except Exception:
             pass
         return True
@@ -2107,17 +1950,15 @@ def _check_sl_outcomes() -> None:
     Also checks for partial TP1 fills (T2-4) on trades with tp1_order_id.
     Also handles trade timeout (T3-2) — force-exit positions open > TRADE_TIMEOUT_H.
     """
-    if not os.path.exists(STATE_FILE):
+    try:
+        _so_conn = db_connect()
+        db_init(_so_conn)
+        active_trades = get_open_trades(_so_conn)
+        _so_conn.close()
+    except Exception as _e:
+        print(f"  ⚠ _check_sl_outcomes: DB read failed: {_e}")
         return
     try:
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        # Include partial_tp trades — their new OCO can still hit TP2 or SL
-        active_statuses = ("open", "partial_tp")
-        active_trades = [
-            t for t in (state.get("trades") or [])
-            if t.get("status") in active_statuses
-        ]
         if not active_trades:
             return
         oco_ids = {t["oco_id"]: t for t in active_trades if t.get("oco_id")}
@@ -2177,23 +2018,6 @@ def _check_sl_outcomes() -> None:
                                 _c.close()
                         except Exception:
                             pass
-                        # Legacy state.json surgical patch (kept during migration):
-                        try:
-                            _patch: dict[str, Any] = {}
-                            if os.path.exists(STATE_FILE):
-                                with open(STATE_FILE) as _f:
-                                    _patch = json.load(_f)
-                            for _t in (_patch.get("trades") or []):
-                                if str(_t.get("order_id")) == str(trade.get("order_id")):
-                                    _t["status"]     = trade["status"]
-                                    _t["partial_tp1"] = trade.get("partial_tp1")
-                                    _t["oco_id"]     = trade.get("oco_id")
-                                    _t["qty"]        = trade.get("qty")
-                                    break
-                            with open(STATE_FILE, "w") as _f:
-                                json.dump(_patch, _f, indent=2)
-                        except Exception:
-                            pass  # best-effort; main persistence loop is the authoritative write
                         # Skip OCO terminal-state checks this cycle —
                         # TP2/SL will be caught on the next scan.
                         continue
@@ -2266,26 +2090,6 @@ def _check_sl_outcomes() -> None:
             _conn.close()
         except Exception as _e:
             print(f"  ⚠ SQLite trade outcome write failed: {_e}")
-
-        # Legacy state.json write (re-read after all API calls to avoid clobbering).
-        with open(STATE_FILE) as f:
-            state = json.load(f)
-        for t in (state.get("trades") or []):
-            resolved = resolved_by_order.get(str(t.get("order_id")))
-            if resolved and resolved.get("status") not in ("open",):
-                t["status"]     = resolved["status"]
-                t["exit_price"] = resolved.get("exit_price")
-                t["pnl_pct"]    = resolved.get("pnl_pct")
-                t["exit_time"]  = resolved.get("exit_time")
-                # Propagate partial_tp fields
-                if resolved.get("partial_tp1"):
-                    t["partial_tp1"] = resolved["partial_tp1"]
-                if resolved.get("oco_id") is not None:
-                    t["oco_id"] = resolved["oco_id"]
-                if resolved.get("qty") is not None:
-                    t["qty"] = resolved["qty"]
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
     except Exception as e:
         print(f"  ⚠ SL outcome check failed: {e}")
 
@@ -3375,20 +3179,13 @@ def scan() -> None:
     print(f"  SL: -{STOP_LOSS*100:.0f}% | TP: +{TAKE_PROFIT*100:.0f}%")
     print(f"{'='*55}")
 
-    # ── Load persisted state (dedup ledger + regime tracking) ────────────────
-    _scan_state: dict[str, Any] = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                _scan_state = json.load(f)
-        except Exception:
-            pass
-    sent_signals: dict[str, str] = _scan_state.get("sent_signals") or {}
+    # ── Load persisted state from SQLite (dedup ledger + regime tracking) ───────
+    _sq = db_connect()
+    db_init(_sq)
+    sent_signals: dict[str, str] = load_sent_signals(_sq)
+    _sq.close()
 
     # ── Check for SL outcomes from previous trades ───────────────────────────
-    # Must run after _scan_state is loaded so old_fg_regime is not overwritten.
-    # _check_sl_outcomes() calls save_state() internally with fg_regime=None,
-    # which preserves the existing regime value already on disk.
     _check_sl_outcomes()
 
     # ── Split-entry: check pending second legs (T2-1) ─────────────────────────
@@ -3433,16 +3230,6 @@ def scan() -> None:
                             insert_trade(_se_conn, trade)
                             _se_conn.close()
                         except Exception as _e:
-                            print(f"  ⚠ Could not persist split-entry trade to SQLite: {_e}")
-                        try:
-                            _se_state: dict[str, Any] = {}
-                            if os.path.exists(STATE_FILE):
-                                with open(STATE_FILE) as _f:
-                                    _se_state = json.load(_f)
-                            _se_state.setdefault("trades", []).append(trade)
-                            with open(STATE_FILE, "w") as _f:
-                                json.dump(_se_state, _f, indent=2)
-                        except Exception as _e:
                             print(f"  ⚠ Could not persist split-entry trade: {_e}")
             except Exception as _split_e:
                 print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
@@ -3450,16 +3237,13 @@ def scan() -> None:
     # ── Break-even stop: check open trades (T3-1) ───────────────────────────────
     # Fetch current price for each open trade; if price ≥ entry + 1×ATR, move SL to entry.
     if BREAKEVEN_ENABLED:
-        _be_state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE) as _f:
-                    _be_state = json.load(_f)
-            except Exception:
-                pass
-        for _be_trade in (_be_state.get("trades") or []):
-            if _be_trade.get("status") not in ("open", "partial_tp"):
-                continue
+        try:
+            _be_conn = db_connect()
+            _be_trades = get_open_trades(_be_conn)
+            _be_conn.close()
+        except Exception:
+            _be_trades = []
+        for _be_trade in _be_trades:
             try:
                 _be_sym = _be_trade["symbol"]
                 _be_cp  = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
@@ -3471,16 +3255,13 @@ def scan() -> None:
     # Fires only for breakeven-armed trades; each stage cancels+replaces the OCO
     # with a tighter trailing delta. Mirrors the break-even phase above.
     if PROGRESSIVE_TRAILING_ENABLED:
-        _pt_state: dict[str, Any] = {}
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE) as _f:
-                    _pt_state = json.load(_f)
-            except Exception:
-                pass
-        for _pt_trade in (_pt_state.get("trades") or []):
-            if _pt_trade.get("status") not in ("open", "partial_tp"):
-                continue
+        try:
+            _pt_conn = db_connect()
+            _pt_trades = get_open_trades(_pt_conn)
+            _pt_conn.close()
+        except Exception:
+            _pt_trades = []
+        for _pt_trade in _pt_trades:
             if not _pt_trade.get("breakeven_moved"):
                 continue   # micro-opt: skip trades where break-even hasn't fired
             try:
@@ -3493,7 +3274,12 @@ def scan() -> None:
     # ── Market context (fetched once per scan) ────────────────────────────────
     fg_value, fg_class, fg_fresh = get_fear_greed()
     # Bootstrap old_regime to current value on first run to suppress spurious alert
-    old_fg_regime: str = _scan_state.get("fg_regime") or _fg_regime(fg_value)
+    try:
+        _r_conn = db_connect()
+        old_fg_regime: str = get_kv(_r_conn, "fg_regime") or _fg_regime(fg_value)
+        _r_conn.close()
+    except Exception:
+        old_fg_regime = _fg_regime(fg_value)
     btc_ctx = get_btc_context()
     btc_dom        = get_btc_dominance() if BTC_DOM_ENABLED else None
     btc_dom_rising = _is_btc_dom_rising(btc_dom) if BTC_DOM_ENABLED else False
@@ -3504,26 +3290,14 @@ def scan() -> None:
     dom_str = f"{btc_dom:.1f}%{'↑' if btc_dom_rising else ''}" if btc_dom is not None else "n/a"
     print(f"  F&G: {fg_value} ({fg_class})  |  BTC: ${btc_ctx['price']:,.0f}  RSI:{btc_ctx['rsi']}  "
           f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}  |  BTC.D:{dom_str}")
-    # Surgical patch: save btc_dom_prev for the *next* scan's comparison.
-    # Re-read state after network calls to avoid clobbering concurrent writes.
+    # Save btc_dom_prev for the *next* scan's comparison.
     if BTC_DOM_ENABLED and btc_dom is not None:
-        try:
-            _dom_state: dict[str, Any] = {}
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as f:
-                    _dom_state = json.load(f)
-            _dom_state["btc_dom_prev"] = btc_dom
-            with open(STATE_FILE, "w") as f:
-                json.dump(_dom_state, f, indent=2)
-        except Exception as e:
-            print(f"  ⚠ Could not persist btc_dom_prev: {e}")
-        # SQLite dual-write (replaces JSON surgical patch in cleanup branch)
         try:
             _bdp_conn = db_connect()
             set_kv(_bdp_conn, "btc_dom_prev", str(btc_dom))
             _bdp_conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ⚠ Could not persist btc_dom_prev: {e}")
 
     # ── F&G regime-change alert (fires once per threshold crossing) ───────────
     # Skip when F&G data is stale (fallback 50/"Neutral") to avoid spurious alerts
@@ -3575,9 +3349,9 @@ def scan() -> None:
         if PAIR_SCORE_ENABLED:
             _score_trades: list[dict[str, Any]] = []
             try:
-                if os.path.exists(STATE_FILE):
-                    with open(STATE_FILE) as _sf:
-                        _score_trades = json.load(_sf).get("trades", [])
+                _ps_conn = db_connect()
+                _score_trades = get_all_trades(_ps_conn)
+                _ps_conn.close()
             except Exception as _se:
                 print(f"  ⚠ Pair score: state read failed ({_se}) — falling back to neutral 0.5")
             # Cache scores to avoid re-computing during sort and for log message
@@ -3593,14 +3367,25 @@ def scan() -> None:
               f"dropping: {', '.join(dropped)}")
 
     # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────
-    peak_usdc    = _scan_state.get("peak_portfolio_usdc") or 0.0
+    try:
+        _cb_conn = db_connect()
+        _peak_str = get_kv(_cb_conn, "peak_portfolio_usdc")
+        peak_usdc: float = float(_peak_str) if _peak_str else 0.0
+        _cb_conn.close()
+    except Exception:
+        peak_usdc = 0.0
     current_usdc = portfolio["total_usdc"] if portfolio else None
     cb_alert_ts: Optional[str] = None  # set if alert fires this scan
     if peak_usdc and current_usdc:
         drawdown_pct = (peak_usdc - current_usdc) / peak_usdc
         if drawdown_pct >= MAX_DRAWDOWN_PCT:
             # Deduplicate: only fire Telegram once every 4 hours
-            cb_last = _scan_state.get("cb_alert_sent_at") or ""
+            try:
+                _cbl_conn = db_connect()
+                cb_last = get_kv(_cbl_conn, "cb_alert_sent_at") or ""
+                _cbl_conn.close()
+            except Exception:
+                cb_last = ""
             cb_cooldown_expired = (
                 not cb_last
                 or (datetime.now() - datetime.fromisoformat(cb_last)).total_seconds() >= 4 * 3600
@@ -3636,18 +3421,16 @@ def scan() -> None:
 
     # ── Telegram scan summary ─────────────────────────────────────────────────
     if all_results:
-        # Build performance line from closed trades in state.json
+        # Build performance line from closed trades in state.db
         perf_line = ""
         try:
-            if os.path.exists(STATE_FILE):
-                with open(STATE_FILE) as f:
-                    _state = json.load(f)
-                closed = [t for t in (_state.get("trades") or [])
-                          if t.get("status") in ("tp_hit", "sl_hit")]
-                if closed:
-                    wins  = sum(1 for t in closed if t.get("status") == "tp_hit")
-                    total = len(closed)
-                    perf_line = f"\n📊 Trades: `{wins}W/{total-wins}L` ({wins/total*100:.0f}% WR)"
+            _pl_conn = db_connect()
+            closed = get_closed_trades(_pl_conn)
+            _pl_conn.close()
+            if closed:
+                wins  = sum(1 for t in closed if t.get("status") == "tp_hit")
+                total = len(closed)
+                perf_line = f"\n📊 Trades: `{wins}W/{total-wins}L` ({wins/total*100:.0f}% WR)"
         except Exception:
             pass
 
@@ -3706,14 +3489,12 @@ def scan() -> None:
             send_telegram(msg)
             _sent_ts = datetime.now().isoformat()
             sent_signals[dedup_key] = _sent_ts
-            # SQLite dual-write
             try:
                 _ss_conn = db_connect()
                 save_sent_signal(_ss_conn, dedup_key, _sent_ts)
                 _ss_conn.close()
             except Exception:
                 pass
-        _save_sent_signals(sent_signals)
 
     if signals:
         cron_mode = os.environ.get("SCANNER_CRON", "") == "1"
@@ -3826,36 +3607,24 @@ def scan() -> None:
                                      # fg_regime already persisted by the earlier save_state call
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                _dash_state = json.load(f)
-            generate_dashboard(_dash_state)
+        _d_conn = db_connect()
+        db_init(_d_conn)
+        generate_dashboard(get_state_dict(_d_conn))
+        _d_conn.close()
     except Exception as e:
         print(f"  ⚠ Dashboard generation failed: {e}")
 
     # ── Daily digest (8am, once per calendar day) ─────────────────────────────
     try:
         now = datetime.now()
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as _df:
-                _digest_state = json.load(_df)
-            last_digest = _digest_state.get("last_digest_date", "")
-            if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
-                _send_daily_digest(_digest_state)
-                # Surgical patch: re-read freshest state after send_telegram() network call
-                # to avoid overwriting concurrent cooldown writes with a stale snapshot.
-                with open(STATE_FILE) as _df:
-                    _patch = json.load(_df)
-                _patch["last_digest_date"] = str(now.date())
-                with open(STATE_FILE, "w") as _df:
-                    json.dump(_patch, _df, indent=2)
-                # SQLite dual-write
-                try:
-                    _ldd_conn = db_connect()
-                    set_kv(_ldd_conn, "last_digest_date", str(now.date()))
-                    _ldd_conn.close()
-                except Exception:
-                    pass
+        _dd_conn = db_connect()
+        db_init(_dd_conn)
+        last_digest = get_kv(_dd_conn, "last_digest_date") or ""
+        if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
+            _send_daily_digest(get_state_dict(_dd_conn))
+            # set_kv after send_telegram() — WAL mode means no concurrent-write concern
+            set_kv(_dd_conn, "last_digest_date", str(now.date()))
+        _dd_conn.close()
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
 

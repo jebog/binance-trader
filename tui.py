@@ -737,7 +737,7 @@ class ScannerApp(App):
 
         try:
             tlog("Fetching market context...")
-            fg_value, fg_class = get_fear_greed()
+            fg_value, fg_class, _ = get_fear_greed()
             btc_ctx = get_btc_context()
             context = {
                 "fg_value":      fg_value,

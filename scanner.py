@@ -2225,8 +2225,19 @@ def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
     return STOP_LOSS, TAKE_PROFIT
 
 # ── Performance statistics (T4-1) ────────────────────────────────────────────
+def _safe_fromisoformat(ts: str) -> datetime:
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.min
+
+
 def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    """Compute rolling 30-day performance stats from closed trades."""
+    """Compute rolling 30-day performance stats from closed trades.
+
+    Sharpe is the per-trade information ratio (mean/std, sample-based).
+    It is not annualised because trades have variable holding periods.
+    """
     cutoff = datetime.now() - timedelta(days=30)
     closed = [
         t for t in trades
@@ -2240,13 +2251,15 @@ def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
     pnls = [t["pnl_pct"] for t in closed]
     wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    losses = [p for p in pnls if p < 0]   # strict: zero-pnl neither win nor loss
 
     mean_pnl = sum(pnls) / len(pnls)
-    variance = sum((p - mean_pnl) ** 2 for p in pnls) / len(pnls) if len(pnls) > 1 else 0.0
+    # Sample variance (N-1) for unbiased estimate of population std
+    variance = (sum((p - mean_pnl) ** 2 for p in pnls) / (len(pnls) - 1)
+                if len(pnls) > 1 else 0.0)
     std_pnl  = variance ** 0.5
-    # Annualise: scanner runs ~30-min scans → 17520 periods/year
-    sharpe = (mean_pnl / std_pnl * (17520 ** 0.5)) if std_pnl > 0 else 0.0
+    # Per-trade information ratio (not annualised — trades have variable hold times)
+    sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
 
     gross_profit = sum(wins)   if wins   else 0.0
     gross_loss   = abs(sum(losses)) if losses else 0.0
@@ -2254,7 +2267,7 @@ def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
 
     max_consec = cur = 0
     for p in pnls:
-        if p <= 0:
+        if p < 0:   # strict: zero-pnl does not extend loss streak
             cur += 1
             max_consec = max(max_consec, cur)
         else:
@@ -2269,20 +2282,13 @@ def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
             tier_stats[tier]["wins"] += 1
 
     return {
-        "count":            len(closed),
-        "win_rate":         len(wins) / len(closed),
-        "sharpe":           sharpe,
-        "profit_factor":    profit_factor,
+        "count":             len(closed),
+        "win_rate":          len(wins) / len(closed),
+        "sharpe":            sharpe,
+        "profit_factor":     profit_factor,
         "max_consec_losses": max_consec,
-        "tier_stats":       tier_stats,
+        "tier_stats":        tier_stats,
     }
-
-
-def _safe_fromisoformat(ts: str) -> datetime:
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return datetime.min
 
 
 # ── Daily digest ─────────────────────────────────────────────────────────────
@@ -2350,16 +2356,16 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
     perf = _compute_perf_stats(trades)
     if perf:
         pf_str = f"{perf['profit_factor']:.2f}" if perf["profit_factor"] != float("inf") else "∞"
-        tier_lines = "  ".join(
+        tier_lines = "\n  ".join(
             f"{tier}: {v['wins']}/{v['total']} ({v['wins']/v['total']*100:.0f}%)"
             for tier, v in sorted(perf["tier_stats"].items())
             if v["total"] > 0
         )
         perf_section = (
             f"\n\n📈 *30-day stats ({perf['count']} trades)*\n"
-            f"  Win rate: `{perf['win_rate']*100:.1f}%` | P.Factor: `{pf_str}` | Sharpe: `{perf['sharpe']:.2f}`\n"
-            f"  Max consec losses: `{perf['max_consec_losses']}`\n"
-            + (f"  {tier_lines}" if tier_lines else "")
+            f"  Win rate: `{perf['win_rate']*100:.1f}%` | P.Factor: `{pf_str}` | IR: `{perf['sharpe']:.2f}`\n"
+            f"  Max consec losses: `{perf['max_consec_losses']}`"
+            + (f"\n  {tier_lines}" if tier_lines else "")
         )
     else:
         perf_section = ""

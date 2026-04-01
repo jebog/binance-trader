@@ -1507,9 +1507,16 @@ class TestPerfStats:
         assert result["profit_factor"] == float("inf")
 
     def test_sharpe_positive_for_winning_trades(self):
+        # IR = mean/std; with consistent wins std>0, mean>0 → IR>0
         trades = [self._trade(5.0), self._trade(4.0), self._trade(6.0)]
         result = _compute_perf_stats(trades)
         assert result["sharpe"] > 0
+
+    def test_sharpe_single_trade_is_zero(self):
+        # std=0 for single trade → Sharpe defaults to 0.0
+        result = _compute_perf_stats([self._trade(5.0)])
+        assert result["sharpe"] == pytest.approx(0.0)
+        assert result["win_rate"] == pytest.approx(1.0)
 
     def test_max_consec_losses(self):
         trades = [
@@ -1522,6 +1529,19 @@ class TestPerfStats:
         ]
         result = _compute_perf_stats(trades)
         assert result["max_consec_losses"] == 3
+
+    def test_all_losses_case(self):
+        trades = [self._trade(-1.0, "sl_hit"), self._trade(-2.0, "sl_hit")]
+        result = _compute_perf_stats(trades)
+        assert result["win_rate"] == pytest.approx(0.0)
+        assert result["profit_factor"] == pytest.approx(0.0)
+        assert result["max_consec_losses"] == 2
+
+    def test_breakeven_trade_not_counted_as_loss(self):
+        # pnl_pct=0 is neither win nor loss; max_consec_losses not incremented
+        trades = [self._trade(0.0, "tp_hit"), self._trade(-1.0, "sl_hit")]
+        result = _compute_perf_stats(trades)
+        assert result["max_consec_losses"] == 1  # only the -1.0 trade
 
     def test_per_tier_win_rate(self):
         trades = [
@@ -1539,3 +1559,14 @@ class TestPerfStats:
         trades = [self._trade(-1.0, "timeout")]
         result = _compute_perf_stats(trades)
         assert result["count"] == 1
+
+    def test_partial_tp_excluded(self):
+        # partial_tp is not a terminal status — must not appear in stats
+        from datetime import timedelta
+        trades = [{
+            "status": "partial_tp",
+            "pnl_pct": 3.0,
+            "exit_time": datetime.now().isoformat(),
+            "signal_strength": "STRONG",
+        }]
+        assert _compute_perf_stats(trades) == {}

@@ -1,6 +1,6 @@
 # Binance Trading Scanner
 
-Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, filters with RSI divergence and BTC dominance, places confirmed market orders with ATR-based OCO exit brackets, partial take-profit at 1×ATR, and split entries for EXTREME quality signals. Sends a daily 8am Telegram digest. Includes a max-drawdown circuit breaker that halts new orders if the portfolio drops >15% from its peak.
+Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, filters with RSI divergence and BTC dominance, places confirmed market orders with ATR-based OCO exit brackets, partial take-profit at 1×ATR, and split entries for EXTREME quality signals. Sends a daily 8am Telegram digest. Includes a max-drawdown circuit breaker, break-even stop, trade timeout, progressive trailing stop, volatility-adjusted position sizing, 15m entry refinement, and dynamic pair scoring. Persists all state to SQLite (WAL mode).
 
 ---
 
@@ -59,7 +59,7 @@ Trading/
 ├── requirements.txt        Python dependencies
 ├── .env.example            Credential template — copy to .env and fill in values
 ├── LICENSE                 MIT
-├── state.json              Runtime state — written each run, read by TUI (gitignored)
+├── state.db                SQLite runtime state — WAL mode, canonical store (gitignored)
 ├── scanner.log             Append-only run log (gitignored)
 └── backtest_results.json   Output of last backtest run (gitignored)
 
@@ -70,7 +70,7 @@ Trading/
 └── com.trading.scanner.plist   launchd job — runs every 30 minutes
 ```
 
-> **Never edit `state.json` or `scanner.log` manually** — they are overwritten/appended on every run.
+> **Never edit `state.db` with a full-replacement write** — use targeted SQL (`UPDATE`, `DELETE`, `INSERT OR REPLACE`) to avoid corrupting concurrent reads.
 
 ---
 
@@ -146,7 +146,7 @@ The portfolio panel also shows a drawdown warning when the portfolio is below it
 | Key | Action |
 |-----|--------|
 | `S` | Run a full scan now |
-| `R` | Re-read `state.json` from disk |
+| `R` | Re-read `state.db` from disk |
 | `P` | Toggle left portfolio panel |
 | `E` | Toggle left panel: portfolio ↔ equity curve |
 | `C` | Open settings (scan interval) |
@@ -174,10 +174,10 @@ TP/SL shown are ATR-estimated — the actual OCO prices are computed from the li
 
 | Timer | Interval | What it does |
 |-------|----------|--------------|
-| State watcher | 5 s | Reads `state.json` (disk only — no API calls) |
+| State watcher | 5 s | Reads `state.db` via SQLite WAL (disk only — no API calls) |
 | Auto-scan | 30 s | Full Binance API scan in background thread |
 
-The TUI and the launchd cron job are independent. When cron writes `state.json`, the TUI detects the update within 5 seconds via the state watcher.
+The TUI and the launchd cron job are independent. When cron writes `state.db`, the TUI detects the update within 5 seconds via the state watcher. WAL mode allows the reader and writer to run concurrently without locking.
 
 ---
 
@@ -232,11 +232,12 @@ EXTREME always bypasses the daily trend filter, divergence filter, and BTC domin
 
 Applied in this order after signal detection:
 
-1. **Correlation cap** — if ≥ 3 candidates, keep only the lowest-RSI pair (BTC-correlated overexposure)
+1. **Dynamic pair scoring (T4-3)** — if ≥ 3 candidates, keep the highest-scoring pair (win_rate × profit_factor from last 20 trades); falls back to lowest RSI if fewer than 3 trades per symbol
 2. **Circuit breaker** — if portfolio has dropped ≥ `MAX_DRAWDOWN_PCT` (15%) from its peak, all candidates are cleared and a Telegram alert is sent (at most once per 4 hours)
 3. **Max positions** — skip a signal if `MAX_POSITIONS` are already open
 4. **SL cooldown** — skip a symbol for 4 hours after its stop-loss was hit
 5. **Open position** — skip if an OCO order already exists for the symbol
+6. **15m entry refinement (T4-2)** — skip if the 15m RSI > 45 (momentum peaked on the shorter timeframe)
 
 > The correlation cap and circuit breaker both run **before** the per-symbol guards so they filter on raw signal quality, not on whatever accidentally survives the guards.
 
@@ -313,6 +314,21 @@ All settings live in `config.py` — edit only this file, never `scanner.py` dir
 | `SPLIT_ENTRY_ENABLED` | `True` | Enable split entry for EXTREME quality signals (T2-1) |
 | `SPLIT_ENTRY_ATR_MULT` | `1.0` | Second entry trigger = first_fill × (1 − ATR × this) |
 | `SPLIT_ENTRY_TTL_H` | `48` | Expire pending second entry after this many hours |
+| `TRADE_TIMEOUT_ENABLED` | `True` | Force-exit positions open longer than `TRADE_TIMEOUT_H` (T3-2) |
+| `TRADE_TIMEOUT_H` | `72` | Hours before a position is force-exited |
+| `BREAKEVEN_ENABLED` | `True` | Move SL to entry once price reaches 1×ATR gain (T3-1) |
+| `BREAKEVEN_ATR_MULT` | `1.0` | Break-even trigger = entry × (1 + this × ATR%) |
+| `VOL_SIZING_ENABLED` | `True` | Scale position size by volatility (T3-4) |
+| `TARGET_RISK_PCT` | `0.015` | Target 1.5% portfolio risk per trade |
+| `VOL_SIZING_MIN` | `0.25` | Floor: never below 25% of CAPITAL |
+| `VOL_SIZING_MAX` | `1.00` | Ceiling: never above 100% of CAPITAL |
+| `ENTRY_REFINE_ENABLED` | `True` | Skip order if 15m RSI > threshold (T4-2) |
+| `ENTRY_REFINE_15M_RSI_MAX` | `45` | 15m RSI threshold; higher → momentum peaked |
+| `PAIR_SCORE_ENABLED` | `True` | Sort correlation-cap candidates by win_rate × profit_factor (T4-3) |
+| `PAIR_SCORE_MIN_TRADES` | `3` | Minimum closed trades to compute score |
+| `PAIR_SCORE_LOOKBACK` | `20` | Last N closed trades per symbol |
+| `PROGRESSIVE_TRAILING_ENABLED` | `True` | Tighten trailing delta at ATR milestones (T4-4) |
+| `PROGRESSIVE_TRAILING_STAGES` | `[(1.5,100),(2.0,75),(2.5,50)]` | (ATR multiplier trigger, new bps); do not reorder while trades are open |
 
 **ATR floor note:** When ATR < `ATR_SL_MIN / ATR_SL_MULT`, SL is floored to `ATR_SL_MIN` but TP still scales from the floored SL. The apparent R/R improves beyond what the raw ATR justifies — a conservative bias in flat/low-volatility markets.
 
@@ -359,7 +375,7 @@ signal confirmed
        │
        └─ 8. Arm split entry (if SPLIT_ENTRY_ENABLED + EXTREME quality)
               Stores {first_fill, first_qty, first_oco_id, atr_pct, …} in
-              state.json["pending_second_entries"][symbol]
+              state.db pending_second_entries table
               Trigger: current_price ≤ first_fill × (1 − 1×ATR%)
               TTL: 48 hours
 ```
@@ -374,6 +390,18 @@ When the TP1 LIMIT_MAKER fills, `_handle_partial_tp1()` is called:
 
 When the final OCO fills, P&L = `TP1_pnl × 0.5 + final_pnl × 0.5` (weighted average).
 
+### Position management
+
+After an order is placed, each scan runs the following checks in order:
+
+| Phase | Condition | Action |
+|-------|-----------|--------|
+| **Break-even stop (T3-1)** | price ≥ entry × (1 + 1×ATR%) | Cancel OCO, re-place with SL at entry; fires once (`breakeven_moved` guard) |
+| **Progressive trailing (T4-4)** | price ≥ entry × (1 + 1.5/2/2.5×ATR%) | Tighten trailing delta to 100/75/50 bps at each milestone; tracked by `trailing_stage` index |
+| **Trade timeout (T3-2)** | trade age > `TRADE_TIMEOUT_H` (72h) | Cancel OCO, market-sell remaining qty; status → `timeout` |
+
+Volatility-adjusted sizing (T3-4): capital per trade = `TARGET_RISK_PCT × portfolio / atr_pct`, clamped to `[25%, 100%] × CAPITAL`. Falls back to `CAPITAL` when ATR is unavailable.
+
 ### SL outcome tracking
 
 After each scan, `_check_sl_outcomes()` queries `allOrders` for every open/partial_tp trade's OCO ID:
@@ -383,7 +411,7 @@ After each scan, `_check_sl_outcomes()` queries `allOrders` for every open/parti
 - TP1 `LIMIT_MAKER` (standalone) filled → `partial_tp` transition, new OCO placed
 - Both OCO legs filled (race condition) → TP takes precedence
 
-On terminal outcome, three fields are written to the trade record in `state.json`:
+On terminal outcome, three fields are written to the trade row in `state.db` via `update_trade_fields()`:
 - `exit_price` — actual avg fill price from `cummulativeQuoteQty / executedQty`
 - `pnl_pct` — `(exit_price − entry) / entry × 100` (weighted avg for partial_tp trades)
 - `exit_time` — ISO timestamp of the outcome detection
@@ -447,7 +475,7 @@ Generated by `generate_dashboard()` at the end of each scan. Self-contained sing
 | Order placed | Fill price, actual TP/SL, OCO order ID |
 | TP hit | Symbol confirmation |
 | SL hit | Symbol + cooldown duration |
-| F&G regime change | Threshold crossed (20 / 30 / 50) with regime description; once per crossing, deduped via `fg_regime` in state.json |
+| F&G regime change | Threshold crossed (20 / 30 / 50) with regime description; once per crossing, deduped via `fg_regime` key in `kv` table |
 | Circuit breaker | Drawdown %, peak vs current portfolio; at most once per 4 hours |
 | Daily digest (8am) | 7-day closed trade summary (wins/losses/net P&L), portfolio total, F&G, open positions with time-held |
 | F&G cache expired | Warning that sentiment filter is inactive |
@@ -547,7 +575,7 @@ RSI above thresholds is normal in trending or neutral markets. EXTREME requires 
 
 ### F&G fetch failing
 
-The scanner falls back to a 25-hour cache in `state.json["fg_cache"]`, then to neutral 50 with a Telegram warning. The sentiment filter becomes inactive but signals can still fire (MODERATE will be less filtered). Check internet connectivity if this persists.
+The scanner falls back to a 25-hour cache in the `fg_cache` SQLite table, then to neutral 50 with a Telegram warning. The sentiment filter becomes inactive but signals can still fire (MODERATE will be less filtered). Check internet connectivity if this persists.
 
 ### Order rejected: `Filter failure: LOT_SIZE`
 
@@ -558,10 +586,10 @@ The computed quantity is below the exchange minimum. This happens when `CAPITAL 
 Cooldowns expire automatically. To clear manually:
 ```bash
 python3 -c "
-import json
-with open('state.json') as f: s = json.load(f)
-s['cooldowns'] = {}
-with open('state.json','w') as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect('state.db')
+conn.execute('DELETE FROM cooldowns')
+conn.commit(); conn.close()
 print('Cooldowns cleared')
 "
 ```

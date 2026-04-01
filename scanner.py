@@ -15,7 +15,7 @@ import time
 import subprocess
 import urllib.request
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,7 +47,7 @@ from config import (  # noqa: E402
     TELEGRAM_CHAT_ID,
     WEBHOOK_URL,
     PAIRS, CAPITAL,
-    MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT,
+    MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -194,7 +194,8 @@ def save_state(
             state["fg_regime"]        = fg_regime or old.get("fg_regime")     # preserve regime state
             state["open_pnl"]         = open_pnl if open_pnl is not None else old.get("open_pnl")
             state["peak_portfolio_usdc"] = old.get("peak_portfolio_usdc")   # updated below
-            state["cb_alert_sent_at"] = cb_alert_sent_at or old.get("cb_alert_sent_at")
+            state["cb_alert_sent_at"]  = cb_alert_sent_at or old.get("cb_alert_sent_at")
+            state["last_digest_date"]  = old.get("last_digest_date")
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
@@ -307,8 +308,6 @@ def get_fear_greed() -> tuple[int, str, bool]:
 
     Priority: live fetch → cached value (< 25h old) → fallback 50 + Telegram warning.
     """
-    from datetime import timedelta
-
     def _read_cache():
         try:
             if os.path.exists(STATE_FILE):
@@ -639,7 +638,6 @@ def _save_cooldown(symbol: str) -> None:
             with open(STATE_FILE) as f:
                 state = json.load(f)
         cooldowns = state.get("cooldowns") or {}
-        from datetime import timedelta
         cooldowns[symbol] = (datetime.now() + timedelta(hours=SL_COOLDOWN_H)).isoformat()
         state["cooldowns"] = cooldowns
         with open(STATE_FILE, "w") as f:
@@ -1427,6 +1425,78 @@ def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
             return sl_pct, tp_pct
     return STOP_LOSS, TAKE_PROFIT
 
+# ── Daily digest ─────────────────────────────────────────────────────────────
+def _send_daily_digest(state: dict[str, Any]) -> None:
+    """Send an 8am morning digest summarising the last 7 days of trading."""
+    now       = datetime.now()
+    cutoff    = now - timedelta(days=7)
+    trades    = state.get("trades") or []
+    portfolio = state.get("portfolio")
+    fg_cache  = state.get("fg_cache") or {}
+    fg_val    = fg_cache.get("value")
+    fg_str    = f"\n*Fear & Greed:* `{fg_val}`" if fg_val is not None else ""
+
+    # 7-day closed trades
+    window = []
+    for t in trades:
+        if t.get("status") not in ("tp_hit", "sl_hit"):
+            continue
+        try:
+            ts = datetime.fromisoformat(t.get("exit_time") or t.get("time", ""))
+            if ts >= cutoff:
+                window.append(t)
+        except Exception:
+            pass
+
+    wins   = [t for t in window if t.get("status") == "tp_hit"]
+    losses = [t for t in window if t.get("status") == "sl_hit"]
+    net_usdc = sum(
+        (t.get("pnl_pct") or 0) / 100 * (t.get("capital") or CAPITAL)
+        for t in window
+    )
+    win_usdc  = sum((t.get("pnl_pct") or 0) / 100 * (t.get("capital") or CAPITAL) for t in wins)
+    loss_usdc = sum((t.get("pnl_pct") or 0) / 100 * (t.get("capital") or CAPITAL) for t in losses)
+    deployed  = sum(t.get("capital") or CAPITAL for t in window) or CAPITAL
+    net_pct   = net_usdc / deployed * 100 if deployed else 0.0
+
+    # Open positions
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    open_lines  = []
+    for t in open_trades:
+        sym   = t.get("symbol", "?")
+        entry = t.get("entry", 0)
+        try:
+            held_h = (now - datetime.fromisoformat(t["time"])).total_seconds() / 3600
+            held_s = f"{held_h:.0f}h" if held_h < 24 else f"{held_h/24:.1f}d"
+        except Exception:
+            held_s = "?"
+        open_lines.append(f"  `{sym}`  entry `${entry:.4f}`  held `{held_s}`")
+
+    portfolio_line = (
+        f"\n*Portfolio:* `${portfolio['total_usdc']:,.0f} USDC`"
+        if portfolio else ""
+    )
+    trades_section = (
+        f"\n*Last 7 days — {len(window)} trade(s):*\n"
+        f"  ✅ TP: {len(wins)}  →  `+${win_usdc:,.2f}`\n"
+        f"  ❌ SL: {len(losses)}  →  `${loss_usdc:,.2f}`\n"
+        f"  Net: `{'+'if net_usdc>=0 else ''}{net_usdc:,.2f} ({net_pct:+.1f}% on deployed capital)`"
+    ) if window else "\n*Last 7 days:* No closed trades"
+    open_section = (
+        f"\n*Open positions ({len(open_trades)}):*\n" + "\n".join(open_lines)
+    ) if open_trades else "\n*Open positions:* None"
+
+    msg = (
+        f"📊 *Morning Digest — {now.strftime('%a %b %-d')}*"
+        f"{portfolio_line}"
+        f"{fg_str}"
+        f"{trades_section}"
+        f"{open_section}"
+        f"\n\n_Next scan in ~30 min_"
+    )
+    send_telegram(msg)
+    print("  📊 Morning digest sent")
+
 # ── Main scan ────────────────────────────────────────────────────────────────
 def scan() -> None:
     print(f"\n--- {datetime.now().strftime('%a. %d %b %Y %H:%M:%S')} ---")
@@ -1712,6 +1782,25 @@ def scan() -> None:
             generate_dashboard(_dash_state)
     except Exception as e:
         print(f"  ⚠ Dashboard generation failed: {e}")
+
+    # ── Daily digest (8am, once per calendar day) ─────────────────────────────
+    try:
+        now = datetime.now()
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as _df:
+                _digest_state = json.load(_df)
+            last_digest = _digest_state.get("last_digest_date", "")
+            if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
+                _send_daily_digest(_digest_state)
+                # Surgical patch: re-read freshest state after send_telegram() network call
+                # to avoid overwriting concurrent cooldown writes with a stale snapshot.
+                with open(STATE_FILE) as _df:
+                    _patch = json.load(_df)
+                _patch["last_digest_date"] = str(now.date())
+                with open(STATE_FILE, "w") as _df:
+                    json.dump(_patch, _df, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Daily digest failed: {e}")
 
     print(f"\n{'='*55}\n")
 

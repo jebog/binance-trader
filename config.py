@@ -30,6 +30,7 @@ CAPITAL = 200.0   # USDC per trade
 MAX_POSITIONS    = 2     # max concurrent open positions
 SL_COOLDOWN_H    = 4     # hours to block a pair after a stop-loss hit
 MAX_DRAWDOWN_PCT = 0.15  # halt new orders if portfolio drops >15% from peak
+DIGEST_HOUR      = 8    # local hour (0–23) to send morning digest
 
 # ── SL / TP ───────────────────────────────────────────────────
 STOP_LOSS      = 0.03   # 3%   — fixed fallback when ATR unavailable

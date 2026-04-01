@@ -54,11 +54,15 @@ from scanner import (
     _estimate_sl_tp_pct,
     _load_cooldowns,
     analyze,
+    db_connect,
+    db_init,
     generate_dashboard,
     get_btc_context,
     get_fear_greed,
     get_open_positions,
+    get_open_trades,
     get_portfolio,
+    get_state_dict,
     place_buy_order,
     save_state,
     send_telegram,
@@ -624,14 +628,22 @@ class ScannerApp(App):
 
         # Seed known trade outcomes so we don't toast historical tp/sl hits on startup
         try:
-            with open(STATE_FILE) as f:
-                init_state = json.load(f)
-            for t in (init_state.get("trades") or []):
-                if t.get("status") in ("tp_hit", "sl_hit"):
-                    key = (t.get("oco_id") or t.get("time", ""), t["status"])
-                    self._notified_outcomes.add(key)
+            _seed_conn = db_connect()
+            db_init(_seed_conn)
+            seed_trades = get_open_trades(_seed_conn)
+            _seed_conn.close()
         except Exception:
-            pass
+            seed_trades = []
+        if not seed_trades:
+            try:
+                with open(STATE_FILE) as f:
+                    seed_trades = json.load(f).get("trades") or []
+            except Exception:
+                seed_trades = []
+        for t in seed_trades:
+            if t.get("status") in ("tp_hit", "sl_hit"):
+                key = (t.get("oco_id") or t.get("time", ""), t["status"])
+                self._notified_outcomes.add(key)
 
         # Hide progress bar until first scan starts
         self.query_one("#scan-progress", ProgressBar).display = False
@@ -646,6 +658,17 @@ class ScannerApp(App):
 
     # ── State file watcher (cheap, disk-only) ─────────────────────────────────
     def _read_state_file(self) -> None:
+        # Try SQLite first (WAL mode allows concurrent reader + scanner writer)
+        try:
+            conn = db_connect()
+            db_init(conn)
+            state = get_state_dict(conn)
+            conn.close()
+            self.post_message(StateUpdated(state))
+            return
+        except Exception:
+            pass
+        # Fall back to state.json during migration / if state.db missing
         try:
             with open(STATE_FILE) as f:
                 state = json.load(f)
@@ -854,11 +877,18 @@ class ScannerApp(App):
             )
             if portfolio:
                 try:
-                    with open(STATE_FILE) as f:
-                        dash_state = json.load(f)
+                    _dash_conn = db_connect()
+                    db_init(_dash_conn)
+                    dash_state = get_state_dict(_dash_conn)
+                    _dash_conn.close()
                     generate_dashboard(dash_state)
                 except Exception:
-                    pass
+                    try:
+                        with open(STATE_FILE) as f:
+                            dash_state = json.load(f)
+                        generate_dashboard(dash_state)
+                    except Exception:
+                        pass
 
             tlog(f"[green]Scan complete — {len(results)} pairs, {len(signals)} signal(s)[/]")
 

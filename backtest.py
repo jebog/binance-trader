@@ -198,8 +198,9 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             tp1_price = open_trade.get("tp1_price")
             if PARTIAL_TP_ENABLED and tp1_price and not open_trade.get("partial_tp1_hit"):
                 if high >= tp1_price:
-                    open_trade["partial_tp1_hit"]  = True
-                    open_trade["tp1_exit_price"]   = tp1_price
+                    open_trade["partial_tp1_hit"]    = True
+                    open_trade["tp1_exit_price"]     = tp1_price
+                    open_trade["tp1_candle_idx"]     = i   # track candle for same-candle guard
 
             tp_hit = high >= tp_price
             sl_hit = low  <= sl_price
@@ -220,8 +221,15 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
                 continue  # trade still open
 
             entry = open_trade["entry"]
-            # T3-3: weighted P&L when TP1 was hit before the final exit
-            if PARTIAL_TP_ENABLED and open_trade.get("partial_tp1_hit"):
+            # T3-3: weighted P&L when TP1 was hit on a PREVIOUS candle.
+            # Do NOT credit TP1 if it hit on the same candle as the final exit —
+            # intra-candle execution order is undefined; crediting would be optimistic.
+            tp1_credited = (
+                PARTIAL_TP_ENABLED
+                and open_trade.get("partial_tp1_hit")
+                and open_trade.get("tp1_candle_idx") != i
+            )
+            if tp1_credited:
                 tp1_ep        = open_trade["tp1_exit_price"]
                 tp1_pnl       = (tp1_ep - entry) / entry * 100
                 final_leg_pnl = (exit_price - entry) / entry * 100
@@ -251,7 +259,7 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
         # EXTREME bypasses (catches capitulation bottoms regardless of divergence).
         if DIVERGENCE_ENABLED and signal in ("STRONG", "MODERATE"):
             closes = [float(k[4]) for k in window]
-            lb_needed = DIVERGENCE_LOOKBACK + 14 + 5
+            lb_needed = DIVERGENCE_LOOKBACK + 14 + 28  # +28 Wilder steps (matches scanner)
             div_closes = closes[-lb_needed:]
             rsi_series = [calc_rsi(div_closes[:j]) for j in range(14, len(div_closes) + 1)]
             rsi_series = rsi_series[-DIVERGENCE_LOOKBACK:]
@@ -317,8 +325,13 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
         last_idx   = len(klines) - 1
         exit_price = float(klines[last_idx][4])
         held       = last_idx - open_trade["entry_candle_idx"]
-        entry      = open_trade["entry"]
-        if PARTIAL_TP_ENABLED and open_trade.get("partial_tp1_hit"):
+        entry        = open_trade["entry"]
+        tp1_credited = (
+            PARTIAL_TP_ENABLED
+            and open_trade.get("partial_tp1_hit")
+            and open_trade.get("tp1_candle_idx") != last_idx
+        )
+        if tp1_credited:
             tp1_ep        = open_trade["tp1_exit_price"]
             tp1_pnl       = (tp1_ep - entry) / entry * 100
             final_leg_pnl = (exit_price - entry) / entry * 100

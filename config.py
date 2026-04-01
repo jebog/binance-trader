@@ -51,6 +51,11 @@ BTC_DOM_ENABLED        = True
 BTC_DOM_CACHE_H        = 1       # cache lifetime hours (CoinGecko free tier: ~50 req/min)
 BTC_DOM_RISE_THRESHOLD = 0.005   # 0.5% scan-over-scan rise = "rising dominance"
 
+# ── Partial take-profit (T2-4) ────────────────────────────────────────────────
+PARTIAL_TP_ENABLED   = True
+PARTIAL_TP1_ATR_MULT = 1.0    # TP1 at entry × (1 + 1.0 × ATR%) — halfway to full TP
+PARTIAL_TP1_QTY_PCT  = 0.50   # fraction of position closed at TP1
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

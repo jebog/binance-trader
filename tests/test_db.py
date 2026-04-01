@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import tempfile
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -21,7 +20,6 @@ import pytest
 # We can't use ":memory:" across test functions (each connection is a new DB),
 # so each test creates its own in-memory connection via sqlite3.connect directly
 # and passes it to the helpers.
-
 import scanner
 
 # ── Helper: create a fresh in-memory DB with the schema applied ───────────────

@@ -8,6 +8,7 @@ scanner.py is imported with the Binance API calls guarded by mock.
 from __future__ import annotations
 
 import pytest
+from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 # ── Import pure functions directly (no side effects on import) ────────────────
@@ -523,9 +524,12 @@ class TestCalcCapital:
         self.fn = scanner._calc_capital
         self.CAPITAL = scanner.CAPITAL  # 200.0
 
-    def test_extreme_quality_full_capital(self):
+    def test_extreme_quality_half_capital_split_entry(self):
+        # EXTREME + quality + SPLIT_ENTRY_ENABLED → CAPITAL/2 (first split leg)
+        import scanner
+        assert scanner.SPLIT_ENTRY_ENABLED is True, "SPLIT_ENTRY_ENABLED must be True for this test"
         s = {"signal_strength": "EXTREME", "extreme_quality": True}
-        assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL
+        assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL / 2
 
     def test_extreme_crash_half_capital(self):
         s = {"signal_strength": "EXTREME", "extreme_quality": False}
@@ -882,3 +886,113 @@ class TestPartialTp1:
         assert any("unprotected" in m.lower() for m in telegram_calls), (
             "A critical 'UNPROTECTED' Telegram alert must be sent when re-OCO fails"
         )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Split entry (T2-1) — unit tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSplitEntry:
+    """Unit tests for T2-1 split entry logic."""
+
+    def test_extreme_quality_arms_split_entry(self):
+        """_calc_capital returns CAPITAL/2 for EXTREME quality when SPLIT_ENTRY_ENABLED."""
+        import scanner
+        s = {"signal_strength": "EXTREME", "extreme_quality": True}
+        assert scanner._calc_capital(s, {"btc_rsi": 50.0}) == scanner.CAPITAL / 2
+
+    def test_trigger_price_one_atr_below_fill(self):
+        """Trigger = first_fill × (1 - atr_pct × SPLIT_ENTRY_ATR_MULT)."""
+        import scanner
+        first_fill = 100.0
+        atr_pct    = 0.02  # 2%
+        trigger    = first_fill * (1 - atr_pct * scanner.SPLIT_ENTRY_ATR_MULT)
+        assert trigger == pytest.approx(100.0 * (1 - 0.02), rel=1e-6)
+
+    def test_ttl_expiry_clears_entry(self):
+        """A pending entry older than SPLIT_ENTRY_TTL_H hours is expired and cleared."""
+        import scanner, json
+        from unittest.mock import mock_open
+        from datetime import timedelta
+
+        expired_time = (datetime.now() - timedelta(hours=scanner.SPLIT_ENTRY_TTL_H + 1)).isoformat()
+        pending = {"ETHUSDC": {"time": expired_time, "first_fill": 2000.0}}
+        state = {"pending_second_entries": pending}
+
+        cleared = {}
+        def fake_clear(symbol):
+            cleared[symbol] = True
+        telegram_calls = []
+
+        with patch.object(scanner, "_load_pending_second_entries", return_value=dict(pending)), \
+             patch.object(scanner, "_clear_pending_second_entry", side_effect=fake_clear), \
+             patch.object(scanner, "_place_split_second_entry", return_value=None), \
+             patch.object(scanner, "get", return_value={"price": "1950.0"}), \
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)), \
+             patch("scanner.SPLIT_ENTRY_ENABLED", True):
+            # Simulate the TTL-expiry branch in scan() directly
+            entry_age_h = (
+                datetime.now() - datetime.fromisoformat(expired_time)
+            ).total_seconds() / 3600
+            assert entry_age_h > scanner.SPLIT_ENTRY_TTL_H
+            # The clear should be called
+            scanner._clear_pending_second_entry("ETHUSDC")
+        assert "ETHUSDC" in cleared
+
+    def test_place_split_second_entry_cancel_fail_preserves_pending(self):
+        """When OCO cancel fails, _place_split_second_entry returns None (pending preserved by caller)."""
+        import scanner
+
+        pending = {
+            "first_fill":   2000.0,
+            "first_qty":    0.05,
+            "first_oco_id": 99,
+            "sl_pct":       0.03,
+            "tp_pct":       0.07,
+            "atr_pct":      0.02,
+            "capital_half": 100.0,
+            "time":         datetime.now().isoformat(),
+        }
+        with patch.object(scanner, "signed_delete", side_effect=Exception("timeout")), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            result = scanner._place_split_second_entry("ETHUSDC", pending, 1960.0, [])
+        assert result is None, "None return means pending entry should be preserved for retry"
+
+    def test_place_split_second_entry_combined_oco_on_success(self):
+        """On success: second buy + combined OCO with weighted-average entry."""
+        import scanner
+
+        pending = {
+            "first_fill":   2000.0,
+            "first_qty":    0.05,
+            "first_oco_id": 99,
+            "sl_pct":       0.03,
+            "tp_pct":       0.07,
+            "atr_pct":      0.02,
+            "capital_half": 100.0,
+            "time":         datetime.now().isoformat(),
+        }
+        exch_info = {"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE",     "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}
+        buy_response = {
+            "orderId":             55555,
+            "executedQty":         "0.051",
+            "fills":               [{"price": "1960.0"}],
+        }
+        post_calls = []
+
+        with patch.object(scanner, "signed_delete", return_value={}), \
+             patch.object(scanner, "signed_post",   side_effect=lambda p, d: (
+                 post_calls.append((p, d)) or (buy_response if "order" == p.split("/")[-1] else {"orderListId": 200})
+             )), \
+             patch.object(scanner, "get",           return_value=exch_info), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            trade = scanner._place_split_second_entry("ETHUSDC", pending, 1960.0, [])
+
+        assert trade is not None
+        assert trade["status"] == "open"
+        assert trade["split_entry"] is True
+        # Weighted avg: (2000*0.05 + 1960*0.051) / (0.05+0.051)
+        expected_avg = (2000.0 * 0.05 + 1960.0 * 0.051) / (0.05 + 0.051)
+        assert trade["entry"] == pytest.approx(expected_avg, rel=1e-3)

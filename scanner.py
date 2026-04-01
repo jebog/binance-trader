@@ -1458,33 +1458,44 @@ def _save_cooldown(symbol: str) -> None:
         pass
 
 # ── Split-entry state helpers (T2-1) ─────────────────────────────────────────
-def _load_pending_second_entries() -> dict[str, Any]:
+def _load_pending_second_entries(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
     """Return pending_second_entries dict from state.db (empty dict on any failure)."""
+    _own = conn is None
     try:
-        _lp_conn = db_connect()
-        result = load_pending_second_entries(_lp_conn)
-        _lp_conn.close()
+        if _own:
+            conn = db_connect()
+        result = load_pending_second_entries(conn)
+        if _own:
+            conn.close()
         return result
     except Exception:
         return {}
 
 
-def _save_pending_second_entry(symbol: str, data: dict[str, Any]) -> None:
+def _save_pending_second_entry(symbol: str, data: dict[str, Any],
+                               conn: Optional[sqlite3.Connection] = None) -> None:
     """Write a single pending second entry to state.db."""
+    _own = conn is None
     try:
-        _pse_conn = db_connect()
-        save_pending_second_entry(_pse_conn, symbol, data)
-        _pse_conn.close()
+        if _own:
+            conn = db_connect()
+        save_pending_second_entry(conn, symbol, data)
+        if _own:
+            conn.close()
     except Exception as e:
         print(f"  ⚠ Could not persist pending second entry for {symbol}: {e}")
 
 
-def _clear_pending_second_entry(symbol: str) -> None:
+def _clear_pending_second_entry(symbol: str,
+                                conn: Optional[sqlite3.Connection] = None) -> None:
     """Remove a pending second entry from state.db."""
+    _own = conn is None
     try:
-        _psc_conn = db_connect()
-        clear_pending_second_entry(_psc_conn, symbol)
-        _psc_conn.close()
+        if _own:
+            conn = db_connect()
+        clear_pending_second_entry(conn, symbol)
+        if _own:
+            conn.close()
     except Exception as e:
         print(f"  ⚠ Could not clear pending second entry for {symbol}: {e}")
 
@@ -1966,10 +1977,13 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
             conn = db_connect()
             db_init(conn)
         active_trades = get_open_trades(conn)
-        if _own_conn:
-            conn.close()
     except Exception as _e:
         print(f"  ⚠ _check_sl_outcomes: DB read failed: {_e}")
+        if _own_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
         return
     try:
         if not active_trades:
@@ -2101,6 +2115,12 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
             print(f"  ⚠ SQLite trade outcome write failed: {_e}")
     except Exception as e:
         print(f"  ⚠ SL outcome check failed: {e}")
+    finally:
+        if _own_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 # ── Partial TP1 handler (T2-4) ───────────────────────────────────────────────
 def _handle_partial_tp1(trade: dict[str, Any], tp1_order: dict[str, Any]) -> None:
@@ -3189,6 +3209,7 @@ def scan() -> None:
     print(f"{'='*55}")
 
     # ── Single scan-scoped connection (WAL mode: concurrent TUI reads are safe) ──
+    # Closed in the finally block at the end of scan() to prevent leaks on exception.
     _scan_conn = db_connect()
     db_init(_scan_conn)
 
@@ -3202,14 +3223,14 @@ def scan() -> None:
     # Run before the main scan so second-leg fills are treated as open positions
     # before the correlation cap and per-symbol guards run.
     if SPLIT_ENTRY_ENABLED:
-        pending_entries = _load_pending_second_entries()
+        pending_entries = _load_pending_second_entries(_scan_conn)
         for sym, pending in list(pending_entries.items()):
             try:
                 entry_age_h = (
                     datetime.now() - datetime.fromisoformat(pending["time"])
                 ).total_seconds() / 3600
                 if entry_age_h > SPLIT_ENTRY_TTL_H:
-                    _clear_pending_second_entry(sym)
+                    _clear_pending_second_entry(sym, _scan_conn)
                     send_telegram(
                         f"⏱ *Split entry expired* — `{sym}` pending second leg cleared "
                         f"after {SPLIT_ENTRY_TTL_H}h. No second buy placed."
@@ -3229,10 +3250,10 @@ def scan() -> None:
                         print(f"  ↩ Split entry cancel failed for {sym} — will retry next scan")
                     elif trade.get("status") == "critical_fail":
                         # Cancel succeeded but second buy failed → unrecoverable, clear pending
-                        _clear_pending_second_entry(sym)
+                        _clear_pending_second_entry(sym, _scan_conn)
                     else:
                         # Success (or no_oco status — position exists, just unprotected)
-                        _clear_pending_second_entry(sym)
+                        _clear_pending_second_entry(sym, _scan_conn)
                         # Persist combined trade immediately so the correlation cap
                         # and open-position guard count it in this scan.
                         try:
@@ -3546,7 +3567,7 @@ def scan() -> None:
                     "capital_half":  capital,
                     "time":          datetime.now().isoformat(),
                 }
-                _save_pending_second_entry(s["symbol"], pending_data)
+                _save_pending_second_entry(s["symbol"], pending_data, _scan_conn)
                 trigger_price = trade["entry"] * (1 - atr_pct * SPLIT_ENTRY_ATR_MULT)
                 send_telegram(
                     f"🎯 *Split entry armed* — `{s['symbol']}`\n"

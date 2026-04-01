@@ -9,6 +9,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 4. In cron mode: sends a Telegram alert and waits for CONFIRM/SKIP reply
 5. On CONFIRM: places a market buy + OCO (TP + trailing stop)
 6. Generates an HTML dashboard and updates state.json
+7. At 8am: sends a daily Telegram digest (7-day P&L summary, open positions, F&G)
 
 ---
 
@@ -17,11 +18,11 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | File | Role |
 |------|------|
 | `config.py` | **Single source of truth for all settings** — edit this, nothing else |
-| `scanner.py` | Core engine: signals, orders, state, Telegram, dashboard |
+| `scanner.py` | Core engine: signals, orders, state, Telegram, dashboard, digest |
 | `tui.py` | Textual TUI — live dashboard, runs scanner in background thread |
 | `tui.tcss` | Catppuccin Mocha theme for the TUI |
 | `backtest.py` | Walk-forward backtest (70% train / 30% test), writes `backtest_results.json` |
-| `state.json` | Runtime state: results, trades, cooldowns, portfolio, sent_signals |
+| `state.json` | Runtime state: results, trades, cooldowns, portfolio, sent_signals, peak_portfolio_usdc, fg_regime |
 | `scanner.log` | Append-only log of every scan run |
 | `dashboard.html` | Auto-generated HTML dashboard (written after each scan) |
 
@@ -37,10 +38,12 @@ BINANCE_API_KEY / BINANCE_SECRET_KEY   # Binance spot API
 TELEGRAM_TOKEN / TELEGRAM_CHAT_ID      # Telegram bot
 
 # Strategy
-PAIRS          = [...]     # which symbols to scan (USDC quote)
-CAPITAL        = 200.0     # USDC per trade
-MAX_POSITIONS  = 2         # max concurrent open positions
-SL_COOLDOWN_H  = 4         # hours to block a pair after SL hit
+PAIRS            = [...]     # which symbols to scan (USDC quote)
+CAPITAL          = 200.0     # USDC per trade
+MAX_POSITIONS    = 2         # max concurrent open positions
+SL_COOLDOWN_H    = 4         # hours to block a pair after SL hit
+MAX_DRAWDOWN_PCT = 0.15      # halt new orders if portfolio drops >15% from peak
+DIGEST_HOUR      = 8         # local hour (0–23) to send morning digest
 
 # SL/TP
 TRAILING_DELTA = 150       # trailing stop in basis points; 0 = fixed stop
@@ -96,31 +99,56 @@ The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTRE
 
 ### Scan phases (scanner.py `scan()` and tui.py `action_trigger_scan`)
 
-1. **Fetch context** — Fear & Greed, BTC RSI/SMA/price
+1. **Fetch context** — Fear & Greed, BTC RSI/SMA/price; fire F&G regime-change alert if threshold crossed
 2. **Fetch portfolio** — live Binance balances
-3. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit, save cooldowns
+3. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit (writes `exit_price`, `pnl_pct`, `exit_time`), save cooldowns
 4. **Analyze all pairs** — collect candidates (buy_signal == True)
 5. **Correlation cap** — if ≥ 3 candidates, keep only lowest RSI (avoid concentrated BTC exposure)
-6. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
-7. **Place orders** — market buy → OCO (LIMIT_MAKER TP + STOP_LOSS trailing)
+6. **Circuit breaker** — if drawdown from `peak_portfolio_usdc` ≥ `MAX_DRAWDOWN_PCT`, clear candidates and halt
+7. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
+8. **Place orders** — market buy → OCO (LIMIT_MAKER TP + STOP_LOSS trailing)
+9. **Daily digest** — if `now.hour == DIGEST_HOUR` and not yet sent today, fire 7-day summary to Telegram
 
 ### State machine per trade
 
 ```
-open → tp_hit   (LIMIT_MAKER filled)
+open → tp_hit   (LIMIT_MAKER filled) → exit_price/pnl_pct/exit_time written
      → sl_hit   (STOP_LOSS trailing filled) → SL cooldown SL_COOLDOWN_H hours
+                                            → exit_price/pnl_pct/exit_time written
      → no_oco   (market fill succeeded but OCO API call failed → 🚨 Telegram alert)
 ```
 
+`exit_price` is computed from the actual Binance fill (`cummulativeQuoteQty / executedQty`) via `_order_fill_price()` — not the stored activation price, which is wrong for trailing stops.
+
 ### Two-timer TUI architecture
 
-- **5s timer** → `_read_state_file()` — disk only, no API — updates cooldowns, portfolio cache, log tail
+- **5s timer** → `_read_state_file()` — disk only, no API — updates cooldowns, portfolio cache, open P&L, peak drawdown, log tail
 - **30s timer** → `action_trigger_scan()` — full API round-trip in `@work(thread=True, exclusive=True)`
 - State flows via `ScanComplete` and `StateUpdated` messages from worker → main thread
 
 ### Alert deduplication
 
-`sent_signals` dict in `state.json` keyed by `symbol:tier`. Same symbol+tier suppressed for 2 hours (covers 4 scan cycles). Persisted across process restarts.
+| Alert | Dedup mechanism |
+|-------|----------------|
+| Trade signals | `sent_signals` in state.json keyed by `symbol:tier`, suppressed 2h |
+| F&G regime change | `fg_regime` in state.json — only fires when bucket changes |
+| Circuit breaker | `cb_alert_sent_at` in state.json — suppressed for 4h |
+| Daily digest | `last_digest_date` in state.json — once per calendar day |
+
+### state.json key reference
+
+| Key | Written by | Purpose |
+|-----|-----------|---------|
+| `trades` | `save_state`, `_check_sl_outcomes` | All trades (last 100). Open: `status="open"`. Closed: `exit_price`, `pnl_pct`, `exit_time` populated |
+| `portfolio` | `save_state` | Latest Binance balance snapshot |
+| `peak_portfolio_usdc` | `save_state` | High-water mark for drawdown calculation |
+| `fg_regime` | `save_state` | Last F&G regime bucket (`extreme_fear` / `fear` / `neutral` / `greed` / `extreme_greed`) |
+| `fg_cache` | `get_fear_greed` | Cached F&G response (valid 25h) |
+| `open_pnl` | `save_state` | Aggregate unrealized P&L from last scan (shown in TUI portfolio widget) |
+| `sent_signals` | `scan` | Signal dedup ledger |
+| `cooldowns` | `_save_cooldown` | SL cooldown expiry timestamps per symbol |
+| `cb_alert_sent_at` | `save_state` | Timestamp of last circuit breaker Telegram alert |
+| `last_digest_date` | digest block in `scan` | ISO date of last morning digest send |
 
 ---
 
@@ -138,6 +166,12 @@ open → tp_hit   (LIMIT_MAKER filled)
 
 **Binance API weight** — Each scan costs ~30 weight. At 30s interval from TUI = ~60/min, well under the 1200/min limit. The 5s state watcher reads only disk — zero API calls.
 
+**`_order_fill_price()` for exit tracking** — SL/TP fills use `cummulativeQuoteQty / executedQty` from the filled Binance order object (falls back to `price`). Never use the stored `trade["sl"]` or `trade["tp"]` as exit price — for trailing stops the actual fill is higher than the initial activation price.
+
+**Surgical patch for `last_digest_date`** — The digest block re-reads state.json *after* `send_telegram()` completes before writing `last_digest_date`. This avoids overwriting concurrent cooldown writes that may have occurred during the network call.
+
+**F&G `is_fresh` guard** — `get_fear_greed()` returns `(value, classification, is_fresh: bool)`. Regime-change alerts only fire when `is_fresh=True` to prevent spurious alerts from the stale `(50, "Neutral")` fallback.
+
 ---
 
 ## Common tasks
@@ -151,8 +185,11 @@ Edit `config.py`: `ATR_SL_MULT`, `ATR_TP_MULT`, `TRAILING_DELTA`. Changes take e
 ### Disable trailing stop
 Set `TRAILING_DELTA = 0` in `config.py`. OCO will use `STOP_LOSS_LIMIT` instead of `STOP_LOSS`.
 
-### Rotate API keys
-Update `BINANCE_API_KEY` and `BINANCE_SECRET_KEY` in `config.py`.
+### Adjust circuit breaker threshold
+Edit `MAX_DRAWDOWN_PCT` in `config.py` (default `0.15` = 15%). Set to `1.0` to effectively disable it.
+
+### Change digest time
+Edit `DIGEST_HOUR` in `config.py`. The digest fires within that calendar hour on the next scan boundary (up to 30 min after the hour starts).
 
 ### Force a scan immediately
 In TUI: press `S`. In terminal: `python3 scanner.py`.
@@ -169,6 +206,22 @@ launchctl list com.trading.scanner
 import json
 with open("state.json") as f: s = json.load(f)
 del s["cooldowns"]["ETHUSDC"]  # remove specific symbol
+with open("state.json", "w") as f: json.dump(s, f, indent=2)
+```
+
+### Reset the circuit breaker peak
+```python
+import json
+with open("state.json") as f: s = json.load(f)
+del s["peak_portfolio_usdc"]   # will be re-established on next scan
+with open("state.json", "w") as f: json.dump(s, f, indent=2)
+```
+
+### Force a digest resend today
+```python
+import json
+with open("state.json") as f: s = json.load(f)
+s["last_digest_date"] = ""     # clear the guard — fires on next scan at DIGEST_HOUR
 with open("state.json", "w") as f: json.dump(s, f, indent=2)
 ```
 
@@ -189,3 +242,5 @@ python3 backtest.py
 - **Never remove the OCO failure guard** — a filled buy with no OCO is an unprotected position
 - **Never hardcode credentials or strategy params outside `config.py`**
 - **Never rename `_scan_ctx` back to `_context`** — it shadows a Textual internal method
+- **Never use `trade["sl"]` or `trade["tp"]` as exit price** — use `_order_fill_price()` on the filled order object; activation price is wrong for trailing stops
+- **Never do a full `json.dump` of a stale state snapshot** after a Telegram send — always re-read state.json first (surgical patch pattern)

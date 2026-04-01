@@ -158,8 +158,8 @@ F&G < 20 (Extreme Fear) blocks MODERATE signals. BTC RSI < 30 + below SMA blocks
 
 Each `analyze()` call fetches 30 daily candles to compute `daily_rsi` and check `daily_bullish`:
 - **daily_bullish**: daily RSI > 45 AND price above daily SMA20 → MODERATE allowed
-- **daily_neutral**: daily RSI 30–45 → STRONG allowed, MODERATE blocked
-- **daily_bearish**: daily RSI < 30 AND below daily SMA20 → STRONG blocked, EXTREME still fires
+- **daily_neutral**: daily RSI ≥ 30 AND not bullish → STRONG allowed, MODERATE blocked
+- **daily_bearish**: everything else (RSI < 30, OR RSI 30–45 below SMA) → STRONG blocked, EXTREME still fires
 
 The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTREME signals bypass the daily filter to catch capitulation bottoms.
 

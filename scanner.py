@@ -1035,6 +1035,8 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
 
     # ── Cancel existing OCO ──────────────────────────────────────────────────
     oco_id = trade.get("oco_id")
+    if not oco_id:
+        return False  # no OCO to cancel (e.g. no_oco state corruption) — nothing to do
     try:
         signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": oco_id})
         print(f"  Cancelled OCO #{oco_id} for break-even on {symbol}")
@@ -1124,6 +1126,7 @@ def _check_breakeven(trade: dict[str, Any], current_price: float, symbol: str) -
                 if str(_t.get("order_id")) == str(trade.get("order_id")):
                     _t["status"]          = "no_oco"
                     _t["breakeven_moved"] = True
+                    _t["oco_id"]          = None   # OCO was cancelled; stale ID is dead
                     break
             with open(STATE_FILE, "w") as _f:
                 json.dump(_be_patch2, _f, indent=2)

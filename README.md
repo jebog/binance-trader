@@ -1,6 +1,6 @@
 # Binance Trading Scanner
 
-Personal macOS algorithmic scanner that monitors 6 spot pairs every 10 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, and places confirmed market orders with automatic ATR-based OCO exit brackets.
+Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, detects multi-tier RSI + SMA + volume + sentiment buy signals, filters with RSI divergence and BTC dominance, places confirmed market orders with ATR-based OCO exit brackets, partial take-profit at 1×ATR, and split entries for EXTREME quality signals. Sends a daily 8am Telegram digest. Includes a max-drawdown circuit breaker, break-even stop, trade timeout, progressive trailing stop, volatility-adjusted position sizing, 15m entry refinement, and dynamic pair scoring. Persists all state to SQLite (WAL mode).
 
 ---
 
@@ -25,17 +25,19 @@ Personal macOS algorithmic scanner that monitors 6 spot pairs every 10 minutes, 
 ## Quick Start
 
 ```bash
-# 1 — Credentials (if not already set)
-echo "BINANCE_API_KEY=your_key" >> ~/.env
-echo "BINANCE_SECRET_KEY=your_secret" >> ~/.env
+# 1 — Clone and install dependencies
+git clone https://github.com/your-username/trading-scanner.git
+cd trading-scanner
+pip3 install -r requirements.txt
 
-# 2 — Dependencies (TUI only)
-pip3 install textual
+# 2 — Set your credentials
+cp .env.example .env
+# Edit .env and fill in BINANCE_API_KEY, BINANCE_SECRET_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
 # 3a — Interactive scan (manual confirm prompt)
 python3 scanner.py
 
-# 3b — Real-time TUI dashboard + scan
+# 3b — Real-time TUI dashboard + scan (recommended)
 python3 tui.py
 
 # 3c — Cron mode (no prompt, Telegram confirm)
@@ -48,24 +50,27 @@ SCANNER_CRON=1 python3 scanner.py
 
 ```
 Trading/
-├── scanner.py              Main scanner engine (indicators, signals, orders, state)
+├── config.py               Single source of truth for all settings (reads from .env)
+├── scanner.py              Core engine — indicators, signals, orders, state, Telegram
 ├── tui.py                  Real-time TUI dashboard (Textual)
-├── tui.tcss                Catppuccin Mocha CSS for the TUI
-├── backtest.py             Historical signal backtester (stdlib only)
-├── run_scanner.sh          Shell wrapper for launchd (loads env + runs cron mode)
-├── state.json              Live scan state — written each run, read by TUI/dashboard
-├── scanner.log             Append-only run log (last 200 lines embedded in state.json)
-├── backtest_results.json   Output of the last backtest run
-└── dashboard.html          Legacy browser dashboard (reads state.json every 30s)
-
-~/Library/LaunchAgents/
-└── com.trading.scanner.plist   launchd job — triggers every 10 minutes
+├── tui.tcss                Catppuccin Mocha theme for the TUI
+├── backtest.py             Walk-forward backtester (stdlib only, no look-ahead)
+├── run_scanner.sh          Shell wrapper for launchd (loads .env, runs cron mode)
+├── requirements.txt        Python dependencies
+├── .env.example            Credential template — copy to .env and fill in values
+├── LICENSE                 MIT
+├── state.db                SQLite runtime state — WAL mode, canonical store (gitignored)
+├── scanner.log             Append-only run log (gitignored)
+└── backtest_results.json   Output of last backtest run (gitignored)
 
 ~/.agent/diagrams/
-└── trading-dashboard.html      Auto-generated HTML dashboard (updated each scan)
+└── trading-dashboard.html  Auto-generated HTML dashboard (updated each scan)
+
+~/Library/LaunchAgents/
+└── com.trading.scanner.plist   launchd job — runs every 30 minutes
 ```
 
-> **Never edit `state.json` or `scanner.log` manually** — they are overwritten/appended on every run.
+> **Never edit `state.db` with a full-replacement write** — use targeted SQL (`UPDATE`, `DELETE`, `INSERT OR REPLACE`) to avoid corrupting concurrent reads.
 
 ---
 
@@ -106,40 +111,45 @@ No stdin prompt. If a signal fires, the scanner sends a Telegram alert and waits
 ## TUI App
 
 ```bash
-pip3 install textual   # one-time
+pip3 install -r requirements.txt   # one-time
 python3 tui.py
 ```
 
 ### Layout
 
 ```
-┌─ Header ──────────────────────────────────────────────────────────┐
-│  ◉ TRADING SCANNER    F&G: 45 Fear  |  BTC $66,395  RSI:52.1 ↑  │
-├─ Left panel (30) ────┬─ Center ─────────────────────────────────── │
-│ PORTFOLIO  $2,706    │  MARKET OVERVIEW                            │
-│ ETH  $1,385  51% ████│  ┌─ETH──┐  ┌─ADA──┐  ┌─DOGE─┐            │
-│ USDC $1,221  45% ███ │  │$2000 │  │$0.248│  │$0.16 │            │
-│ ADA  $100     4% ▌   │  │RSI 44│  │RSI 38│  │RSI 52│            │
-│                      │  │ NONE │  │ NONE │  │ NONE │            │
-│ COOLDOWNS            │  └──────┘  └──────┘  └──────┘            │
-│ None active          │  OPEN POSITIONS (live P&L)                 │
-│                      │  TRADE HISTORY  (last 10)                  │
-│ PERFORMANCE          │                                            │
-│ 0W / 0L  —% WR       │                                            │
-├─ Log strip ──────────┴──────────────────────────────────────────── │
-│  10:01:30  ETH RSI 44.5 — NONE | ADA RSI 38.2 — NONE             │
-├─ Status bar ────────────────────────────────────────────────────── │
-│  [S] Scan  [R] Refresh  [P] Panel  [L] Log  [Q] Quit              │
-└───────────────────────────────────────────────────────────────────┘
+┌─ Header ───────────────────────────────────────────────────────────────┐
+│  ◉ TRADING SCANNER   F&G: 45 Fear  │  BTC $66,395  RSI:52.1 ↑  ████  │
+├─ Left panel (30) ────┬─ Market ─ Positions ─ History ─ Backtest ───── │
+│ PORTFOLIO  $2,706    │  ┌─ ETHUSDC ──────┐  ┌─ ADAUSDC ──────┐        │
+│ Open P&L: +$4.20     │  │ $1,998   RSI 44│  │ $0.248   RSI 38│        │
+│ ETH  51%  ████████   │  │ 1d:52  NONE    │  │ 1d:41  NONE    │        │
+│ USDC 45%  ███████    │  │ ▁▂▃▄▅▆▇█▇▆▅   │  │ ▃▃▄▅▆▇▇▆▇█▇   │        │
+│ ADA   4%  ▌          │  └────────────────┘  └────────────────┘        │
+│                      │                                                  │
+│ COOLDOWNS            │                                                  │
+│ None active          │                                                  │
+│                      │                                                  │
+│ PERFORMANCE          │                                                  │
+│ 0W / 0L  —% WR       │                                                  │
+├─ Log strip ──────────┴──────────────────────────────────────────────── │
+│  10:01:30  ETH RSI 44.5 1d:52 — NONE | ADA RSI 38.2 1d:41 — NONE     │
+├─ Status bar ───────────────────────────────────────────────────────── │
+│  [S] Scan [R] Refresh [P] Panel [E] Equity [C] Settings [L] Log [Q]  │
+└────────────────────────────────────────────────────────────────────── ┘
 ```
+
+The portfolio panel also shows a drawdown warning when the portfolio is below its high-water mark: `⚠ Drawdown: X.X%` (orange, ≥10%) or `🛑 HALTED X.X%` (red, ≥15%).
 
 ### Key bindings
 
 | Key | Action |
 |-----|--------|
 | `S` | Run a full scan now |
-| `R` | Re-read `state.json` from disk |
+| `R` | Re-read `state.db` from disk |
 | `P` | Toggle left portfolio panel |
+| `E` | Toggle left panel: portfolio ↔ equity curve |
+| `C` | Open settings (scan interval) |
 | `L` | Toggle log strip |
 | `Q` | Quit |
 
@@ -164,10 +174,10 @@ TP/SL shown are ATR-estimated — the actual OCO prices are computed from the li
 
 | Timer | Interval | What it does |
 |-------|----------|--------------|
-| State watcher | 5 s | Reads `state.json` (disk only — no API calls) |
+| State watcher | 5 s | Reads `state.db` via SQLite WAL (disk only — no API calls) |
 | Auto-scan | 30 s | Full Binance API scan in background thread |
 
-The TUI and the launchd cron job are independent. When cron writes `state.json`, the TUI detects the update within 5 seconds via the state watcher.
+The TUI and the launchd cron job are independent. When cron writes `state.db`, the TUI detects the update within 5 seconds via the state watcher. WAL mode allows the reader and writer to run concurrently without locking.
 
 ---
 
@@ -177,36 +187,59 @@ The TUI and the launchd cron job are independent. When cron writes `state.json`,
 
 `ETHUSDC` · `ADAUSDC` · `DOGEUSDC` · `BNBUSDC` · `SOLUSDC` · `XRPUSDC`
 
+### Timeframes
+
+- **1h candles** — signal generation (RSI, SMA, volume, ATR)
+- **1d candles** — trend filter (fetched per pair, last 30 daily candles)
+
+The daily timeframe classifies each pair's broader trend before the 1h signal is evaluated:
+
+| Daily state | daily RSI | Price vs SMA20 | Effect |
+|-------------|-----------|----------------|--------|
+| **Bullish** | > 45 | above | MODERATE allowed |
+| **Neutral** | 30–45 | any | STRONG allowed, MODERATE blocked |
+| **Bearish** | < 30 | below | STRONG blocked, EXTREME still fires |
+
+EXTREME signals bypass the daily filter — deep oversold readings are entries regardless of trend.
+
 ### Market filters (fetched once per scan)
 
 | Filter | Source | Effect |
 |--------|--------|--------|
-| **Fear & Greed Index** | alternative.me | Blocks MODERATE entries when F&G ≥ 60; blocks STRONG when F&G ≥ 75 |
-| **BTC RSI + SMA20** | Binance 1h klines | Blocks MODERATE entries when BTC is below its SMA20 |
+| **Fear & Greed Index** | alternative.me | Blocks MODERATE when F&G ≥ 60; blocks STRONG when F&G ≥ 75 |
+| **BTC SMA20** | Binance 1h klines | Blocks MODERATE when BTC is below its 1h SMA20 |
+| **BTC RSI** | Binance 1h klines | Halves STRONG position size to $100 when BTC RSI < 35 |
+| **BTC dominance** (T2-3) | CoinGecko /global | Blocks MODERATE when BTC.D rises >0.5% scan-over-scan (fail-open on API error) |
 
-Both are fetched once and shared across all pairs. F&G is cached in `state.json` for 25 hours. If the live fetch fails, the cache is used. If the cache is also expired, neutral 50 is used and a Telegram warning is sent.
+F&G is cached 25h. BTC.D is cached 1h. Fail-open on any API failure — signals are never blocked by unavailable external data.
 
 ### Signal tiers
 
 | Tier | Condition | Capital |
 |------|-----------|---------|
-| **EXTREME** (quality) | RSI < 25 AND above SMA20 AND F&G < 40 | $200 |
-| **EXTREME** (crash)   | RSI < 25 AND (below SMA20 OR F&G ≥ 40) | $100 — falling knife, halved |
-| **STRONG**            | RSI < 32 AND above SMA20 AND F&G < 75 | $200 (or $100 if BTC RSI < 35) |
-| **MODERATE**          | RSI < 40 AND above SMA20 AND vol surge AND momentum AND F&G < 60 AND BTC above SMA | $200 |
+| **EXTREME** (quality) | RSI < 25 AND above SMA20 AND F&G < 40 | $100 — first split leg; second fires at 1×ATR below entry |
+| **EXTREME** (crash)   | RSI < 25 AND (below SMA20 OR F&G ≥ 40) | $100 — falling knife, no split entry |
+| **STRONG**            | RSI < 32 AND above SMA20 AND F&G < 75 AND divergence ok | $200 (or $100 if BTC RSI < 35) |
+| **MODERATE**          | RSI < 40 AND above SMA20 AND vol surge AND momentum AND F&G < 60 AND BTC above SMA AND divergence ok AND BTC.D not rising | $200 |
 
-EXTREME always qualifies regardless of BTC context — deep oversold readings are entries even in fear. Position size is halved when the setup is a falling-knife pattern (below SMA or high F&G).
+EXTREME always bypasses the daily trend filter, divergence filter, and BTC dominance filter — deep panic is always worth entering.
+
+**Additional signal-quality filters (T2-2 / T2-3):**
+- **RSI Divergence** — if the last two price swing lows form a lower low but RSI also forms a lower low, STRONG and MODERATE are blocked. If divergence is detected (RSI makes a higher low while price makes a lower low) or data is ambiguous, signals proceed.
+- **BTC Dominance surge** — if BTC.D rose >0.5% since the previous scan, MODERATE is blocked (altcoins tend to bleed when dominance surges).
 
 ### Per-scan guards
 
 Applied in this order after signal detection:
 
-1. **Correlation cap** — if ≥ 3 candidates, keep only the lowest-RSI pair (BTC-correlated overexposure)
-2. **Max positions** — skip all signals if 2 positions are already open
-3. **SL cooldown** — skip a symbol for 4 hours after its stop-loss was hit
-4. **Open position** — skip if an OCO order already exists for the symbol
+1. **Dynamic pair scoring (T4-3)** — if ≥ 3 candidates, keep the highest-scoring pair (win_rate × profit_factor from last 20 trades); falls back to lowest RSI if fewer than 3 trades per symbol
+2. **Circuit breaker** — if portfolio has dropped ≥ `MAX_DRAWDOWN_PCT` (15%) from its peak, all candidates are cleared and a Telegram alert is sent (at most once per 4 hours)
+3. **Max positions** — skip a signal if `MAX_POSITIONS` are already open
+4. **SL cooldown** — skip a symbol for 4 hours after its stop-loss was hit
+5. **Open position** — skip if an OCO order already exists for the symbol
+6. **15m entry refinement (T4-2)** — skip if the 15m RSI > 45 (momentum peaked on the shorter timeframe)
 
-> The correlation cap runs **before** the per-symbol guards so it filters on raw signal quality, not on whatever accidentally survives the guards.
+> The correlation cap and circuit breaker both run **before** the per-symbol guards so they filter on raw signal quality, not on whatever accidentally survives the guards.
 
 ### Indicators
 
@@ -250,7 +283,7 @@ Used for dynamic SL/TP sizing in `place_buy_order()`.
 
 ## Configuration Reference
 
-All constants are at the top of `scanner.py`:
+All settings live in `config.py` — edit only this file, never `scanner.py` directly:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
@@ -260,6 +293,8 @@ All constants are at the top of `scanner.py`:
 | `TAKE_PROFIT` | `0.075` | Fixed TP fallback when ATR disabled (7.5%) |
 | `MAX_POSITIONS` | `2` | Maximum concurrent open positions |
 | `SL_COOLDOWN_H` | `4` | Hours to pause signals after SL hit |
+| `MAX_DRAWDOWN_PCT` | `0.15` | Halt new orders if portfolio drops >15% from its high-water mark |
+| `DIGEST_HOUR` | `8` | Local hour (0–23) at which the morning Telegram digest is sent |
 | `TRAILING_DELTA` | `150` | Trailing stop in basis points; `0` = disabled |
 | `ATR_SL_MULT` | `1.5` | SL = ATR × multiplier; `0` = use fixed `STOP_LOSS` |
 | `ATR_TP_MULT` | `3.5` | TP = ATR × multiplier → ~2.33:1 R/R |
@@ -267,6 +302,33 @@ All constants are at the top of `scanner.py`:
 | `ATR_SL_MAX` | `0.06` | ATR-based SL ceiling (6%) |
 | `INTERVAL` | `"1h"` | Candle interval |
 | `KLINE_LIMIT` | `100` | Candles fetched per pair (must be ≥ 2 × RSI period to converge) |
+| `DIVERGENCE_ENABLED` | `True` | Enable RSI divergence filter (T2-2) |
+| `DIVERGENCE_LOOKBACK` | `20` | Candles to scan for swing lows |
+| `DIVERGENCE_SWING_DEPTH` | `0.005` | Minimum swing depth (0.5%) for a local low to qualify |
+| `BTC_DOM_ENABLED` | `True` | Enable BTC dominance filter (T2-3) |
+| `BTC_DOM_CACHE_H` | `1` | CoinGecko cache lifetime in hours |
+| `BTC_DOM_RISE_THRESHOLD` | `0.005` | Dominance rise % to trigger MODERATE block |
+| `PARTIAL_TP_ENABLED` | `True` | Enable partial TP1 at 1×ATR (T2-4) |
+| `PARTIAL_TP1_ATR_MULT` | `1.0` | TP1 distance = ATR × this multiplier |
+| `PARTIAL_TP1_QTY_PCT` | `0.50` | Fraction of position closed at TP1 |
+| `SPLIT_ENTRY_ENABLED` | `True` | Enable split entry for EXTREME quality signals (T2-1) |
+| `SPLIT_ENTRY_ATR_MULT` | `1.0` | Second entry trigger = first_fill × (1 − ATR × this) |
+| `SPLIT_ENTRY_TTL_H` | `48` | Expire pending second entry after this many hours |
+| `TRADE_TIMEOUT_ENABLED` | `True` | Force-exit positions open longer than `TRADE_TIMEOUT_H` (T3-2) |
+| `TRADE_TIMEOUT_H` | `72` | Hours before a position is force-exited |
+| `BREAKEVEN_ENABLED` | `True` | Move SL to entry once price reaches 1×ATR gain (T3-1) |
+| `BREAKEVEN_ATR_MULT` | `1.0` | Break-even trigger = entry × (1 + this × ATR%) |
+| `VOL_SIZING_ENABLED` | `True` | Scale position size by volatility (T3-4) |
+| `TARGET_RISK_PCT` | `0.015` | Target 1.5% portfolio risk per trade |
+| `VOL_SIZING_MIN` | `0.25` | Floor: never below 25% of CAPITAL |
+| `VOL_SIZING_MAX` | `1.00` | Ceiling: never above 100% of CAPITAL |
+| `ENTRY_REFINE_ENABLED` | `True` | Skip order if 15m RSI > threshold (T4-2) |
+| `ENTRY_REFINE_15M_RSI_MAX` | `45` | 15m RSI threshold; higher → momentum peaked |
+| `PAIR_SCORE_ENABLED` | `True` | Sort correlation-cap candidates by win_rate × profit_factor (T4-3) |
+| `PAIR_SCORE_MIN_TRADES` | `3` | Minimum closed trades to compute score |
+| `PAIR_SCORE_LOOKBACK` | `20` | Last N closed trades per symbol |
+| `PROGRESSIVE_TRAILING_ENABLED` | `True` | Tighten trailing delta at ATR milestones (T4-4) |
+| `PROGRESSIVE_TRAILING_STAGES` | `[(1.5,100),(2.0,75),(2.5,50)]` | (ATR multiplier trigger, new bps); do not reorder while trades are open |
 
 **ATR floor note:** When ATR < `ATR_SL_MIN / ATR_SL_MULT`, SL is floored to `ATR_SL_MIN` but TP still scales from the floored SL. The apparent R/R improves beyond what the raw ATR justifies — a conservative bias in flat/low-volatility markets.
 
@@ -298,23 +360,61 @@ signal confirmed
        │      └─ Fallback (ATR disabled or klines missing):
        │          sl_pct = STOP_LOSS (3%), tp_pct = TAKE_PROFIT (7.5%)
        │
-       └─ 6. OCO order
-              ├─ TP leg: LIMIT_MAKER at fill × (1 + tp_pct)
-              └─ SL leg:
-                  ├─ Trailing (TRAILING_DELTA > 0):
-                  │   STOP_LOSS with belowTrailingDelta = 150 bps
-                  │   activates at fill × (1 − sl_pct)
-                  └─ Fixed:
-                      STOP_LOSS_LIMIT, limit = stop_price × 0.995
+       ├─ 6. OCO order
+       │      ├─ TP leg: LIMIT_MAKER at fill × (1 + tp_pct)
+       │      └─ SL leg:
+       │          ├─ Trailing (TRAILING_DELTA > 0):
+       │          │   STOP_LOSS with belowTrailingDelta = 150 bps
+       │          │   activates at fill × (1 − sl_pct)
+       │          └─ Fixed:
+       │              STOP_LOSS_LIMIT, limit = stop_price × 0.995
+       │
+       ├─ 7. Partial TP1 LIMIT_MAKER (if PARTIAL_TP_ENABLED)
+       │      Standalone SELL LIMIT_MAKER for qty × 50% at fill × (1 + 1×ATR%)
+       │      Failure is non-fatal — full position still protected by OCO
+       │
+       └─ 8. Arm split entry (if SPLIT_ENTRY_ENABLED + EXTREME quality)
+              Stores {first_fill, first_qty, first_oco_id, atr_pct, …} in
+              state.db pending_second_entries table
+              Trigger: current_price ≤ first_fill × (1 − 1×ATR%)
+              TTL: 48 hours
 ```
+
+### Partial TP flow (T2-4)
+
+When the TP1 LIMIT_MAKER fills, `_handle_partial_tp1()` is called:
+1. Record TP1 exit: `exit_price`, `pnl_pct`, stored in `trade["partial_tp1"]`
+2. Cancel the original full-position OCO via DELETE `/api/v3/orderList`
+3. Place a new OCO for the remaining 50% at the original TP2 and SL prices
+4. Trade status → `partial_tp` (still counted as open)
+
+When the final OCO fills, P&L = `TP1_pnl × 0.5 + final_pnl × 0.5` (weighted average).
+
+### Position management
+
+After an order is placed, each scan runs the following checks in order:
+
+| Phase | Condition | Action |
+|-------|-----------|--------|
+| **Break-even stop (T3-1)** | price ≥ entry × (1 + 1×ATR%) | Cancel OCO, re-place with SL at entry; fires once (`breakeven_moved` guard) |
+| **Progressive trailing (T4-4)** | price ≥ entry × (1 + 1.5/2/2.5×ATR%) | Tighten trailing delta to 100/75/50 bps at each milestone; tracked by `trailing_stage` index |
+| **Trade timeout (T3-2)** | trade age > `TRADE_TIMEOUT_H` (72h) | Cancel OCO, market-sell remaining qty; status → `timeout` |
+
+Volatility-adjusted sizing (T3-4): capital per trade = `TARGET_RISK_PCT × portfolio / atr_pct`, clamped to `[25%, 100%] × CAPITAL`. Falls back to `CAPITAL` when ATR is unavailable.
 
 ### SL outcome tracking
 
-After each scan, `_check_sl_outcomes()` queries `allOrders` for every open trade's OCO ID:
+After each scan, `_check_sl_outcomes()` queries `allOrders` for every open/partial_tp trade's OCO ID:
 
 - `LIMIT_MAKER` filled → `tp_hit` status, no cooldown
 - `STOP_LOSS_LIMIT` / `STOP_LOSS` filled → `sl_hit` status + SL cooldown set
-- Both filled (race condition) → TP takes precedence
+- TP1 `LIMIT_MAKER` (standalone) filled → `partial_tp` transition, new OCO placed
+- Both OCO legs filled (race condition) → TP takes precedence
+
+On terminal outcome, three fields are written to the trade row in `state.db` via `update_trade_fields()`:
+- `exit_price` — actual avg fill price from `cummulativeQuoteQty / executedQty`
+- `pnl_pct` — `(exit_price − entry) / entry × 100` (weighted avg for partial_tp trades)
+- `exit_time` — ISO timestamp of the outcome detection
 
 ---
 
@@ -360,15 +460,7 @@ Live terminal app — see [TUI App](#tui-app).
 open ~/.agent/diagrams/trading-dashboard.html
 ```
 
-Generated by `generate_dashboard()` at the end of each scan. Self-contained single-file HTML. Shows portfolio allocation, pair tiles, open positions, trade history, and performance stats. No web server required.
-
-### Legacy browser dashboard
-
-```bash
-open /Users/jebog/Documents/Claude/Projects/Trading/dashboard.html
-```
-
-Reads `state.json` and auto-refreshes every 30 seconds.
+Generated by `generate_dashboard()` at the end of each scan. Self-contained single-file HTML — no web server required. Shows portfolio allocation, pair tiles, open positions, trade history, and performance stats.
 
 ---
 
@@ -383,24 +475,29 @@ Reads `state.json` and auto-refreshes every 30 seconds.
 | Order placed | Fill price, actual TP/SL, OCO order ID |
 | TP hit | Symbol confirmation |
 | SL hit | Symbol + cooldown duration |
+| F&G regime change | Threshold crossed (20 / 30 / 50) with regime description; once per crossing, deduped via `fg_regime` key in `kv` table |
+| Circuit breaker | Drawdown %, peak vs current portfolio; at most once per 4 hours |
+| Daily digest (8am) | 7-day closed trade summary (wins/losses/net P&L), portfolio total, F&G, open positions with time-held |
 | F&G cache expired | Warning that sentiment filter is inactive |
+| Partial TP1 hit (T2-4) | Symbol, TP1 fill price, pnl%, TP2 target |
+| Partial TP1 re-OCO failed (T2-4) | 🚨 CRITICAL — remaining qty unprotected |
+| Split entry armed (T2-1) | Symbol, trigger price, TTL |
+| Split entry complete (T2-1) | Avg entry, TP, SL, combined OCO ID |
+| Split entry expired (T2-1) | Symbol, TTL hit |
+| Split second buy failed (T2-1) | 🚨 CRITICAL — first half unprotected |
 | Order error | Sanitised exception message (Markdown-safe) |
 
 ### Setup
 
 ```bash
-# 1 — Create bot via @BotFather, copy token
-# 2 — Store token
-echo "SCANNER_TELEGRAM_TOKEN=your_bot_token" >> ~/.env
-
-# 3 — Pair your chat ID (Claude Code skill)
-/telegram:configure
+# 1 — Create a bot via @BotFather on Telegram, copy the token
+# 2 — Get your numeric chat ID via @userinfobot or @RawDataBot
+# 3 — Add to .env:
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_numeric_chat_id
 ```
 
 In cron mode, reply `CONFIRM` or `SKIP` to the bot within 120 seconds after a signal alert.
-
-Token priority: env var → `<project>/.env` → `~/.env`.
-Chat ID is read from `~/.claude/channels/telegram/access.json`.
 
 ---
 
@@ -429,43 +526,48 @@ launchctl load   ~/Library/LaunchAgents/com.trading.scanner.plist
 ### Watch live
 
 ```bash
-tail -f /Users/jebog/Documents/Claude/Projects/Trading/scanner.log
+tail -f scanner.log
 ```
 
 ---
 
 ## Credentials
 
-Read in priority order:
-1. `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` environment variables
-2. `<project>/.env`
-3. `~/.env`
+Credentials are loaded from the `.env` file in the project root (via `python-dotenv`):
 
 ```bash
+cp .env.example .env
+# Then edit .env:
 BINANCE_API_KEY=your_api_key
 BINANCE_SECRET_KEY=your_secret_key
-chmod 600 ~/.env
+TELEGRAM_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_numeric_chat_id
+chmod 600 .env
 ```
 
-Spot trading permission is required to place orders. Market data (klines, ticker) works without authentication.
+Spot trading permission is required on the Binance API key to place orders. Market data (klines, ticker) works without authentication. `.env` is gitignored and will never be committed.
 
 ---
 
 ## Troubleshooting
 
-### `No module named 'textual'`
+### `No module named 'textual'` / `No module named 'dotenv'`
 ```bash
-pip3 install textual
+pip3 install -r requirements.txt
 ```
 
 ### TUI crashes with `TypeError: 'dict' object is not callable`
 
-`_context` in `tui.py` is shadowing a Textual internal method. Check that line 36 of `scanner.py` reads:
+`tui.py` has a class attribute named `_scan_ctx` specifically to avoid shadowing Textual's internal `_context()` method. If you see this error after modifying `tui.py`, check that no class attribute or variable is named `_context` in `ScannerApp`.
+
+### TUI output corrupted or scanner log missing on startup
+
+The `TeeLogger` in `scanner.py` must be guarded:
 ```python
 if __name__ == "__main__":
     sys.stdout = TeeLogger()
 ```
-The guard must be present. If missing, importing `scanner` would redirect stdout before Textual initialises.
+Without this guard, importing `scanner` from `tui.py` would redirect stdout before Textual initialises, corrupting terminal output.
 
 ### No signals firing
 
@@ -473,7 +575,7 @@ RSI above thresholds is normal in trending or neutral markets. EXTREME requires 
 
 ### F&G fetch failing
 
-The scanner falls back to a 25-hour cache in `state.json["fg_cache"]`, then to neutral 50 with a Telegram warning. The sentiment filter becomes inactive but signals can still fire (MODERATE will be less filtered). Check internet connectivity if this persists.
+The scanner falls back to a 25-hour cache in the `fg_cache` SQLite table, then to neutral 50 with a Telegram warning. The sentiment filter becomes inactive but signals can still fire (MODERATE will be less filtered). Check internet connectivity if this persists.
 
 ### Order rejected: `Filter failure: LOT_SIZE`
 
@@ -484,10 +586,10 @@ The computed quantity is below the exchange minimum. This happens when `CAPITAL 
 Cooldowns expire automatically. To clear manually:
 ```bash
 python3 -c "
-import json
-with open('state.json') as f: s = json.load(f)
-s['cooldowns'] = {}
-with open('state.json','w') as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect('state.db')
+conn.execute('DELETE FROM cooldowns')
+conn.commit(); conn.close()
 print('Cooldowns cleared')
 "
 ```

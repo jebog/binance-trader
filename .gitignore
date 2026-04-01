@@ -1,7 +1,5 @@
 # ── Secrets & credentials ─────────────────────────────────────────────────────
 .env
-# config.py committed only after feature/secrets-migration (credentials must be removed first)
-config.py
 
 # ── Runtime / generated files ─────────────────────────────────────────────────
 state.json
@@ -46,7 +44,7 @@ htmlcov/
 .claude/
 .playwright-mcp/
 
-# ── Unrelated assets (to be cleaned up in feature/project-structure) ──────────
+# ── Local-only files (not part of the trading scanner) ────────────────────────
 generate_guide.py
 guide_trading_debutants.pdf
 ve-full.png

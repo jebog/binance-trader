@@ -49,9 +49,19 @@ Screen {
 }
 
 #header-scan-status {
-    width: auto;
+    width: 3;
     color: $teal;
-    text-style: italic;
+}
+
+#scan-progress {
+    width: 20;
+    height: 1;
+    margin-left: 1;
+}
+
+#scan-progress Bar {
+    color: $teal;
+    background: $overlay;
 }
 
 /* ── Main layout ─────────────────────────────────── */
@@ -86,6 +96,17 @@ Screen {
     margin: 0;
 }
 
+/* ── ContentSwitcher + LoadingIndicator ─────────── */
+#left-switcher {
+    height: auto;
+    max-height: 12;
+}
+
+LoadingIndicator {
+    height: 3;
+    color: $teal;
+}
+
 /* ── Portfolio ───────────────────────────────────── */
 #portfolio-total {
     color: $teal;
@@ -97,6 +118,21 @@ Screen {
 }
 
 /* asset bar colours now use M_* hex constants inline in tui.py */
+
+/* ── Equity widget ───────────────────────────────── */
+#equity-widget {
+    height: auto;
+    max-height: 12;
+}
+
+#equity-spark {
+    height: 4;
+}
+
+#equity-stats {
+    color: $subtext;
+    margin-top: 1;
+}
 
 /* ── Cooldowns ───────────────────────────────────── */
 .cooldown-active {
@@ -111,12 +147,50 @@ Screen {
 .perf-positive { color: $green; }
 .perf-neutral  { color: $muted; }
 
-/* ── Center panel ────────────────────────────────── */
-#center-panel {
+/* ── Center panel (TabbedContent) ───────────────── */
+#center-tabs {
     width: 1fr;
     height: 100%;
+}
+
+/* ContentSwitcher is the direct parent of TabPane inside TabbedContent —
+   anchor it so 1fr on TabPane/DataTable resolves against a real height */
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
     padding: 0 1;
+    height: 1fr;
     overflow-y: auto;
+}
+
+/* Tab bar styling */
+Tabs {
+    background: $surface;
+    border-bottom: solid $overlay;
+    height: 3;
+}
+
+Tab {
+    color: $subtext;
+    padding: 0 2;
+}
+
+Tab:focus {
+    color: $text;
+    background: $overlay;
+}
+
+Tab.-active {
+    color: $blue;
+    text-style: bold;
+    background: $bg;
+}
+
+Tab:hover {
+    background: $overlay;
+    color: $text;
 }
 
 /* ── Pair grid ───────────────────────────────────── */
@@ -131,7 +205,17 @@ Screen {
     background: $surface;
     border: solid $overlay;
     padding: 0 1;
-    height: 7;
+    height: 9;
+    layout: vertical;
+}
+
+.pair-info {
+    height: auto;
+}
+
+.pair-spark {
+    height: 2;
+    margin-top: 0;
 }
 
 .pair-card.EXTREME { border: solid $red;    }
@@ -161,18 +245,11 @@ Screen {
 .pair-change-pos { color: $green; }
 .pair-change-neg { color: $red;   }
 
-/* ── Section headers ─────────────────────────────── */
-.section-header {
-    color: $subtext;
-    text-style: bold;
-    margin: 1 0 0 0;
-}
 
 /* ── DataTable (positions + history) ─────────────── */
 DataTable {
     background: $bg;
-    height: auto;
-    max-height: 10;
+    height: 1fr;
     margin-bottom: 1;
 }
 
@@ -261,6 +338,21 @@ OrderConfirmModal {
 
 .modal-label { color: $subtext; width: 12; }
 .modal-value { color: $text;    width: 1fr; }
+
+/* Settings modal — wider label column for "Scan interval (s):" */
+SettingsModal .modal-label { width: 20; }
+
+/* Settings modal Input */
+SettingsModal Input {
+    width: 1fr;
+    background: $bg;
+    color: $text;
+    border: solid $overlay;
+}
+
+SettingsModal Input:focus {
+    border: solid $blue;
+}
 .modal-value-tp  { color: $green; }
 .modal-value-sl  { color: $red;   }
 .modal-value-cap { color: $teal;  }

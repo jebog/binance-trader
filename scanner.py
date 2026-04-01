@@ -2764,6 +2764,10 @@ def scan() -> None:
                         rsi_15m = _get_15m_rsi(s["symbol"])
                         if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
                             print(f"  ⏩ {s['symbol']} 15m RSI {rsi_15m:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
+                            send_telegram(
+                                f"⏩ *Entry deferred* — `{s['symbol']}`\n"
+                                f"15m RSI `{rsi_15m:.1f}` > `{ENTRY_REFINE_15M_RSI_MAX}` — wait for 15m pullback"
+                            )
                             continue
                     try:
                         trade = _place_and_arm(s)

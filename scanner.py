@@ -47,7 +47,7 @@ from config import (  # noqa: E402
     TELEGRAM_CHAT_ID,
     WEBHOOK_URL,
     PAIRS, CAPITAL,
-    MAX_POSITIONS, SL_COOLDOWN_H,
+    MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -192,6 +192,11 @@ def save_state(
             state["sent_signals"]  = old.get("sent_signals") or {}         # preserve dedup ledger
             state["fg_regime"]     = fg_regime or old.get("fg_regime")      # preserve regime state
             state["open_pnl"]      = open_pnl if open_pnl is not None else old.get("open_pnl")
+            old_peak = old.get("peak_portfolio_usdc") or 0.0
+            new_total = portfolio["total_usdc"] if portfolio else None
+            state["peak_portfolio_usdc"] = (
+                new_total if (new_total and new_total > old_peak) else old_peak or None
+            )
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         if signals:
@@ -651,12 +656,22 @@ def _check_sl_outcomes() -> None:
                 if tp_filled:
                     print(f"  ✓ TP hit detected for {symbol}")
                     send_telegram(f"✅ TP hit on `{symbol}` — target reached")
-                    trade["status"] = "tp_hit"
+                    trade["status"]     = "tp_hit"
+                    trade["exit_price"] = trade.get("tp")
+                    entry = trade.get("entry")
+                    ep    = trade["exit_price"]
+                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
+                    trade["exit_time"] = datetime.now().isoformat()
                 elif sl_filled:
                     print(f"  ⚠ SL hit detected for {symbol} — cooldown {SL_COOLDOWN_H}h")
                     send_telegram(f"🔴 SL hit on `{symbol}` — pausing signals {SL_COOLDOWN_H}h")
                     _save_cooldown(symbol)
-                    trade["status"] = "sl_hit"
+                    trade["status"]     = "sl_hit"
+                    trade["exit_price"] = trade.get("sl")
+                    entry = trade.get("entry")
+                    ep    = trade["exit_price"]
+                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
+                    trade["exit_time"] = datetime.now().isoformat()
             except Exception:
                 pass
         # Persist updated trade statuses (tp_hit / sl_hit)
@@ -665,7 +680,10 @@ def _check_sl_outcomes() -> None:
         for t in (state.get("trades") or []):
             resolved = oco_ids.get(t.get("oco_id"))
             if resolved and resolved.get("status") in ("tp_hit", "sl_hit"):
-                t["status"] = resolved["status"]
+                t["status"]     = resolved["status"]
+                t["exit_price"] = resolved.get("exit_price")
+                t["pnl_pct"]    = resolved.get("pnl_pct")
+                t["exit_time"]  = resolved.get("exit_time")
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
@@ -1468,6 +1486,22 @@ def scan() -> None:
         candidates = candidates[:1]
         print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} (lowest RSI), "
               f"dropping: {', '.join(dropped)}")
+
+    # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────
+    peak_usdc    = _scan_state.get("peak_portfolio_usdc") or 0.0
+    current_usdc = portfolio["total_usdc"] if portfolio else None
+    if peak_usdc and current_usdc:
+        drawdown_pct = (peak_usdc - current_usdc) / peak_usdc
+        if drawdown_pct >= MAX_DRAWDOWN_PCT:
+            cb_msg = (
+                f"🛑 *Circuit breaker triggered*\n"
+                f"Drawdown: `{drawdown_pct*100:.1f}%` from peak\n"
+                f"Peak: `${peak_usdc:,.0f}` → Now: `${current_usdc:,.0f}`\n"
+                f"New orders halted until portfolio recovers."
+            )
+            send_telegram(cb_msg)
+            print(f"  🛑 CIRCUIT BREAKER: {drawdown_pct*100:.1f}% drawdown — no orders placed")
+            candidates = []
 
     # ── Phase 3: Per-symbol guards (open position, cooldown, max positions) ──
     for result in candidates:

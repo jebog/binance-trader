@@ -1047,9 +1047,16 @@ def _handle_trade_timeout(trade: dict[str, Any], symbol: str) -> None:
             "type":     "MARKET",
             "quantity": qty,
         })
-        ep        = _order_fill_price(sell_order)
-        entry     = trade.get("entry", 0.0)
-        pnl_pct   = (ep - entry) / entry * 100 if (ep and entry) else None
+        ep    = _order_fill_price(sell_order)
+        entry = trade.get("entry", 0.0)
+        # For partial_tp trades, weight TP1 exit (50%) + this exit (50%)
+        if trade.get("status") == "partial_tp" and trade.get("partial_tp1"):
+            p1        = trade["partial_tp1"]
+            tp1_pnl   = p1.get("pnl_pct") or 0.0
+            leg2_pnl  = (ep - entry) / entry * 100 if (ep and entry) else 0.0
+            pnl_pct   = tp1_pnl * PARTIAL_TP1_QTY_PCT + leg2_pnl * (1 - PARTIAL_TP1_QTY_PCT)
+        else:
+            pnl_pct   = (ep - entry) / entry * 100 if (ep and entry) else None
         trade["status"]     = "timeout"
         trade["exit_price"] = ep
         trade["pnl_pct"]    = pnl_pct

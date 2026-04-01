@@ -41,6 +41,11 @@ ATR_TP_MULT    = 3.5    # TP = ATR × 3.5  → ~2.33 R/R
 ATR_SL_MIN     = 0.02   # SL floor  (never tighter than 2%)
 ATR_SL_MAX     = 0.06   # SL ceiling (never wider than 6%)
 
+# ── RSI divergence filter (T2-2) ─────────────────────────────────────────────
+DIVERGENCE_ENABLED     = True
+DIVERGENCE_LOOKBACK    = 20     # candles to scan for swing lows
+DIVERGENCE_SWING_DEPTH = 0.005  # swing low must be ≥ 0.5% below both neighbors
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

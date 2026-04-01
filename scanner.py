@@ -52,6 +52,7 @@ from config import (  # noqa: E402
     BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
     PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
     SPLIT_ENTRY_ENABLED, SPLIT_ENTRY_ATR_MULT, SPLIT_ENTRY_TTL_H,
+    TRADE_TIMEOUT_ENABLED, TRADE_TIMEOUT_H,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -1007,9 +1008,67 @@ def _place_split_second_entry(
     }
 
 
+# ── Trade timeout handler (T3-2) ─────────────────────────────────────────────
+def _handle_trade_timeout(trade: dict[str, Any], symbol: str) -> None:
+    """Force-exit a position that has been open longer than TRADE_TIMEOUT_H.
+
+    Steps:
+    1. Cancel OCO (best-effort — OCO may already be filled/gone).
+    2. If partial_tp, also cancel the original TP1 order.
+    3. Market-sell remaining qty.
+    4. Record status="timeout" (or "timeout_sell_failed" if sell API fails).
+    No SL cooldown — timeout is not a signal failure.
+    """
+    age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
+    qty   = trade.get("qty", 0)
+
+    # Cancel OCO (best-effort)
+    oco_id = trade.get("oco_id")
+    if oco_id:
+        try:
+            signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": oco_id})
+            print(f"  Cancelled OCO #{oco_id} for timeout on {symbol}")
+        except Exception as e:
+            print(f"  ⚠ OCO cancel failed during timeout ({symbol}): {e}")
+
+    # Cancel standalone TP1 order if still open (partial_tp state has already
+    # transitioned to the new OCO, so tp1_order_id is the original leg)
+    if PARTIAL_TP_ENABLED and trade.get("tp1_order_id") and trade.get("status") == "open":
+        try:
+            signed_delete("/api/v3/order", {"symbol": symbol, "orderId": trade["tp1_order_id"]})
+        except Exception:
+            pass  # best-effort; likely already filled or expired
+
+    # Market-sell remaining qty
+    try:
+        sell_order = signed_post("/api/v3/order", {
+            "symbol":   symbol,
+            "side":     "SELL",
+            "type":     "MARKET",
+            "quantity": qty,
+        })
+        ep        = _order_fill_price(sell_order)
+        entry     = trade.get("entry", 0.0)
+        pnl_pct   = (ep - entry) / entry * 100 if (ep and entry) else None
+        trade["status"]     = "timeout"
+        trade["exit_price"] = ep
+        trade["pnl_pct"]    = pnl_pct
+        trade["exit_time"]  = datetime.now().isoformat()
+        pnl_str = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "N/A"
+        print(f"  ⏱ Timeout exit {symbol} after {age_h:.0f}h — {pnl_str}")
+        send_telegram(f"⏱ Timeout exit `{symbol}` after {age_h:.0f}h — {pnl_str}")
+    except Exception as sell_err:
+        msg = (f"🚨 *TIMEOUT SELL FAILED* — `{symbol}` position UNPROTECTED after {age_h:.0f}h. "
+               f"Manual exit required. Error: `{str(sell_err)[:200]}`")
+        print(f"  ✗ {msg}")
+        send_telegram(msg)
+        trade["status"] = "timeout_sell_failed"
+
+
 def _check_sl_outcomes() -> None:
     """Check closed OCO orders — if stop leg filled, trigger SL cooldown.
     Also checks for partial TP1 fills (T2-4) on trades with tp1_order_id.
+    Also handles trade timeout (T3-2) — force-exit positions open > TRADE_TIMEOUT_H.
     """
     if not os.path.exists(STATE_FILE):
         return
@@ -1030,6 +1089,13 @@ def _check_sl_outcomes() -> None:
         for oco_id, trade in oco_ids.items():
             symbol = trade["symbol"]
             try:
+                # T3-2: Timeout check — runs before any API call to avoid wasted weight
+                if TRADE_TIMEOUT_ENABLED:
+                    age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
+                    if age_h >= TRADE_TIMEOUT_H:
+                        _handle_trade_timeout(trade, symbol)
+                        continue  # skip OCO fill check for this trade
+
                 # Check all orders for the symbol to find TP or SL fill.
                 # Scan all filled legs before deciding — prefer TP in edge case
                 # where both legs somehow register FILLED (race condition).

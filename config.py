@@ -61,6 +61,10 @@ SPLIT_ENTRY_ENABLED  = True
 SPLIT_ENTRY_ATR_MULT = 1.0    # second entry triggers at first_fill × (1 - 1 × ATR%)
 SPLIT_ENTRY_TTL_H    = 48     # expire pending entry after 48h (Telegram notice sent)
 
+# ── Trade timeout (T3-2) ─────────────────────────────────────────────────────
+TRADE_TIMEOUT_ENABLED = True
+TRADE_TIMEOUT_H       = 72     # force-exit any position open longer than 72h
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

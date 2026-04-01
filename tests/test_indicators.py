@@ -12,7 +12,7 @@ from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 # ── Import pure functions directly (no side effects on import) ────────────────
-from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats, _pair_score
+from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats, _pair_score, _check_15m_rsi_gate
 from backtest import (
     calc_rsi as bt_calc_rsi,
     calc_sma as bt_calc_sma,
@@ -1617,33 +1617,22 @@ class TestEntryRefine:
         assert rsi < 50
 
     def test_entry_refine_threshold_boundary(self):
-        """RSI == threshold → allowed (strictly greater-than gate, not >=)."""
+        """RSI exactly at threshold → gate allows (strictly-greater-than, not >=)."""
         import scanner
         max_val = scanner.ENTRY_REFINE_15M_RSI_MAX
-        closes_at_boundary = [100.0 - i * 0.1 for i in range(50)]  # gentle decline
-        klines = self._make_klines(closes_at_boundary)
-        with patch("scanner.get", return_value=klines):
-            rsi = scanner._get_15m_rsi("ETHUSDC")
-        # Verify gate condition: rsi > max_val blocks, rsi == max_val does not
-        if rsi is not None and rsi == max_val:
-            assert not (rsi > max_val)   # boundary is allowed
-        # Explicit: gate is strictly greater-than
-        assert not (max_val > max_val)
+        # Patch _get_15m_rsi to return exactly the threshold value
+        with patch("scanner._get_15m_rsi", return_value=float(max_val)), \
+             patch("scanner.ENTRY_REFINE_ENABLED", True):
+            result = _check_15m_rsi_gate("ETHUSDC")
+        assert result is None   # equal is not greater → entry proceeds
 
     def test_entry_refine_disabled_skips_check(self):
-        """ENTRY_REFINE_ENABLED=False → _get_15m_rsi (get()) never called."""
-        import scanner
-        call_count = []
-        def mock_get_15m(sym):
-            call_count.append(sym)
-            return 60.0   # would-be-blocking RSI
-
-        with patch("scanner._get_15m_rsi", side_effect=mock_get_15m), \
+        """ENTRY_REFINE_ENABLED=False → _get_15m_rsi never called, gate returns None."""
+        with patch("scanner._get_15m_rsi") as mock_rsi, \
              patch("scanner.ENTRY_REFINE_ENABLED", False):
-            # Simulate the gate: if not ENTRY_REFINE_ENABLED, skip the call
-            if scanner.ENTRY_REFINE_ENABLED:
-                scanner._get_15m_rsi("ETHUSDC")
-        assert call_count == []   # never called when disabled
+            result = _check_15m_rsi_gate("ETHUSDC")
+        assert result is None          # disabled → no deferral
+        mock_rsi.assert_not_called()   # helper never invoked
 
 
 # ── T4-3: Dynamic pair scoring ────────────────────────────────────────────────

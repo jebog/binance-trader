@@ -2368,6 +2368,20 @@ def _get_15m_rsi(symbol: str) -> Optional[float]:
         return None
 
 
+def _check_15m_rsi_gate(symbol: str) -> Optional[float]:
+    """Return the blocking RSI value if entry should be deferred, else None.
+
+    None means "proceed" (disabled, fail-open, or RSI below threshold).
+    Non-None means "defer" — value is the actual 15m RSI for logging.
+    """
+    if not ENTRY_REFINE_ENABLED:
+        return None
+    rsi_15m = _get_15m_rsi(symbol)
+    if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
+        return rsi_15m
+    return None
+
+
 def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
     """Estimate SL/TP % for pre-order display — mirrors place_buy_order ATR logic."""
     if ATR_SL_MULT > 0 and s.get("closed_klines"):
@@ -2966,15 +2980,14 @@ def scan() -> None:
             print("  [CRON MODE] Waiting for Telegram confirmation...")
             for s in signals:
                 if wait_telegram_confirm(s["symbol"], timeout=120):
-                    if ENTRY_REFINE_ENABLED:
-                        rsi_15m = _get_15m_rsi(s["symbol"])
-                        if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
-                            print(f"  ⏩ {s['symbol']} 15m RSI {rsi_15m:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
-                            send_telegram(
-                                f"⏩ *Entry deferred* — `{s['symbol']}`\n"
-                                f"15m RSI `{rsi_15m:.1f}` > `{ENTRY_REFINE_15M_RSI_MAX}` — wait for 15m pullback"
-                            )
-                            continue
+                    blocked_rsi = _check_15m_rsi_gate(s["symbol"])
+                    if blocked_rsi is not None:
+                        print(f"  ⏩ {s['symbol']} 15m RSI {blocked_rsi:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
+                        send_telegram(
+                            f"⏩ *Entry deferred* — `{s['symbol']}`\n"
+                            f"15m RSI `{blocked_rsi:.1f}` > `{ENTRY_REFINE_15M_RSI_MAX}` — wait for 15m pullback"
+                        )
+                        continue
                     try:
                         trade = _place_and_arm(s)
                         new_trades.append(trade)
@@ -2985,11 +2998,10 @@ def scan() -> None:
             confirm = input("\n  Type CONFIRM to place order(s), or SKIP to skip: ").strip()
             if confirm.upper() == "CONFIRM":
                 for s in signals:
-                    if ENTRY_REFINE_ENABLED:
-                        rsi_15m = _get_15m_rsi(s["symbol"])
-                        if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
-                            print(f"  ⏩ {s['symbol']} 15m RSI {rsi_15m:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
-                            continue
+                    blocked_rsi = _check_15m_rsi_gate(s["symbol"])
+                    if blocked_rsi is not None:
+                        print(f"  ⏩ {s['symbol']} 15m RSI {blocked_rsi:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
+                        continue
                     try:
                         trade = _place_and_arm(s)
                         new_trades.append(trade)

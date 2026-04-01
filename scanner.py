@@ -173,6 +173,7 @@ def save_state(
     signals: list[dict[str, Any]],
     new_trades: Optional[list[dict[str, Any]]] = None,
     portfolio: Optional[dict[str, Any]] = None,
+    fg_regime: Optional[str] = None,
 ) -> None:
     """Save last scan results to state.json for the dashboard."""
     try:
@@ -188,6 +189,7 @@ def save_state(
             state["fg_cache"]      = old.get("fg_cache")                     # preserve F&G cache
             state["portfolio"]     = old.get("portfolio")                  # preserve last portfolio
             state["sent_signals"]  = old.get("sent_signals") or {}         # preserve dedup ledger
+            state["fg_regime"]     = fg_regime or old.get("fg_regime")      # preserve regime state
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         if signals:
@@ -1311,6 +1313,39 @@ def generate_dashboard(state: dict[str, Any]) -> None:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+def _fg_regime(value: int) -> str:
+    """Map a Fear & Greed value (0-100) to a named regime bucket."""
+    if value < 20:
+        return "extreme_fear"
+    elif value < 30:
+        return "fear"
+    elif value < 50:
+        return "neutral"
+    elif value < 75:
+        return "greed"
+    else:
+        return "extreme_greed"
+
+
+def _check_fg_regime_change(fg_value: int, fg_class: str, old_regime: str) -> str:
+    """Fire a Telegram alert if F&G has crossed into a new regime. Returns new regime."""
+    new_regime = _fg_regime(fg_value)
+    if new_regime == old_regime:
+        return new_regime
+
+    messages: dict[str, str] = {
+        "extreme_fear": f"🔴 *F&G: Extreme Fear* (`{fg_value}`)\nMODERATE signals are now *blocked*.",
+        "fear":         f"🟡 *F&G: Fear* (`{fg_value}`)\nLeft Extreme Fear — MODERATE signals *re-enabled*.",
+        "neutral":      f"🟢 *F&G: Neutral* (`{fg_value}`)\nF&G recovering past the Fear zone.",
+        "greed":        f"⚡ *F&G: Greed* (`{fg_value}`)\nMarket turning greedy — tighten risk.",
+        "extreme_greed": f"🚨 *F&G: Extreme Greed* (`{fg_value}`)\nConsider reducing exposure.",
+    }
+    msg = messages.get(new_regime, f"F&G regime changed to {new_regime} ({fg_value})")
+    send_telegram(msg)
+    print(f"  📡 F&G regime change: {old_regime} → {new_regime} ({fg_value} {fg_class})")
+    return new_regime
+
+
 def _escape_md(text: Any) -> str:
     """Escape Telegram Markdown special characters in arbitrary strings (e.g. exceptions)."""
     for ch in ("*", "_", "`", "[", "]"):
@@ -1351,17 +1386,31 @@ def scan() -> None:
     print(f"  SL: -{STOP_LOSS*100:.0f}% | TP: +{TAKE_PROFIT*100:.0f}%")
     print(f"{'='*55}")
 
+    # ── Load persisted state (dedup ledger + regime tracking) ────────────────
+    _scan_state: dict[str, Any] = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                _scan_state = json.load(f)
+        except Exception:
+            pass
+    sent_signals: dict[str, str] = _scan_state.get("sent_signals") or {}
+
     # ── Check for SL outcomes from previous trades ───────────────────────────
     _check_sl_outcomes()
 
     # ── Market context (fetched once per scan) ────────────────────────────────
     fg_value, fg_class = get_fear_greed()
+    old_fg_regime: str = _scan_state.get("fg_regime") or _fg_regime(fg_value)
     btc_ctx = get_btc_context()
     context = {"fg_value": fg_value, "fg_class": fg_class,
                 "btc_rsi": btc_ctx["rsi"], "btc_above_sma": btc_ctx["above_sma"],
                 "btc_price": btc_ctx["price"]}
     print(f"  F&G: {fg_value} ({fg_class})  |  BTC: ${btc_ctx['price']:,.0f}  RSI:{btc_ctx['rsi']}  "
           f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}")
+
+    # ── F&G regime-change alert (fires once per threshold crossing) ───────────
+    new_fg_regime = _check_fg_regime_change(fg_value, fg_class, old_fg_regime)
 
     # ── Portfolio snapshot ────────────────────────────────────────────────────
     portfolio = get_portfolio()
@@ -1373,15 +1422,6 @@ def scan() -> None:
         )
         print(f"  Portfolio: ${total:,.2f} USDC total  |  {asset_str}")
     print(f"{'─'*55}")
-
-    # Load dedup ledger — survives restarts since it lives in state.json
-    sent_signals: dict = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f:
-                sent_signals = json.load(f).get("sent_signals") or {}
-        except Exception:
-            pass
 
     signals = []
     all_results = []
@@ -1429,7 +1469,7 @@ def scan() -> None:
 
     save_state(all_results, [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                                "signal_strength": s["signal_strength"]} for s in signals],
-               portfolio=portfolio)
+               portfolio=portfolio, fg_regime=new_fg_regime)
 
     # ── Telegram scan summary ─────────────────────────────────────────────────
     if all_results:
@@ -1576,7 +1616,7 @@ def scan() -> None:
         if new_trades:
             save_state(all_results, [{"symbol": s["symbol"], "price": s["price"],
                                       "rsi": s["rsi"], "signal_strength": s["signal_strength"]}
-                                     for s in signals], new_trades)
+                                     for s in signals], new_trades, fg_regime=new_fg_regime)
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
         if os.path.exists(STATE_FILE):

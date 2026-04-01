@@ -11,3 +11,5 @@ python-dotenv>=1.0.0     # Load credentials from .env
 
 # ── Development / testing ─────────────────────────────────────
 pytest>=8.0.0            # run: python3 -m pytest tests/
+ruff>=0.4.0              # linter (CI: ruff check)
+mypy>=1.10.0             # type checker (CI: mypy scanner.py backtest.py)

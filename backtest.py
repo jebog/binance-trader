@@ -107,7 +107,7 @@ def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT
                 raise
             print(f"  Retry {attempt+1}/3 for {symbol}: {e}")
             time.sleep(2)
-    raise RuntimeError(f"fetch_klines: all retries exhausted for {symbol}")  # unreachable
+    raise RuntimeError(f"fetch_klines: all retries exhausted for {symbol}")
 
 
 # ── Signal logic (mirrors scanner.py analyze(), no F&G / BTC filter) ──────────

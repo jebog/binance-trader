@@ -1144,3 +1144,127 @@ class TestTradeTimeout:
             would_timeout = age_h >= scanner.TRADE_TIMEOUT_H
         assert not would_timeout
         assert sell_calls == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T3-1 — Break-even Stop
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBreakeven:
+    def _make_trade(self, sl_pct: float = 0.03, status: str = "open") -> dict:
+        return {
+            "symbol":          "ETHUSDC",
+            "time":            datetime.now().isoformat(),
+            "entry":           2000.0,
+            "tp":              2210.0,    # 7% TP
+            "sl":              1940.0,    # 3% SL
+            "qty":             0.1,
+            "order_id":        111,
+            "oco_id":          222,
+            "status":          status,
+            "sl_pct":          sl_pct,
+            "tp_pct":          0.07,
+            "breakeven_moved": False,
+        }
+
+    def _exch_info(self) -> dict:
+        return {"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE",     "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}
+
+    def test_breakeven_triggers_at_atr_threshold(self):
+        """Price ≥ entry*(1 + ATR%) → OCO cancelled and re-placed with SL=entry."""
+        import scanner
+        trade = self._make_trade()
+        # atr_pct = sl_pct / ATR_SL_MULT = 0.03 / 1.5 = 0.02 → trigger = 2000*1.02 = 2040
+        # Set current price above trigger
+        current_price = 2000.0 * (1 + 0.02 * scanner.BREAKEVEN_ATR_MULT) + 1.0
+
+        oco_calls: list = []
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   side_effect=lambda p, d: (oco_calls.append(d) or {"orderListId": 999})), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("builtins.open", MagicMock(return_value=MagicMock(__enter__=lambda s: s, __exit__=MagicMock(return_value=False), read=lambda: "{}"))), \
+             patch("scanner.os.path.exists", return_value=False):
+            result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
+
+        assert result is True
+        assert trade["breakeven_moved"] is True
+        # SL should equal the rounded entry price
+        assert trade["sl"] == pytest.approx(2000.0, rel=1e-4)
+
+    def test_breakeven_not_triggers_below_threshold(self):
+        """Price < trigger → no action, breakeven_moved stays False."""
+        import scanner
+        trade = self._make_trade()
+        current_price = 2000.0 * (1 + 0.02 * scanner.BREAKEVEN_ATR_MULT) - 1.0  # just below
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
+
+        assert result is False
+        assert trade["breakeven_moved"] is False
+
+    def test_breakeven_not_retriggers(self):
+        """breakeven_moved=True → guard exits immediately, no API calls."""
+        import scanner
+        trade = self._make_trade()
+        trade["breakeven_moved"] = True
+
+        delete_calls: list = []
+        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append(p)):
+            result = scanner._check_breakeven(trade, 99999.0, "ETHUSDC")
+
+        assert result is False
+        assert delete_calls == []
+
+    def test_breakeven_cancel_fail_does_not_set_flag(self):
+        """OCO cancel failure → breakeven_moved stays False (retry next scan)."""
+        import scanner
+        trade = self._make_trade()
+        current_price = 2000.0 * 1.05  # well above trigger
+
+        with patch.object(scanner, "signed_delete", side_effect=Exception("timeout")), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
+
+        assert result is False
+        assert trade["breakeven_moved"] is False
+
+    def test_breakeven_oco_fail_sets_no_oco_status(self):
+        """Re-OCO fails after cancel → status=no_oco, breakeven_moved=True, Telegram fires."""
+        import scanner
+        trade = self._make_trade()
+        current_price = 2000.0 * 1.05
+        telegram_msgs: list = []
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   side_effect=Exception("LOT_SIZE")), \
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)), \
+             patch("scanner.os.path.exists", return_value=False):
+            result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
+
+        assert result is True
+        assert trade["status"] == "no_oco"
+        assert trade["breakeven_moved"] is True
+        assert any("BREAKEVEN OCO FAILED" in m for m in telegram_msgs)
+
+    def test_breakeven_sl_set_to_entry(self):
+        """New SL must equal the entry price (rounded to tick)."""
+        import scanner
+        trade = self._make_trade()
+        current_price = 2000.0 * 1.05  # trigger is ~2040 with 2% ATR
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   return_value={"orderListId": 500}), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("scanner.os.path.exists", return_value=False):
+            scanner._check_breakeven(trade, current_price, "ETHUSDC")
+
+        # SL should be entry rounded to tick=0.01 → 2000.0 exactly
+        assert trade["sl"] == pytest.approx(2000.0, rel=1e-6)

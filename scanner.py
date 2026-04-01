@@ -48,6 +48,7 @@ from config import (  # noqa: E402
     WEBHOOK_URL,
     PAIRS, CAPITAL,
     MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
+    DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -302,6 +303,47 @@ def calc_sma(closes: list[float], period: int = 20) -> Optional[float]:
         return None  # caller must handle — don't silently return price (price > price = False)
     return sum(closes[-period:]) / period
 
+def detect_bullish_divergence(
+    closes: list[float],
+    rsi_series: list[float],
+    lookback: int = 20,
+    swing_depth: float = 0.005,
+) -> Optional[bool]:
+    """Detect bullish RSI divergence in the last `lookback` candles.
+
+    Finds 3-bar local minima where the middle bar is at least `swing_depth` below
+    both neighbours. With < 2 swing lows the pattern is ambiguous → None (allow).
+
+    Returns:
+      True  — price lower low + RSI higher low (classic bullish divergence → allow)
+      False — price lower low + RSI lower low  (confirmed weakness → block)
+      None  — ambiguous (< 2 swings, or price not making lower lows) → allow
+    """
+    win_c = closes[-lookback:]
+    win_r = rsi_series[-lookback:]
+    n = len(win_c)
+
+    swings: list[int] = []
+    for i in range(1, n - 1):
+        c_prev, c_curr, c_next = win_c[i - 1], win_c[i], win_c[i + 1]
+        if (c_curr < c_prev and c_curr < c_next
+                and (c_prev - c_curr) / c_prev >= swing_depth
+                and (c_next - c_curr) / c_next >= swing_depth):
+            swings.append(i)
+
+    if len(swings) < 2:
+        return None   # too few swings — ambiguous, allow signal
+
+    i1, i2 = swings[-2], swings[-1]
+    price_lower = win_c[i2] < win_c[i1]
+    rsi_higher  = win_r[i2] > win_r[i1]
+
+    if price_lower and rsi_higher:
+        return True   # bullish divergence
+    if price_lower and not rsi_higher:
+        return False  # confirmed weakness
+    return None       # no divergence pattern — allow
+
 # ── Market context ───────────────────────────────────────────────────────────
 def get_fear_greed() -> tuple[int, str, bool]:
     """Fetch Crypto Fear & Greed index — with state.json cache (valid 25h).
@@ -380,6 +422,17 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
 
     price     = closes[-1]
     rsi       = calc_rsi(closes)
+
+    # ── RSI divergence series (T2-2) ─────────────────────────────────────────
+    # Compute per-candle RSI values for the lookback window with Wilder warm-up buffer.
+    rsi_series: Optional[list[float]] = None
+    div_result: Optional[bool] = None
+    if DIVERGENCE_ENABLED:
+        lb  = DIVERGENCE_LOOKBACK + 14 + 5   # +14 Wilder warm-up, +5 margin
+        win = closes[-lb:]
+        rsi_series = [calc_rsi(win[:i]) for i in range(14, len(win) + 1)]
+        rsi_series = rsi_series[-DIVERGENCE_LOOKBACK:]
+
     sma20     = calc_sma(closes, 20)
     above_sma = (sma20 is not None) and (price > sma20)
     avg_vol   = sum(vols[:-1]) / (len(vols) - 1) if len(vols) > 1 else 0
@@ -412,6 +465,17 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     fg        = context["fg_value"]        # 0-100
     btc_above = context["btc_above_sma"]
 
+    # ── RSI divergence gate (T2-2) ────────────────────────────────────────────
+    # Block STRONG/MODERATE when price AND RSI both make lower lows (confirmed weakness).
+    # EXTREME bypasses — deep panic is worth catching regardless of recent structure.
+    divergence_ok = True
+    if DIVERGENCE_ENABLED and rsi_series and len(rsi_series) >= 4:
+        div_result = detect_bullish_divergence(
+            closes, rsi_series, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
+        )
+        if div_result is False:
+            divergence_ok = False   # confirmed weakness — block STRONG and MODERATE
+
     # ── Signal tiers (1h thresholds) ─────────────────────────────────────────
     # EXTREME: deep oversold — always qualifies regardless of market regime.
     # Two sub-cases for sizing (handled in scan()):
@@ -422,7 +486,7 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
 
     # STRONG: solid oversold + trend alignment + not in euphoria
     # Blocked only if daily is clearly bearish (daily downtrend confirmed)
-    strong_signal = rsi < 32 and above_sma and fg < 75 and not daily_bearish
+    strong_signal = rsi < 32 and above_sma and fg < 75 and not daily_bearish and divergence_ok
 
     # MODERATE: requires clean setup + healthy market regime + daily not bearish
     moderate_signal = (
@@ -430,6 +494,7 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         and fg < 60          # skip when market is greedy
         and btc_above        # skip when BTC in downtrend
         and daily_bullish    # requires confirmed daily uptrend for MODERATE
+        and divergence_ok    # skip when RSI confirms weakness (T2-2)
     )
 
     ticker     = get("/api/v3/ticker/24hr", {"symbol": symbol})
@@ -457,6 +522,7 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         "buy_signal":       extreme_signal or strong_signal or moderate_signal,
         "signal_strength":  strength,
         "extreme_quality":  extreme_quality,
+        "divergence":       div_result,   # True/False/None; None = ambiguous/disabled
         "closed_klines":    closed,  # passed to place_buy_order for ATR-based SL/TP
     }
 

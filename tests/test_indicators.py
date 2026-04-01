@@ -11,7 +11,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 # ── Import pure functions directly (no side effects on import) ────────────────
-from scanner import calc_rsi, calc_sma, calc_atr
+from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence
 from backtest import (
     calc_rsi as bt_calc_rsi,
     calc_sma as bt_calc_sma,
@@ -399,7 +399,7 @@ class TestAnalyzeSignalTiers:
         expected_keys = {
             "symbol", "price", "rsi", "daily_rsi", "sma20", "above_sma",
             "vol_surge", "momentum", "change24h", "buy_signal",
-            "signal_strength", "extreme_quality", "closed_klines",
+            "signal_strength", "extreme_quality", "divergence", "closed_klines",
         }
         assert set(result.keys()) == expected_keys
 
@@ -518,3 +518,74 @@ class TestComputeStats:
         trades = [self._trade("TP" if p > 0 else "SL", p) for p in pnls]
         s = compute_stats(trades)
         assert s["net_pct"] == pytest.approx(sum(pnls), rel=1e-3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# detect_bullish_divergence (T2-2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_divergence_data(
+    price_lows: list[float],
+    rsi_lows: list[float],
+    n: int = 20,
+) -> tuple[list[float], list[float]]:
+    """Build closes and rsi_series lists with swing lows embedded at fixed positions."""
+    # Place swing lows at positions 5 and 15 in a 20-candle window
+    closes     = [100.0] * n
+    rsi_series = [50.0]  * n
+    # Swing 1 at index 5: lower than neighbors by >0.5%
+    closes[4], closes[5], closes[6]         = price_lows[0] * 1.01, price_lows[0], price_lows[0] * 1.01
+    rsi_series[4], rsi_series[5], rsi_series[6] = rsi_lows[0] + 1,    rsi_lows[0],  rsi_lows[0] + 1
+    # Swing 2 at index 15
+    closes[14], closes[15], closes[16]          = price_lows[1] * 1.01, price_lows[1], price_lows[1] * 1.01
+    rsi_series[14], rsi_series[15], rsi_series[16] = rsi_lows[1] + 1,    rsi_lows[1],  rsi_lows[1] + 1
+    return closes, rsi_series
+
+
+class TestDetectBullishDivergence:
+    def test_lower_price_lower_rsi_returns_false(self):
+        # Price lower low + RSI lower low = confirmed weakness → False (block)
+        closes, rsi_series = _make_divergence_data(
+            price_lows=[99.0, 97.0],  # 97 < 99 → lower low
+            rsi_lows=[35.0, 30.0],    # 30 < 35 → lower RSI low (no divergence)
+        )
+        assert detect_bullish_divergence(closes, rsi_series) is False
+
+    def test_lower_price_higher_rsi_returns_true(self):
+        # Price lower low + RSI higher low = bullish divergence → True (allow)
+        closes, rsi_series = _make_divergence_data(
+            price_lows=[99.0, 97.0],  # 97 < 99 → lower price low
+            rsi_lows=[30.0, 35.0],    # 35 > 30 → higher RSI low (divergence!)
+        )
+        assert detect_bullish_divergence(closes, rsi_series) is True
+
+    def test_insufficient_swings_returns_none(self):
+        # Flat prices → no local minima → ambiguous → None
+        closes     = [100.0] * 20
+        rsi_series = [50.0]  * 20
+        assert detect_bullish_divergence(closes, rsi_series) is None
+
+    def test_only_one_swing_returns_none(self):
+        # Only one swing low found → can't compare → None
+        closes     = [100.0] * 20
+        rsi_series = [50.0]  * 20
+        closes[9], closes[10], closes[11] = 100.5, 99.0, 100.5   # one dip, < 0.5% depth
+        assert detect_bullish_divergence(closes, rsi_series) is None
+
+    def test_price_higher_low_returns_none(self):
+        # Price making higher lows → not a lower-low pattern → None (allow)
+        closes, rsi_series = _make_divergence_data(
+            price_lows=[95.0, 97.0],  # 97 > 95 → higher price low
+            rsi_lows=[30.0, 28.0],
+        )
+        assert detect_bullish_divergence(closes, rsi_series) is None
+
+    def test_swing_depth_threshold_respected(self):
+        # A dip of exactly 0.3% (< default 0.5%) is NOT counted as a swing
+        closes     = [100.0] * 20
+        rsi_series = [50.0]  * 20
+        # 0.3% dip at position 5
+        closes[4], closes[5], closes[6] = 100.0, 99.7, 100.0
+        # 0.3% dip at position 15
+        closes[14], closes[15], closes[16] = 100.0, 99.7, 100.0
+        assert detect_bullish_divergence(closes, rsi_series, swing_depth=0.005) is None

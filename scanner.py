@@ -6,6 +6,7 @@ Config: ETH/ADA/DOGE/BNB (USDC pairs) | $200/trade | SL -3% | TP +7.5%
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import json
@@ -22,6 +23,23 @@ from typing import Any, Optional
 SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE  = os.path.join(SCANNER_DIR, "state.json")
 LOG_FILE    = os.path.join(SCANNER_DIR, "scanner.log")
+
+# ── Structured logger ────────────────────────────────────────────────────────
+# Available to all scan functions. TUI can attach its own handler via
+# logging.getLogger("scanner").addHandler(...).
+logger = logging.getLogger("scanner")
+if not logger.handlers:
+    logger.setLevel(logging.DEBUG)
+    _fh = logging.FileHandler(LOG_FILE)
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(_fh)
+    # Console handler only in CLI mode (TUI has its own RichLog)
+    if os.environ.get("SCANNER_LOG_CONSOLE", "0") == "1" or not os.environ.get("TEXTUAL_APP"):
+        _ch = logging.StreamHandler()
+        _ch.setLevel(logging.INFO)
+        _ch.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(_ch)
 
 import sys  # noqa: E402
 
@@ -914,7 +932,7 @@ def save_state(
 BASE_URL = "https://api.binance.com"
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
-def get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
+def get(path: str, params: Optional[dict[str, Any]] = None, _retries: int = 1) -> Any:
     url = BASE_URL + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -922,8 +940,15 @@ def get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
         "User-Agent": "binance-spot/1.1.0 (Scanner)",
         "X-MBX-APIKEY": API_KEY,
     })
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())
+    for attempt in range(_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < _retries:
+                time.sleep(1)
+                continue
+            raise
 
 def signed_get(path: str, params: dict[str, Any]) -> Any:
     params["timestamp"] = int(time.time() * 1000)
@@ -1969,12 +1994,27 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
     """Check closed OCO orders — if stop leg filled, trigger SL cooldown.
     Also checks for partial TP1 fills (T2-4) on trades with tp1_order_id.
     Also handles trade timeout (T3-2) — force-exit positions open > TRADE_TIMEOUT_H.
+
+    Uses a scan-lock sentinel (kv 'sl_check_lock') to prevent double-processing
+    when TUI and cron run simultaneously. Lock expires after 60s.
     """
     _own_conn = conn is None
     try:
         if _own_conn:
             conn = db_connect()
             db_init(conn)
+        # Scan lock: skip if another process checked within last 60s
+        _lock_ts = get_kv(conn, "sl_check_lock") or ""
+        if _lock_ts:
+            try:
+                _lock_age = (datetime.now() - datetime.fromisoformat(_lock_ts)).total_seconds()
+                if _lock_age < 60:
+                    if _own_conn:
+                        conn.close()
+                    return
+            except (ValueError, TypeError):
+                pass
+        set_kv(conn, "sl_check_lock", datetime.now().isoformat())
         active_trades = get_open_trades(conn)
     except Exception as _e:
         print(f"  ⚠ _check_sl_outcomes: DB read failed: {_e}")
@@ -3707,6 +3747,32 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
             set_kv(_scan_conn, "last_digest_date", str(now.date()))
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
+
+    # ── Health sentinel — monitoring can poll this to verify scans are running ──
+    set_kv(_scan_conn, "last_scan_ok", datetime.now().isoformat())
+
+
+def get_health(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
+    """Return scanner health status. Useful for monitoring / alerting."""
+    _own = conn is None
+    if _own:
+        conn = db_connect()
+        db_init(conn)
+    last_ok = get_kv(conn, "last_scan_ok") or ""
+    last_scan = get_kv(conn, "last_scan") or ""
+    stuck = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE status IN ('timeout_sell_failed', 'no_oco')"
+    ).fetchone()[0]
+    if _own:
+        conn.close()
+    age_s = (datetime.now() - datetime.fromisoformat(last_ok)).total_seconds() if last_ok else None
+    return {
+        "last_scan_ok": last_ok,
+        "last_scan": last_scan,
+        "age_seconds": round(age_s, 1) if age_s is not None else None,
+        "healthy": age_s is not None and age_s < 3600,  # stale if no scan in 1h
+        "stuck_positions": stuck,
+    }
 
 
 if __name__ == "__main__":

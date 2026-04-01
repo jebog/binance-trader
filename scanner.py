@@ -3208,6 +3208,145 @@ def _pair_score(symbol: str, trades: list[dict[str, Any]]) -> float:
     return win_rate * profit_factor
 
 
+# ── Shared scan helpers (used by both scan() and TUI) ────────────────────────
+
+def apply_correlation_cap(
+    candidates: list[dict[str, Any]],
+    conn: Optional[sqlite3.Connection] = None,
+) -> tuple[list[dict[str, Any]], list[str], str]:
+    """Apply correlation cap: when ≥3 candidates fire simultaneously, keep top 1.
+
+    Returns (filtered_candidates, dropped_symbols, reason_str).
+    If <3 candidates, returns (candidates, [], "").
+    """
+    if len(candidates) < 3:
+        return candidates, [], ""
+    if PAIR_SCORE_ENABLED:
+        _score_trades: list[dict[str, Any]] = []
+        try:
+            _c = conn if conn is not None else db_connect()
+            _score_trades = get_all_trades(_c)
+            if conn is None:
+                _c.close()
+        except Exception:
+            pass
+        _scores = {s["symbol"]: _pair_score(s["symbol"], _score_trades) for s in candidates}
+        candidates.sort(key=lambda s: _scores[s["symbol"]], reverse=True)
+        reason = f"best score ({_scores[candidates[0]['symbol']]:.2f})"
+    else:
+        candidates.sort(key=lambda s: s["rsi"])
+        reason = "lowest RSI"
+    dropped = [s["symbol"] for s in candidates[1:]]
+    return candidates[:1], dropped, reason
+
+
+def build_market_context() -> dict[str, Any]:
+    """Fetch F&G, BTC context, and BTC dominance — returns full context dict.
+
+    Shared between scan() and TUI scan worker to avoid drift.
+    """
+    fg_value, fg_class, fg_fresh = get_fear_greed()
+    btc_ctx = get_btc_context()
+    btc_dom = get_btc_dominance() if BTC_DOM_ENABLED else None
+    btc_dom_rising = _is_btc_dom_rising(btc_dom) if BTC_DOM_ENABLED else False
+    return {
+        "fg_value":      fg_value,
+        "fg_class":      fg_class,
+        "fg_fresh":      fg_fresh,
+        "btc_rsi":       btc_ctx["rsi"],
+        "btc_above_sma": btc_ctx["above_sma"],
+        "btc_price":     btc_ctx["price"],
+        "btc_dom":       btc_dom,
+        "btc_dom_rising": btc_dom_rising,
+    }
+
+
+def run_position_management(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Run break-even (T3-1) and progressive trailing (T4-4) checks on open trades.
+
+    Shared between scan() and TUI scan worker.
+    """
+    if BREAKEVEN_ENABLED:
+        try:
+            _c = conn if conn is not None else db_connect()
+            _be_trades = get_open_trades(_c)
+            if conn is None:
+                _c.close()
+        except Exception:
+            _be_trades = []
+        for _be_trade in _be_trades:
+            try:
+                _be_sym = _be_trade["symbol"]
+                _be_cp = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
+                _check_breakeven(_be_trade, _be_cp, _be_sym, conn)
+            except Exception as _be_e:
+                print(f"  ⚠ Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
+
+    if PROGRESSIVE_TRAILING_ENABLED:
+        try:
+            _c = conn if conn is not None else db_connect()
+            _pt_trades = get_open_trades(_c)
+            if conn is None:
+                _c.close()
+        except Exception:
+            _pt_trades = []
+        for _pt_trade in _pt_trades:
+            if not _pt_trade.get("breakeven_moved"):
+                continue
+            try:
+                _pt_sym = _pt_trade["symbol"]
+                _pt_cp = float(get("/api/v3/ticker/price", {"symbol": _pt_sym})["price"])
+                _check_progressive_trailing(_pt_trade, _pt_cp, _pt_sym, conn)
+            except Exception as _pt_e:
+                print(f"  ⚠ Progressive trailing check failed for {_pt_trade.get('symbol', '?')}: {_pt_e}")
+
+
+def run_split_entry_checks(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Check pending split-entry second legs (T2-1): fire or expire.
+
+    Shared between scan() and TUI scan worker.
+    """
+    if not SPLIT_ENTRY_ENABLED:
+        return
+    pending_entries = _load_pending_second_entries(conn)
+    for sym, pending in list(pending_entries.items()):
+        try:
+            entry_age_h = (
+                datetime.now() - datetime.fromisoformat(pending["time"])
+            ).total_seconds() / 3600
+            if entry_age_h > SPLIT_ENTRY_TTL_H:
+                _clear_pending_second_entry(sym, conn)
+                send_telegram(
+                    f"⏱ *Split entry expired* — `{sym}` pending second leg cleared "
+                    f"after {SPLIT_ENTRY_TTL_H}h. No second buy placed."
+                )
+                continue
+            cp_resp = get("/api/v3/ticker/price", {"symbol": sym})
+            cp = float(cp_resp["price"])
+            trigger = pending["first_fill"] * (1 - pending["atr_pct"] * SPLIT_ENTRY_ATR_MULT)
+            print(f"  Split entry {sym}: current=${cp:.4f} trigger=${trigger:.4f} "
+                  f"(age {entry_age_h:.1f}h / {SPLIT_ENTRY_TTL_H}h TTL)")
+            if cp <= trigger:
+                klines = get("/api/v3/klines", {"symbol": sym, "interval": INTERVAL,
+                                                 "limit": KLINE_LIMIT})
+                trade = _place_split_second_entry(sym, pending, cp, klines[:-1])
+                if trade is None:
+                    print(f"  ↩ Split entry cancel failed for {sym} — will retry next scan")
+                elif trade.get("status") == "critical_fail":
+                    _clear_pending_second_entry(sym, conn)
+                else:
+                    _clear_pending_second_entry(sym, conn)
+                    try:
+                        _c = conn if conn is not None else db_connect()
+                        insert_trade(_c, trade)
+                        if conn is None:
+                            _c.close()
+                    except Exception as _e:
+                        print(f"  ⚠ Could not persist split-entry trade: {_e}")
+        except Exception as _split_e:
+            print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
+
+
 # ── Main scan ────────────────────────────────────────────────────────────────
 def scan() -> None:
     print(f"\n--- {datetime.now().strftime('%a. %d %b %Y %H:%M:%S')} ---")
@@ -3239,100 +3378,24 @@ def scan() -> None:
     except Exception:
         pass
 
-    # ── Split-entry: check pending second legs (T2-1) ─────────────────────────
-    # Run before the main scan so second-leg fills are treated as open positions
-    # before the correlation cap and per-symbol guards run.
-    if SPLIT_ENTRY_ENABLED:
-        pending_entries = _load_pending_second_entries(_scan_conn)
-        for sym, pending in list(pending_entries.items()):
-            try:
-                entry_age_h = (
-                    datetime.now() - datetime.fromisoformat(pending["time"])
-                ).total_seconds() / 3600
-                if entry_age_h > SPLIT_ENTRY_TTL_H:
-                    _clear_pending_second_entry(sym, _scan_conn)
-                    send_telegram(
-                        f"⏱ *Split entry expired* — `{sym}` pending second leg cleared "
-                        f"after {SPLIT_ENTRY_TTL_H}h. No second buy placed."
-                    )
-                    continue
-                cp_resp = get("/api/v3/ticker/price", {"symbol": sym})
-                cp = float(cp_resp["price"])
-                trigger = pending["first_fill"] * (1 - pending["atr_pct"] * SPLIT_ENTRY_ATR_MULT)
-                print(f"  Split entry {sym}: current=${cp:.4f} trigger=${trigger:.4f} "
-                      f"(age {entry_age_h:.1f}h / {SPLIT_ENTRY_TTL_H}h TTL)")
-                if cp <= trigger:
-                    klines = get("/api/v3/klines", {"symbol": sym, "interval": INTERVAL,
-                                                     "limit": KLINE_LIMIT})
-                    trade = _place_split_second_entry(sym, pending, cp, klines[:-1])
-                    if trade is None:
-                        # Cancel failed — pending entry preserved so next scan retries
-                        print(f"  ↩ Split entry cancel failed for {sym} — will retry next scan")
-                    elif trade.get("status") == "critical_fail":
-                        # Cancel succeeded but second buy failed → unrecoverable, clear pending
-                        _clear_pending_second_entry(sym, _scan_conn)
-                    else:
-                        # Success (or no_oco status — position exists, just unprotected)
-                        _clear_pending_second_entry(sym, _scan_conn)
-                        # Persist combined trade immediately so the correlation cap
-                        # and open-position guard count it in this scan.
-                        try:
-                            insert_trade(_scan_conn, trade)
-                        except Exception as _e:
-                            print(f"  ⚠ Could not persist split-entry trade: {_e}")
-            except Exception as _split_e:
-                print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
-
-    # ── Break-even stop: check open trades (T3-1) ───────────────────────────────
-    # Fetch current price for each open trade; if price ≥ entry + 1×ATR, move SL to entry.
-    if BREAKEVEN_ENABLED:
-        try:
-            _be_trades = get_open_trades(_scan_conn)
-        except Exception:
-            _be_trades = []
-        for _be_trade in _be_trades:
-            try:
-                _be_sym = _be_trade["symbol"]
-                _be_cp  = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
-                _check_breakeven(_be_trade, _be_cp, _be_sym, _scan_conn)
-            except Exception as _be_e:
-                print(f"  ⚠ Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
-
-    # ── Progressive trailing: tighten stop at each ATR milestone (T4-4) ─────────
-    # Fires only for breakeven-armed trades; each stage cancels+replaces the OCO
-    # with a tighter trailing delta. Mirrors the break-even phase above.
-    if PROGRESSIVE_TRAILING_ENABLED:
-        try:
-            _pt_trades = get_open_trades(_scan_conn)
-        except Exception:
-            _pt_trades = []
-        for _pt_trade in _pt_trades:
-            if not _pt_trade.get("breakeven_moved"):
-                continue   # micro-opt: skip trades where break-even hasn't fired
-            try:
-                _pt_sym = _pt_trade["symbol"]
-                _pt_cp  = float(get("/api/v3/ticker/price", {"symbol": _pt_sym})["price"])
-                _check_progressive_trailing(_pt_trade, _pt_cp, _pt_sym, _scan_conn)
-            except Exception as _pt_e:
-                print(f"  ⚠ Progressive trailing check failed for {_pt_trade.get('symbol', '?')}: {_pt_e}")
+    # ── Split-entry / break-even / progressive trailing (shared helpers) ────────
+    run_split_entry_checks(_scan_conn)
+    run_position_management(_scan_conn)
 
     # ── Market context (fetched once per scan) ────────────────────────────────
-    fg_value, fg_class, fg_fresh = get_fear_greed()
+    context = build_market_context()
+    fg_value   = context["fg_value"]
+    fg_class   = context["fg_class"]
+    fg_fresh   = context["fg_fresh"]
+    btc_dom    = context["btc_dom"]
     # Bootstrap old_regime to current value on first run to suppress spurious alert
     try:
         old_fg_regime: str = get_kv(_scan_conn, "fg_regime") or _fg_regime(fg_value)
     except Exception:
         old_fg_regime = _fg_regime(fg_value)
-    btc_ctx = get_btc_context()
-    btc_dom        = get_btc_dominance() if BTC_DOM_ENABLED else None
-    btc_dom_rising = _is_btc_dom_rising(btc_dom) if BTC_DOM_ENABLED else False
-    context = {"fg_value": fg_value, "fg_class": fg_class,
-                "btc_rsi": btc_ctx["rsi"], "btc_above_sma": btc_ctx["above_sma"],
-                "btc_price": btc_ctx["price"],
-                "btc_dom": btc_dom, "btc_dom_rising": btc_dom_rising}
-    dom_str = f"{btc_dom:.1f}%{'↑' if btc_dom_rising else ''}" if btc_dom is not None else "n/a"
-    print(f"  F&G: {fg_value} ({fg_class})  |  BTC: ${btc_ctx['price']:,.0f}  RSI:{btc_ctx['rsi']}  "
-          f"SMA:{'above' if btc_ctx['above_sma'] else 'below'}  |  BTC.D:{dom_str}")
+    dom_str = f"{btc_dom:.1f}%{'↑' if context['btc_dom_rising'] else ''}" if btc_dom is not None else "n/a"
+    print(f"  F&G: {fg_value} ({fg_class})  |  BTC: ${context['btc_price']:,.0f}  RSI:{context['btc_rsi']}  "
+          f"SMA:{'above' if context['btc_above_sma'] else 'below'}  |  BTC.D:{dom_str}")
     # Save btc_dom_prev for the *next* scan's comparison.
     if BTC_DOM_ENABLED and btc_dom is not None:
         try:
@@ -3383,26 +3446,10 @@ def scan() -> None:
         except Exception as e:
             print(f"  ✗ {symbol}: Error — {e}")
 
-    # ── Phase 2: Correlation cap (on raw candidates, BEFORE per-symbol guards) ─
-    # ETH/ADA/DOGE/BNB/SOL/XRP are 0.75–0.95 BTC-correlated: ≥3 simultaneous
-    # signals = amplified BTC exposure, not independent opportunities. Cap at 1.
-    if len(candidates) >= 3:
-        if PAIR_SCORE_ENABLED:
-            _score_trades: list[dict[str, Any]] = []
-            try:
-                _score_trades = get_all_trades(_scan_conn)
-            except Exception as _se:
-                print(f"  ⚠ Pair score: state read failed ({_se}) — falling back to neutral 0.5")
-            # Cache scores to avoid re-computing during sort and for log message
-            _scores = {s["symbol"]: _pair_score(s["symbol"], _score_trades) for s in candidates}
-            candidates.sort(key=lambda s: _scores[s["symbol"]], reverse=True)
-            reason = f"best score ({_scores[candidates[0]['symbol']]:.2f})"
-        else:
-            candidates.sort(key=lambda s: s["rsi"])
-            reason = "lowest RSI"
-        dropped = [s["symbol"] for s in candidates[1:]]
-        candidates = candidates[:1]
-        print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} ({reason}), "
+    # ── Phase 2: Correlation cap (shared helper) ──────────────────────────────
+    candidates, dropped, cap_reason = apply_correlation_cap(candidates, _scan_conn)
+    if dropped:
+        print(f"\n  ⚠ Correlation cap — keeping {candidates[0]['symbol']} ({cap_reason}), "
               f"dropping: {', '.join(dropped)}")
 
     # ── Circuit breaker: halt new orders if drawdown ≥ MAX_DRAWDOWN_PCT ─────────

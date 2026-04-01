@@ -54,6 +54,7 @@ from config import (  # noqa: E402
     SPLIT_ENTRY_ENABLED, SPLIT_ENTRY_ATR_MULT, SPLIT_ENTRY_TTL_H,
     TRADE_TIMEOUT_ENABLED, TRADE_TIMEOUT_H,
     BREAKEVEN_ENABLED, BREAKEVEN_ATR_MULT,
+    VOL_SIZING_ENABLED, TARGET_RISK_PCT, VOL_SIZING_MIN, VOL_SIZING_MAX,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -2179,15 +2180,28 @@ def _escape_md(text: Any) -> str:
 def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
     """Central capital-sizing rule — single source of truth.
 
-    EXTREME + quality (above SMA, F&G<40) → CAPITAL/2 (first split leg; second fires at ATR trigger)
-    EXTREME crash (falling knife)          → CAPITAL/2 (falling-knife cap)
-    STRONG in weak BTC (RSI<35)            → CAPITAL/2
-    Everything else                        → full CAPITAL
+    With VOL_SIZING_ENABLED=True (T3-4):
+      Continuous Kelly-style formula: CAPITAL × TARGET_RISK_PCT / ATR%.
+      Clamped to [CAPITAL×VOL_SIZING_MIN, CAPITAL×VOL_SIZING_MAX].
+      EXTREME signals additionally capped at CAPITAL×0.5 for split-entry.
+
+    Fallback (VOL_SIZING_ENABLED=False or ATR unavailable):
+      EXTREME                → CAPITAL/2
+      STRONG + weak BTC      → CAPITAL/2
+      Everything else        → CAPITAL
     """
-    if s["signal_strength"] == "EXTREME" and s.get("extreme_quality"):
-        return CAPITAL / 2   # first split leg (second leg fires at ATR trigger)
+    if VOL_SIZING_ENABLED and ATR_SL_MULT > 0:
+        sl_pct, _ = _estimate_sl_tp_pct(s)
+        atr_pct = sl_pct / ATR_SL_MULT
+        if atr_pct > 0:
+            raw   = CAPITAL * TARGET_RISK_PCT / atr_pct
+            sized = max(CAPITAL * VOL_SIZING_MIN, min(CAPITAL * VOL_SIZING_MAX, raw))
+            if s["signal_strength"] == "EXTREME":
+                sized = min(sized, CAPITAL * 0.5)  # split-entry cap
+            return round(sized, 2)
+    # Fallback: preserve ad-hoc rules when vol sizing is off or ATR unavailable
     if s["signal_strength"] == "EXTREME":
-        return CAPITAL / 2   # crash/falling-knife path
+        return CAPITAL / 2
     if s["signal_strength"] == "STRONG" and context["btc_rsi"] < 35:
         return CAPITAL / 2
     return CAPITAL

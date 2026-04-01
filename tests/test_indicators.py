@@ -536,19 +536,95 @@ class TestCalcCapital:
         assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL / 2
 
     def test_strong_weak_btc_half_capital(self):
+        # Fallback path (VOL_SIZING_ENABLED=False): STRONG in weak BTC → CAPITAL/2
+        import scanner
         s = {"signal_strength": "STRONG", "extreme_quality": False}
-        assert self.fn(s, {"btc_rsi": 34.9}) == self.CAPITAL / 2
+        with patch("scanner.VOL_SIZING_ENABLED", False):
+            assert self.fn(s, {"btc_rsi": 34.9}) == self.CAPITAL / 2
 
     def test_strong_normal_btc_full_capital(self):
+        # Fallback path: STRONG with normal BTC → full CAPITAL
+        import scanner
         s = {"signal_strength": "STRONG", "extreme_quality": False}
-        assert self.fn(s, {"btc_rsi": 35.0}) == self.CAPITAL
+        with patch("scanner.VOL_SIZING_ENABLED", False):
+            assert self.fn(s, {"btc_rsi": 35.0}) == self.CAPITAL
 
     def test_moderate_always_full_capital(self):
-        # MODERATE takes neither the EXTREME nor the STRONG branch → always full capital
-        # even when BTC RSI is below the 35 threshold that would halve a STRONG order.
+        # Fallback path: MODERATE → full CAPITAL regardless of BTC RSI
+        import scanner
         s = {"signal_strength": "MODERATE", "extreme_quality": False}
-        assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL  # weak BTC irrelevant for MODERATE
-        assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL  # same result with neutral BTC
+        with patch("scanner.VOL_SIZING_ENABLED", False):
+            assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL
+            assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T3-4 — Volatility-Adjusted Capital Sizing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestVolSizing:
+    """Unit tests for _calc_capital() with VOL_SIZING_ENABLED=True."""
+
+    def _signal(self, strength: str = "STRONG", atr: float = 1.0, price: float = 100.0) -> dict:
+        """Build a minimal signal dict with synthetic closed_klines to drive ATR."""
+        import scanner
+        # Construct klines where the last ATR ≈ atr (high-low range ≈ atr per candle)
+        # calc_atr uses (high - low) average over 14 periods.
+        klines = []
+        for _ in range(20):
+            klines.append([0, str(price), str(price + atr), str(price - atr), str(price), "1000"])
+        return {
+            "signal_strength": strength,
+            "extreme_quality": strength == "EXTREME",
+            "closed_klines":   klines,
+            "price":           price,
+        }
+
+    def test_high_atr_reduces_capital(self):
+        """Wide ATR → formula shrinks capital (down to VOL_SIZING_MIN floor)."""
+        import scanner
+        # ATR/price = 6% → sl_pct = min(0.06, 0.06*1.5=0.09) = 0.06 (clamped to ATR_SL_MAX)
+        # atr_pct for sizing = 0.06 / 1.5 = 0.04
+        # raw = 200 * 0.015 / 0.04 = 75.0
+        # sized = max(200*0.25=50, min(200, 75)) = 75
+        s = self._signal(atr=6.0, price=100.0)
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital < scanner.CAPITAL
+        assert capital >= scanner.CAPITAL * scanner.VOL_SIZING_MIN
+
+    def test_low_atr_caps_at_max(self):
+        """Tiny ATR → formula would give > CAPITAL → capped at CAPITAL."""
+        import scanner
+        # Very small ATR → raw = huge → capped at VOL_SIZING_MAX × CAPITAL
+        s = self._signal(atr=0.01, price=100.0)
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital == pytest.approx(scanner.CAPITAL * scanner.VOL_SIZING_MAX, rel=1e-3)
+
+    def test_extreme_signal_capped_at_half(self):
+        """EXTREME signal: vol-sized result is further capped at CAPITAL×0.5."""
+        import scanner
+        # Use a moderate ATR that would otherwise give ~CAPITAL
+        s = self._signal(strength="EXTREME", atr=1.0, price=100.0)
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital <= scanner.CAPITAL * 0.5
+
+    def test_vol_sizing_floor_applied(self):
+        """Even with extreme ATR, capital never falls below VOL_SIZING_MIN×CAPITAL."""
+        import scanner
+        # Very high ATR → floor kicks in
+        s = self._signal(atr=100.0, price=100.0)  # ATR > price is extreme but tests the floor
+        capital = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital >= scanner.CAPITAL * scanner.VOL_SIZING_MIN
+
+    def test_vol_sizing_disabled_uses_fallback(self):
+        """With VOL_SIZING_ENABLED=False: old ad-hoc rules apply."""
+        import scanner
+        s = self._signal(strength="STRONG", atr=1.0, price=100.0)
+        with patch("scanner.VOL_SIZING_ENABLED", False):
+            capital_weak_btc = scanner._calc_capital(s, {"btc_rsi": 34.9})
+            capital_norm_btc = scanner._calc_capital(s, {"btc_rsi": 50.0})
+        assert capital_weak_btc == scanner.CAPITAL / 2
+        assert capital_norm_btc == scanner.CAPITAL
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

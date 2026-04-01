@@ -69,6 +69,12 @@ TRADE_TIMEOUT_H       = 72     # force-exit any position open longer than 72h
 BREAKEVEN_ENABLED  = True
 BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + BREAKEVEN_ATR_MULT × atr_pct)
 
+# ── Volatility-adjusted capital sizing (T3-4) ─────────────────────────────────
+VOL_SIZING_ENABLED = True
+TARGET_RISK_PCT    = 0.015  # target 1.5% portfolio risk per trade (= 1×ATR as SL floor)
+VOL_SIZING_MIN     = 0.25   # floor: never below 25% of CAPITAL
+VOL_SIZING_MAX     = 1.00   # ceiling: never above 100% of CAPITAL
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

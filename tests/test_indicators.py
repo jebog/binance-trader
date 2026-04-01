@@ -559,23 +559,15 @@ class TestIsBtcDomRising:
     """
 
     def _run(self, current, prev_value=None):
-        import scanner, json as _json, builtins
+        import scanner, json as _json
+        from unittest.mock import mock_open
 
         state = {}
         if prev_value is not None:
             state["btc_dom_prev"] = prev_value
 
-        fake_open = MagicMock()
-        fake_open.return_value.__enter__ = lambda s: s
-        fake_open.return_value.__exit__ = MagicMock(return_value=False)
-        fake_open.return_value.read = MagicMock(return_value=_json.dumps(state))
-        fake_open.return_value.__iter__ = MagicMock(return_value=iter([]))
-        # json.load needs a file-like with .read()
-        import io
-        fake_file = io.StringIO(_json.dumps(state))
-
         with patch("scanner.os.path.exists", return_value=True), \
-             patch("builtins.open", return_value=fake_file):
+             patch("builtins.open", mock_open(read_data=_json.dumps(state))):
             return scanner._is_btc_dom_rising(current)
 
     def test_none_current_returns_false(self):
@@ -599,9 +591,9 @@ class TestIsBtcDomRising:
         # 50.1 vs 50.0 → rise = 0.2% < 0.5% threshold
         assert self._run(current=50.1, prev_value=50.0) is False
 
-    def test_clearly_below_threshold_returns_false(self):
-        # 50.1 vs 50.0 → rise = 0.2%, well below 0.5% threshold
-        assert self._run(current=50.1, prev_value=50.0) is False
+    def test_falling_far_below_threshold_returns_false(self):
+        # 45.0 vs 50.0 → dominance falling hard
+        assert self._run(current=45.0, prev_value=50.0) is False
 
     def test_well_above_threshold_returns_true(self):
         # 50.5 vs 50.0 → rise = 1.0% > 0.5% threshold

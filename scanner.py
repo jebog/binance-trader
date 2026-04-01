@@ -425,6 +425,8 @@ def get_btc_dominance() -> Optional[float]:
     Caches the result in state.json["btc_dom_cache"] for BTC_DOM_CACHE_H hours to
     avoid hammering CoinGecko's free tier across repeated scans.
     """
+    if not BTC_DOM_ENABLED:
+        return None
     try:
         state: dict[str, Any] = {}
         if os.path.exists(STATE_FILE):

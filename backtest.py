@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Standalone backtest script — no dependencies beyond stdlib.
+Standalone backtest script — no dependencies beyond stdlib + scanner.py.
 
 Strategy:  RSI/SMA/Vol/Momentum signals (EXTREME/STRONG/MODERATE tiers)
            mirroring scanner.py logic exactly.
-Filters:   No Fear & Greed or BTC context filter applied
-           (not available historically without extra API calls).
+Filters:   RSI divergence filter (T2-2) applied when DIVERGENCE_ENABLED.
+           No Fear & Greed or BTC dominance filter (not available historically).
+Execution: Partial TP at TP1 (T2-4) when PARTIAL_TP_ENABLED.
+           Volatility-adjusted capital sizing (T3-4) when VOL_SIZING_ENABLED.
 Data:      Binance public klines API, 1h, 1000 candles (~41 days) per pair.
 """
 
@@ -25,10 +27,26 @@ from config import (
     ATR_SL_MIN,
     ATR_SL_MULT,
     ATR_TP_MULT,
+    CAPITAL,
+    DIVERGENCE_ENABLED,
+    DIVERGENCE_LOOKBACK,
+    DIVERGENCE_SWING_DEPTH,
     PAIRS,
+    PARTIAL_TP1_ATR_MULT,
+    PARTIAL_TP1_QTY_PCT,
+    PARTIAL_TP_ENABLED,
     STOP_LOSS,
     TAKE_PROFIT,
+    TARGET_RISK_PCT,
+    VOL_SIZING_ENABLED,
+    VOL_SIZING_MAX,
+    VOL_SIZING_MIN,
 )
+
+# ── RSI divergence helper (imported from scanner.py) ─────────────────────────
+# scanner.py has a TeeLogger guard (`if __name__ == "__main__"`) so importing
+# it here is safe — no side effects on import.
+from scanner import detect_bullish_divergence
 
 INTERVAL     = "1h"
 KLINE_LIMIT  = 1000   # max per Binance request (backtest fetches more than scanner)
@@ -174,9 +192,18 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
 
             sl_price = open_trade["sl"]
             tp_price = open_trade["tp"]
-            tp_hit   = high >= tp_price
-            sl_hit   = low  <= sl_price
             held     = j - open_trade["entry_candle_idx"]
+
+            # T3-3: partial TP1 tracking — mark hit if candle high reaches TP1
+            tp1_price = open_trade.get("tp1_price")
+            if PARTIAL_TP_ENABLED and tp1_price and not open_trade.get("partial_tp1_hit"):
+                if high >= tp1_price:
+                    open_trade["partial_tp1_hit"]    = True
+                    open_trade["tp1_exit_price"]     = tp1_price
+                    open_trade["tp1_candle_idx"]     = i   # track candle for same-candle guard
+
+            tp_hit = high >= tp_price
+            sl_hit = low  <= sl_price
 
             if tp_hit and sl_hit:
                 outcome    = "SL"
@@ -193,13 +220,30 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             else:
                 continue  # trade still open
 
-            entry       = open_trade["entry"]
-            pnl_pct     = (exit_price - entry) / entry * 100
-            open_trade["outcome"]       = outcome
-            open_trade["exit_price"]    = exit_price
-            open_trade["exit_candle_idx"] = j
-            open_trade["candles_held"]  = held
-            open_trade["pnl_pct"]       = round(pnl_pct, 4)
+            entry = open_trade["entry"]
+            # T3-3: weighted P&L when TP1 was hit on a PREVIOUS candle.
+            # Do NOT credit TP1 if it hit on the same candle as the final exit —
+            # intra-candle execution order is undefined; crediting would be optimistic.
+            tp1_credited = (
+                PARTIAL_TP_ENABLED
+                and open_trade.get("partial_tp1_hit")
+                and open_trade.get("tp1_candle_idx") != i
+            )
+            if tp1_credited:
+                tp1_ep        = open_trade["tp1_exit_price"]
+                tp1_pnl       = (tp1_ep - entry) / entry * 100
+                final_leg_pnl = (exit_price - entry) / entry * 100
+                pnl_pct       = tp1_pnl * PARTIAL_TP1_QTY_PCT + final_leg_pnl * (1 - PARTIAL_TP1_QTY_PCT)
+            else:
+                pnl_pct = (exit_price - entry) / entry * 100
+            capital     = open_trade.get("capital", CAPITAL)
+            pnl_usdc    = capital * pnl_pct / 100
+            open_trade["outcome"]           = outcome
+            open_trade["exit_price"]        = exit_price
+            open_trade["exit_candle_idx"]   = j
+            open_trade["candles_held"]      = held
+            open_trade["pnl_pct"]           = round(pnl_pct, 4)
+            open_trade["pnl_usdc"]          = round(pnl_usdc, 4)
             trades.append(open_trade)
             open_trade = None
             continue
@@ -210,21 +254,55 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
         if signal == "NONE":
             continue
 
+        # T3-3: RSI divergence filter — mirrors scanner.py analyze() logic
+        # Blocks STRONG/MODERATE when price makes lower low + RSI lower low.
+        # EXTREME bypasses (catches capitulation bottoms regardless of divergence).
+        if DIVERGENCE_ENABLED and signal in ("STRONG", "MODERATE"):
+            closes = [float(k[4]) for k in window]
+            lb_needed = DIVERGENCE_LOOKBACK + 14 + 28  # +28 Wilder steps (matches scanner)
+            div_closes = closes[-lb_needed:]
+            rsi_series = [calc_rsi(div_closes[:j]) for j in range(14, len(div_closes) + 1)]
+            rsi_series = rsi_series[-DIVERGENCE_LOOKBACK:]
+            if len(rsi_series) >= 4:
+                div = detect_bullish_divergence(
+                    div_closes, rsi_series, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH
+                )
+                if div is False:
+                    continue  # confirmed weakness — skip signal
+
         # Entry at close of candle[i-1] (last candle in window = klines[i-1])
         entry_candle_idx = i - 1
         entry_price      = float(klines[entry_candle_idx][4])
 
-        # ATR-based SL/TP
+        # ATR-based SL/TP — mirrors place_buy_order() exactly
         if atr is not None and entry_price > 0:
-            atr_pct  = atr / entry_price
-            sl_pct   = max(ATR_SL_MIN, min(ATR_SL_MAX, atr_pct * ATR_SL_MULT))
-            tp_pct   = sl_pct * (ATR_TP_MULT / ATR_SL_MULT)
+            atr_pct_raw = atr / entry_price
+            sl_pct      = max(ATR_SL_MIN, min(ATR_SL_MAX, atr_pct_raw * ATR_SL_MULT))
+            tp_pct      = sl_pct * (ATR_TP_MULT / ATR_SL_MULT)
         else:
-            sl_pct = STOP_LOSS
-            tp_pct = TAKE_PROFIT
+            atr_pct_raw = 0.0
+            sl_pct      = STOP_LOSS
+            tp_pct      = TAKE_PROFIT
 
         sl_price = entry_price * (1 - sl_pct)
         tp_price = entry_price * (1 + tp_pct)
+
+        # T3-3: partial TP1 price — mirrors place_buy_order() PARTIAL_TP_ENABLED block
+        tp1_price: Optional[float] = None
+        if PARTIAL_TP_ENABLED and ATR_SL_MULT > 0:
+            atr_pct_for_tp1 = sl_pct / ATR_SL_MULT  # use clamped sl_pct, same as live scanner
+            tp1_pct   = atr_pct_for_tp1 * PARTIAL_TP1_ATR_MULT
+            tp1_price = entry_price * (1 + tp1_pct)
+            if tp1_price >= tp_price:
+                tp1_price = None  # TP1 must be below TP2
+
+        # T3-3: volatility-adjusted capital — mirrors _calc_capital() formula
+        if VOL_SIZING_ENABLED and ATR_SL_MULT > 0 and sl_pct > 0:
+            atr_for_sizing = sl_pct / ATR_SL_MULT
+            raw_capital = CAPITAL * TARGET_RISK_PCT / atr_for_sizing
+            capital     = max(CAPITAL * VOL_SIZING_MIN, min(CAPITAL * VOL_SIZING_MAX, raw_capital))
+        else:
+            capital = float(CAPITAL)
 
         open_trade = {
             "symbol":           symbol,
@@ -237,6 +315,9 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             "tp_pct":           round(tp_pct * 100, 3),
             "entry_candle_idx": entry_candle_idx,
             "atr":              round(atr, 8) if atr else None,
+            "capital":          round(capital, 2),
+            "tp1_price":        tp1_price,
+            "partial_tp1_hit":  False,
         }
 
     # If a trade is still open at end of data, force-close at last candle
@@ -244,12 +325,27 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
         last_idx   = len(klines) - 1
         exit_price = float(klines[last_idx][4])
         held       = last_idx - open_trade["entry_candle_idx"]
-        pnl_pct    = (exit_price - open_trade["entry"]) / open_trade["entry"] * 100
+        entry        = open_trade["entry"]
+        tp1_credited = (
+            PARTIAL_TP_ENABLED
+            and open_trade.get("partial_tp1_hit")
+            and open_trade.get("tp1_candle_idx") != last_idx
+        )
+        if tp1_credited:
+            tp1_ep        = open_trade["tp1_exit_price"]
+            tp1_pnl       = (tp1_ep - entry) / entry * 100
+            final_leg_pnl = (exit_price - entry) / entry * 100
+            pnl_pct       = tp1_pnl * PARTIAL_TP1_QTY_PCT + final_leg_pnl * (1 - PARTIAL_TP1_QTY_PCT)
+        else:
+            pnl_pct = (exit_price - entry) / entry * 100
+        capital  = open_trade.get("capital", CAPITAL)
+        pnl_usdc = capital * pnl_pct / 100
         open_trade["outcome"]         = "TIMEOUT"
         open_trade["exit_price"]      = exit_price
         open_trade["exit_candle_idx"] = last_idx
         open_trade["candles_held"]    = held
         open_trade["pnl_pct"]         = round(pnl_pct, 4)
+        open_trade["pnl_usdc"]        = round(pnl_usdc, 4)
         trades.append(open_trade)
 
     return trades
@@ -263,6 +359,7 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "n": 0, "wins": 0, "losses": 0, "timeouts": 0,
             "win_rate": 0.0, "avg_tp_pct": 0.0, "avg_sl_pct": 0.0,
             "avg_to_pct": 0.0, "net_pct": 0.0, "expectancy": 0.0,
+            "net_usdc": 0.0, "expectancy_usdc": 0.0,
         }
     wins     = [t for t in trades if t["outcome"] == "TP"]
     losses   = [t for t in trades if t["outcome"] == "SL"]
@@ -279,18 +376,23 @@ def compute_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     avg_to   = sum(t["pnl_pct"] for t in timeouts) / nt if nt else 0.0
     net      = sum(t["pnl_pct"] for t in trades)
     exp      = net / n
+    # Dollar-weighted P&L (available when VOL_SIZING_ENABLED)
+    net_usdc = sum(t.get("pnl_usdc", 0.0) for t in trades)
+    exp_usdc = net_usdc / n
 
     return {
-        "n":         n,
-        "wins":      nw,
-        "losses":    nl,
-        "timeouts":  nt,
-        "win_rate":  round(wr, 1),
-        "avg_tp_pct": round(avg_win, 2),
-        "avg_sl_pct": round(avg_loss, 2),
-        "avg_to_pct": round(avg_to, 2),
-        "net_pct":   round(net, 2),
-        "expectancy": round(exp, 2),
+        "n":              n,
+        "wins":           nw,
+        "losses":         nl,
+        "timeouts":       nt,
+        "win_rate":       round(wr, 1),
+        "avg_tp_pct":     round(avg_win, 2),
+        "avg_sl_pct":     round(avg_loss, 2),
+        "avg_to_pct":     round(avg_to, 2),
+        "net_pct":        round(net, 2),
+        "expectancy":     round(exp, 2),
+        "net_usdc":       round(net_usdc, 2),
+        "expectancy_usdc": round(exp_usdc, 2),
     }
 
 
@@ -311,11 +413,17 @@ def _print_stats_row(label: str, s: dict[str, Any], trades: list[dict[str, Any]]
 def main() -> None:
     from collections import Counter
     print()
+    partial_note = f"Partial TP1={PARTIAL_TP1_ATR_MULT}×ATR ({int(PARTIAL_TP1_QTY_PCT*100)}% qty)" if PARTIAL_TP_ENABLED else "off"
+    div_note     = f"Divergence filter (lookback={DIVERGENCE_LOOKBACK})" if DIVERGENCE_ENABLED else "off"
+    vol_note     = f"Vol sizing (target_risk={TARGET_RISK_PCT*100:.1f}%)" if VOL_SIZING_ENABLED else "off"
     print("══════════════════════════════════════════════════════════════")
     print("  BACKTEST — 1h · 1000 candles · ~41 days")
     print(f"  Walk-forward split: {int(TRAIN_FRAC*100)}% train / {100-int(TRAIN_FRAC*100)}% test")
     print("  Signal filters: RSI/SMA/Vol/Momentum")
-    print("  NOTE: No F&G or BTC trend filter (not available historically)")
+    print(f"  {div_note}")
+    print(f"  Execution: {partial_note}")
+    print(f"  Sizing:    {vol_note}")
+    print("  NOTE: No F&G or BTC dominance filter (not available historically)")
     print("  SL/TP: ATR-based, SL=ATR×1.5 clamped [2%,6%], TP=SL×(3.5/1.5)")
     print("  Max hold: 72 candles (3 days) → TIMEOUT at market")
     print("══════════════════════════════════════════════════════════════")
@@ -397,16 +505,22 @@ def main() -> None:
     # ── Write JSON results ────────────────────────────────────────────────────
     results = {
         "meta": {
-            "interval":       INTERVAL,
-            "kline_limit":    KLINE_LIMIT,
-            "window":         WINDOW,
-            "train_frac":     TRAIN_FRAC,
-            "max_hold_h":     MAX_HOLD_CANDLES,
-            "atr_sl_mult":    ATR_SL_MULT,
-            "atr_tp_mult":    ATR_TP_MULT,
-            "atr_sl_min":     ATR_SL_MIN,
-            "atr_sl_max":     ATR_SL_MAX,
-            "note":           "No F&G or BTC trend filter applied (backtest limitation)",
+            "interval":              INTERVAL,
+            "kline_limit":           KLINE_LIMIT,
+            "window":                WINDOW,
+            "train_frac":            TRAIN_FRAC,
+            "max_hold_h":            MAX_HOLD_CANDLES,
+            "atr_sl_mult":           ATR_SL_MULT,
+            "atr_tp_mult":           ATR_TP_MULT,
+            "atr_sl_min":            ATR_SL_MIN,
+            "atr_sl_max":            ATR_SL_MAX,
+            "partial_tp_enabled":    PARTIAL_TP_ENABLED,
+            "partial_tp1_atr_mult":  PARTIAL_TP1_ATR_MULT,
+            "partial_tp1_qty_pct":   PARTIAL_TP1_QTY_PCT,
+            "vol_sizing_enabled":    VOL_SIZING_ENABLED,
+            "target_risk_pct":       TARGET_RISK_PCT,
+            "divergence_enabled":    DIVERGENCE_ENABLED,
+            "note":                  "No F&G or BTC dominance filter (not available historically)",
         },
         "overall_train": overall_train,
         "overall_test":  overall_test,

@@ -924,7 +924,9 @@ def _place_split_second_entry(
             f"was cancelled but second buy failed. First half UNPROTECTED. "
             f"Error: `{str(buy_err)[:200]}`"
         )
-        return None  # pending cleared by caller on critical failure
+        # Return a sentinel (not None) to tell the caller to clear pending.
+        # Returning None is reserved for cancel-failure (caller must preserve pending).
+        return {"status": "critical_fail"}  # caller clears pending; no trade to persist
 
     # Step 3: Place combined OCO at weighted-average entry TP/SL
     total_qty   = first_qty + second_qty
@@ -977,6 +979,8 @@ def _place_split_second_entry(
             "oco_id":   None,
             "status":   "no_oco",
             "split_entry": True,
+            "sl_pct":   sl_pct,
+            "tp_pct":   tp_pct,
         }
 
     print(f"  Split entry combined OCO #{combined_oco.get('orderListId')}: "
@@ -1974,15 +1978,15 @@ def _escape_md(text: Any) -> str:
 def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
     """Central capital-sizing rule — single source of truth.
 
-    EXTREME + quality (above SMA, F&G<40) + SPLIT_ENTRY_ENABLED → CAPITAL/2 (first leg)
-    EXTREME crash (falling knife)          → half CAPITAL ($100)
-    STRONG in weak BTC (RSI<35)            → half CAPITAL ($100)
-    Everything else                        → full CAPITAL ($200)
+    EXTREME + quality (above SMA, F&G<40) → CAPITAL/2 (first split leg; second fires at ATR trigger)
+    EXTREME crash (falling knife)          → CAPITAL/2 (falling-knife cap)
+    STRONG in weak BTC (RSI<35)            → CAPITAL/2
+    Everything else                        → full CAPITAL
     """
-    if s["signal_strength"] == "EXTREME" and not s.get("extreme_quality"):
-        return CAPITAL / 2
-    if SPLIT_ENTRY_ENABLED and s["signal_strength"] == "EXTREME" and s.get("extreme_quality"):
-        return CAPITAL / 2   # first split leg; second leg fires at trigger price
+    if s["signal_strength"] == "EXTREME" and s.get("extreme_quality"):
+        return CAPITAL / 2   # first split leg (second leg fires at ATR trigger)
+    if s["signal_strength"] == "EXTREME":
+        return CAPITAL / 2   # crash/falling-knife path
     if s["signal_strength"] == "STRONG" and context["btc_rsi"] < 35:
         return CAPITAL / 2
     return CAPITAL
@@ -2121,7 +2125,14 @@ def scan() -> None:
                     klines = get("/api/v3/klines", {"symbol": sym, "interval": INTERVAL,
                                                      "limit": KLINE_LIMIT})
                     trade = _place_split_second_entry(sym, pending, cp, klines[:-1])
-                    if trade:
+                    if trade is None:
+                        # Cancel failed — pending entry preserved so next scan retries
+                        print(f"  ↩ Split entry cancel failed for {sym} — will retry next scan")
+                    elif trade.get("status") == "critical_fail":
+                        # Cancel succeeded but second buy failed → unrecoverable, clear pending
+                        _clear_pending_second_entry(sym)
+                    else:
+                        # Success (or no_oco status — position exists, just unprotected)
                         _clear_pending_second_entry(sym)
                         # Persist combined trade immediately so the correlation cap
                         # and open-position guard count it in this scan.
@@ -2135,9 +2146,6 @@ def scan() -> None:
                                 json.dump(_se_state, _f, indent=2)
                         except Exception as _e:
                             print(f"  ⚠ Could not persist split-entry trade: {_e}")
-                    else:
-                        # Second buy failed after cancel → clear pending (can't retry)
-                        _clear_pending_second_entry(sym)
             except Exception as _split_e:
                 print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
 

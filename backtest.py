@@ -14,16 +14,20 @@ from __future__ import annotations
 import json
 import os
 import time
-import urllib.request
-import urllib.parse
 import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 from config import (
+    ATR_SL_MAX,
+    ATR_SL_MIN,
+    ATR_SL_MULT,
+    ATR_TP_MULT,
     PAIRS,
-    STOP_LOSS, TAKE_PROFIT,
-    ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
+    STOP_LOSS,
+    TAKE_PROFIT,
 )
 
 INTERVAL     = "1h"
@@ -103,6 +107,7 @@ def fetch_klines(symbol: str, interval: str = INTERVAL, limit: int = KLINE_LIMIT
                 raise
             print(f"  Retry {attempt+1}/3 for {symbol}: {e}")
             time.sleep(2)
+    raise RuntimeError(f"fetch_klines: all retries exhausted for {symbol}")
 
 
 # ── Signal logic (mirrors scanner.py analyze(), no F&G / BTC filter) ──────────
@@ -154,7 +159,7 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
     Returns list of trade dicts.
     """
     trades = []
-    open_trade = None   # at most one open trade at a time per symbol
+    open_trade: Optional[dict[str, Any]] = None   # at most one open trade at a time per symbol
 
     for i in range(WINDOW, len(klines)):
         window = klines[i - WINDOW : i]   # 100 closed candles, index i-1 is last closed
@@ -318,7 +323,7 @@ def main() -> None:
 
     train_trades_all = []
     test_trades_all  = []
-    symbol_data      = {}   # {symbol: {train_stats, test_stats, train_trades, test_trades}}
+    symbol_data: dict[str, dict[str, Any]] = {}   # {symbol: {train_stats, test_stats, train_trades, test_trades}}
 
     for symbol in PAIRS:
         print(f"  Fetching {symbol} ...", end=" ", flush=True)

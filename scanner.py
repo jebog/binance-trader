@@ -22,7 +22,7 @@ SCANNER_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE  = os.path.join(SCANNER_DIR, "state.json")
 LOG_FILE    = os.path.join(SCANNER_DIR, "scanner.log")
 
-import sys
+import sys  # noqa: E402
 
 class TeeLogger:
     """Write to both stdout and the log file (append)."""
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     sys.stdout = TeeLogger()
 
 # ── Config ────────────────────────────────────────────────────────────────────
-from config import (
+from config import (  # noqa: E402
     BINANCE_API_KEY    as API_KEY,
     BINANCE_SECRET_KEY as SECRET_KEY,
     TELEGRAM_TOKEN,
@@ -176,7 +176,7 @@ def save_state(
 ) -> None:
     """Save last scan results to state.json for the dashboard."""
     try:
-        state = {"last_scan": datetime.now().isoformat(), "results": results, "signals": signals,
+        state: dict[str, Any] = {"last_scan": datetime.now().isoformat(), "results": results, "signals": signals,
                  "history": [], "trades": [], "cooldowns": {}, "fg_cache": None,
                  "portfolio": None, "logs": []}
         if os.path.exists(STATE_FILE):
@@ -396,9 +396,8 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
         daily_neutral  = False
         daily_bearish  = False
 
-    fg          = context["fg_value"]        # 0-100
-    btc_rsi     = context["btc_rsi"]
-    btc_above   = context["btc_above_sma"]
+    fg        = context["fg_value"]        # 0-100
+    btc_above = context["btc_above_sma"]
 
     # ── Signal tiers (1h thresholds) ─────────────────────────────────────────
     # EXTREME: deep oversold — always qualifies regardless of market regime.
@@ -549,8 +548,8 @@ def get_portfolio() -> Optional[dict[str, Any]]:
                     break
                 except Exception:
                     continue
-            if price is None:
-                continue  # untradeable / no price — skip
+        if price is None:
+            continue  # untradeable / no price — skip
         value = qty * price
         if value < 0.10:
             continue  # dust

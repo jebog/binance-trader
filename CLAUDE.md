@@ -163,11 +163,22 @@ Each `analyze()` call fetches 30 daily candles to compute `daily_rsi` and check 
 
 The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTREME signals bypass the daily filter to catch capitulation bottoms.
 
-### Scan phases (scanner.py `scan()` and tui.py `action_trigger_scan`)
+### Shared scan helpers (scanner.py — used by both `scan()` and TUI)
+
+| Helper | Purpose |
+|--------|---------|
+| `build_market_context()` | Fetches F&G + BTC context + BTC dominance → returns full context dict |
+| `apply_correlation_cap(candidates, conn)` | If ≥3 candidates, sorts by `_pair_score()` (T4-3) or RSI, keeps top 1 |
+| `run_position_management(conn)` | T3-1 break-even + T4-4 progressive trailing on all open trades |
+| `run_split_entry_checks(conn)` | T2-1 pending second legs — fire on trigger or expire after TTL |
+
+All accept `conn: Optional[sqlite3.Connection] = None` — shared connection when called from `scan()`, own connection when called standalone from the TUI.
+
+### Scan phases (scanner.py `_scan_body()` and tui.py `action_trigger_scan`)
 
 1. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit/partial_tp; detect TP1 fills; compute weighted P&L for partial_tp exits
-2. **Trade timeout (T3-2)** — force-exit any position open > `TRADE_TIMEOUT_H` hours; marks `status="timeout"`
-3. **Split-entry check (T2-1)** — check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
+2. **Trade timeout (T3-2)** — force-exit any position open > `TRADE_TIMEOUT_H` hours; runs BEFORE the OCO loop so `no_oco` trades are also age-checked
+3. **Split-entry check (T2-1)** — `run_split_entry_checks()`: check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
 4. **Break-even stop (T3-1)** — for each open+partial_tp trade: if price ≥ break-even trigger, cancel OCO + re-place with SL at entry; sets `breakeven_moved=True`
 5. **Progressive trailing (T4-4)** — for each break-even-armed trade: check 1.5×/2×/2.5×ATR milestones; tighten trailing delta at each stage; advances `trailing_stage` index
 6. **Fetch context** — Fear & Greed, BTC RSI/SMA/price, BTC dominance; fire F&G regime-change alert if threshold crossed
@@ -193,7 +204,7 @@ open ──► tp_hit        (LIMIT_MAKER or final OCO TP filled) → exit_price
 
 `exit_price` is computed from the actual Binance fill (`cummulativeQuoteQty / executedQty`) via `_order_fill_price()` — not the stored activation price, which is wrong for trailing stops.
 
-**Split-entry (T2-1) parallel state** — stored in `state.json["pending_second_entries"]`, not in `trades`:
+**Split-entry (T2-1) parallel state** — stored in `pending_second_entries` table, not in `trades`:
 ```
 first_half_open + pending_second_entry ──► trigger price hit → cancel first OCO → buy second half
                                                               → combined OCO at weighted-avg entry

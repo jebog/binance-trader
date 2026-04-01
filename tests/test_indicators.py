@@ -7,20 +7,34 @@ scanner.py is imported with the Binance API calls guarded by mock.
 
 from __future__ import annotations
 
-import pytest
 from datetime import datetime
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-# ── Import pure functions directly (no side effects on import) ────────────────
-from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats, _pair_score, _check_15m_rsi_gate
+import pytest
+
+from backtest import (
+    calc_atr as bt_calc_atr,
+)
 from backtest import (
     calc_rsi as bt_calc_rsi,
+)
+from backtest import (
     calc_sma as bt_calc_sma,
-    calc_atr as bt_calc_atr,
-    compute_signal,
+)
+from backtest import (
     compute_stats,
 )
 
+# ── Import pure functions directly (no side effects on import) ────────────────
+from scanner import (
+    _check_15m_rsi_gate,
+    _compute_perf_stats,
+    _pair_score,
+    calc_atr,
+    calc_rsi,
+    calc_sma,
+    detect_bullish_divergence,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # calc_rsi
@@ -537,21 +551,18 @@ class TestCalcCapital:
 
     def test_strong_weak_btc_half_capital(self):
         # Fallback path (VOL_SIZING_ENABLED=False): STRONG in weak BTC → CAPITAL/2
-        import scanner
         s = {"signal_strength": "STRONG", "extreme_quality": False}
         with patch("scanner.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 34.9}) == self.CAPITAL / 2
 
     def test_strong_normal_btc_full_capital(self):
         # Fallback path: STRONG with normal BTC → full CAPITAL
-        import scanner
         s = {"signal_strength": "STRONG", "extreme_quality": False}
         with patch("scanner.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 35.0}) == self.CAPITAL
 
     def test_moderate_always_full_capital(self):
         # Fallback path: MODERATE → full CAPITAL regardless of BTC RSI
-        import scanner
         s = {"signal_strength": "MODERATE", "extreme_quality": False}
         with patch("scanner.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL
@@ -567,7 +578,6 @@ class TestVolSizing:
 
     def _signal(self, strength: str = "STRONG", atr: float = 1.0, price: float = 100.0) -> dict:
         """Build a minimal signal dict with synthetic closed_klines to drive ATR."""
-        import scanner
         # Construct klines where the last ATR ≈ atr (high-low range ≈ atr per candle)
         # calc_atr uses (high - low) average over 14 periods.
         klines = []
@@ -868,7 +878,8 @@ class TestPartialTp1:
 
     def test_handle_partial_tp1_calls_cancel_and_re_oco(self):
         """_handle_partial_tp1 must call signed_delete (cancel) then signed_post (new OCO)."""
-        import scanner, json
+
+        import scanner
 
         trade = {
             "symbol":      "ETHUSDC",
@@ -1002,13 +1013,12 @@ class TestSplitEntry:
 
     def test_ttl_expiry_clears_entry(self):
         """A pending entry older than SPLIT_ENTRY_TTL_H hours is expired and cleared."""
-        import scanner, json
-        from unittest.mock import mock_open
         from datetime import timedelta
+
+        import scanner
 
         expired_time = (datetime.now() - timedelta(hours=scanner.SPLIT_ENTRY_TTL_H + 1)).isoformat()
         pending = {"ETHUSDC": {"time": expired_time, "first_fill": 2000.0}}
-        state = {"pending_second_entries": pending}
 
         cleared = {}
         def fake_clear(symbol):
@@ -1119,7 +1129,6 @@ class TestTradeTimeout:
         import scanner
         trade = self._make_trade(80)
         delete_calls: list = []
-        post_calls: list = []
 
         with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
              patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
@@ -1361,6 +1370,143 @@ class TestBreakeven:
         # SL should be entry rounded to tick=0.01 → 2000.0 exactly
         assert trade["sl"] == pytest.approx(2000.0, rel=1e-6)
 
+    def test_breakeven_success_persists_to_db(self):
+        """Successful break-even writes breakeven_moved, sl, oco_id to SQLite."""
+        import scanner
+        trade = self._make_trade()
+        trade["order_id"] = "test-be-db-111"
+        trade["capital"] = 100.0
+        trade["trailing_stage"] = 0
+        current_price = 2000.0 * 1.05
+
+        conn = scanner.db_connect()
+        scanner.db_init(conn)
+        scanner.insert_trade(conn, trade)
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   return_value={"orderListId": 777}), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            scanner._check_breakeven(trade, current_price, "ETHUSDC", conn)
+
+        # Verify DB was updated
+        row = conn.execute(
+            "SELECT breakeven_moved, sl, oco_id FROM trades WHERE order_id = ?",
+            ("test-be-db-111",),
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == 1  # breakeven_moved = True
+        assert row[1] == pytest.approx(2000.0, rel=1e-4)
+        assert row[2] == "777"
+
+    def test_breakeven_oco_fail_persists_no_oco_to_db(self):
+        """OCO re-place failure writes status=no_oco to SQLite."""
+        import scanner
+        trade = self._make_trade()
+        trade["order_id"] = "test-be-nooco-222"
+        trade["capital"] = 100.0
+        trade["trailing_stage"] = 0
+        current_price = 2000.0 * 1.05
+
+        conn = scanner.db_connect()
+        scanner.db_init(conn)
+        scanner.insert_trade(conn, trade)
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   side_effect=Exception("LOT_SIZE")), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            scanner._check_breakeven(trade, current_price, "ETHUSDC", conn)
+
+        row = conn.execute(
+            "SELECT status, breakeven_moved FROM trades WHERE order_id = ?",
+            ("test-be-nooco-222",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == "no_oco"
+        assert row[1] == 1
+
+
+class TestProgressiveTrailingDB:
+    """Tests for progressive trailing DB write paths."""
+
+    def _make_trade(self) -> dict:
+        return {
+            "symbol":          "ETHUSDC",
+            "time":            datetime.now().isoformat(),
+            "entry":           2000.0,
+            "tp":              2210.0,
+            "sl":              2000.0,     # already at break-even
+            "qty":             0.1,
+            "order_id":        "test-pt-333",
+            "oco_id":          222,
+            "status":          "open",
+            "sl_pct":          0.03,
+            "tp_pct":          0.07,
+            "capital":         100.0,
+            "breakeven_moved": True,
+            "trailing_stage":  0,
+        }
+
+    def _exch_info(self) -> dict:
+        return {"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE",     "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}
+
+    def test_progressive_trailing_success_persists_stage(self):
+        """Stage advance writes oco_id + trailing_stage to SQLite."""
+        import scanner
+        trade = self._make_trade()
+        # Stage 1 trigger: entry * (1 + 1.5 * atr_pct) where atr_pct = 0.03/1.5 = 0.02
+        # = 2000 * 1.03 = 2060
+        current_price = 2065.0
+
+        conn = scanner.db_connect()
+        scanner.db_init(conn)
+        scanner.insert_trade(conn, trade)
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   return_value={"orderListId": 888}), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC", conn)
+
+        assert result is True
+        row = conn.execute(
+            "SELECT trailing_stage, oco_id FROM trades WHERE order_id = ?",
+            ("test-pt-333",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == 1
+        assert row[1] == "888"
+
+    def test_progressive_trailing_oco_fail_persists_no_oco(self):
+        """Re-OCO failure writes status=no_oco and advances stage to prevent retry loop."""
+        import scanner
+        trade = self._make_trade()
+        current_price = 2065.0
+
+        conn = scanner.db_connect()
+        scanner.db_init(conn)
+        scanner.insert_trade(conn, trade)
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "get",           return_value=self._exch_info()), \
+             patch.object(scanner, "signed_post",   side_effect=Exception("PRICE")), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC", conn)
+
+        assert result is True
+        row = conn.execute(
+            "SELECT status, trailing_stage FROM trades WHERE order_id = ?",
+            ("test-pt-333",),
+        ).fetchone()
+        conn.close()
+        assert row[0] == "no_oco"
+        assert row[1] == 1  # stage advanced to prevent retry
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # T3-3 — Backtest Parity
@@ -1369,7 +1515,7 @@ class TestBreakeven:
 class TestBacktestParity:
     """Tests for partial TP simulation and RSI divergence filter in backtest.py."""
 
-    def _make_klines(self, prices: list[float], atr_spread: float = 1.0) -> list[list[Any]]:
+    def _make_klines(self, prices: list[float], atr_spread: float = 1.0) -> list[list]:
         """Build minimal klines from a close-price sequence."""
         result = []
         for p in prices:
@@ -1378,7 +1524,6 @@ class TestBacktestParity:
 
     def test_partial_tp1_hit_then_tp2_weighted_pnl(self):
         """TP1 fires mid-trade, TP2 fires later → P&L = TP1×50% + TP2×50%."""
-        from backtest import backtest_symbol
         import backtest as bt
 
         # Build klines: 100 warmup at flat 100, then rise to hit tp1, then tp2
@@ -1387,7 +1532,7 @@ class TestBacktestParity:
         # tp1_price ≈ entry × (1 + sl_pct/ATR_SL_MULT × PARTIAL_TP1_ATR_MULT)
         # With STOP_LOSS=0.03, ATR_SL_MULT=1.5: atr_pct=0.02 → tp1=100*1.02=102.0
         # tp2 = 100 * (1 + 0.075) = 107.5
-        warmup = self._make_klines([100.0] * 101, atr_spread=0.1)  # low ATR → uses fallback
+        self._make_klines([100.0] * 101, atr_spread=0.1)  # low ATR → uses fallback
         # kline that drives signal: close ends at 24 (RSI < 25 = EXTREME)
         # Actually, let's make it simple: just test the P&L weighting math directly
         # by patching PARTIAL_TP_ENABLED=True and building a trade dict manually
@@ -1403,8 +1548,6 @@ class TestBacktestParity:
 
     def test_partial_tp1_not_hit_single_exit_pnl(self):
         """If TP1 never fires, P&L is single-exit (unchanged from pre-T3-3)."""
-        from backtest import backtest_symbol
-        import backtest as bt
 
         # Verify the no-tp1 path: partial_tp1_hit=False → pnl = single exit
         entry = 100.0
@@ -1640,7 +1783,6 @@ class TestPairScore:
 
     def test_neutral_with_no_history(self):
         """Fewer than PAIR_SCORE_MIN_TRADES → 0.5 (neutral)."""
-        import scanner
         trades = [self._trade("ETHUSDC", 5.0)]  # only 1 trade < 3 min
         score = _pair_score("ETHUSDC", trades)
         assert score == pytest.approx(0.5)
@@ -1659,14 +1801,12 @@ class TestPairScore:
         assert score == pytest.approx(4.5, rel=1e-4)
 
     def test_all_losses_gives_zero(self):
-        import scanner
         trades = [self._trade("ETHUSDC", -2.0, "sl_hit")] * 5
         score = _pair_score("ETHUSDC", trades)
         assert score == pytest.approx(0.0)
 
     def test_uses_last_n_trades(self):
         """Only last PAIR_SCORE_LOOKBACK trades are used."""
-        import scanner
         # 25 old losses then 5 recent wins — lookback=20 should pick 5 wins + 15 losses
         old_losses = [self._trade("ETHUSDC", -2.0, "sl_hit")] * 25
         recent_wins = [self._trade("ETHUSDC", 4.0, "tp_hit")] * 5

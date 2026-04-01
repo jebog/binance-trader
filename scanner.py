@@ -3356,11 +3356,18 @@ def scan() -> None:
     print(f"  SL: -{STOP_LOSS*100:.0f}% | TP: +{TAKE_PROFIT*100:.0f}%")
     print(f"{'='*55}")
 
-    # ── Single scan-scoped connection (WAL mode: concurrent TUI reads are safe) ──
-    # Closed in the finally block at the end of scan() to prevent leaks on exception.
+    # ── Single scan-scoped connection — closed in finally to prevent leaks ────
     _scan_conn = db_connect()
     db_init(_scan_conn)
+    try:
+        _scan_body(_scan_conn)
+    finally:
+        _scan_conn.close()
+    print(f"\n{'='*55}\n")
 
+
+def _scan_body(_scan_conn: sqlite3.Connection) -> None:
+    """Inner scan logic — separated so scan() can wrap it in try/finally."""
     # ── Load persisted state from SQLite (dedup ledger + regime tracking) ───────
     sent_signals: dict[str, str] = load_sent_signals(_scan_conn)
 
@@ -3701,8 +3708,6 @@ def scan() -> None:
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
 
-    _scan_conn.close()
-    print(f"\n{'='*55}\n")
 
 if __name__ == "__main__":
     scan()

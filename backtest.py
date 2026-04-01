@@ -6,7 +6,8 @@ Strategy:  RSI/SMA/Vol/Momentum signals (EXTREME/STRONG/MODERATE tiers)
            mirroring scanner.py logic exactly.
 Filters:   RSI divergence filter (T2-2) applied when DIVERGENCE_ENABLED.
            No Fear & Greed or BTC dominance filter (not available historically).
-Execution: Partial TP at TP1 (T2-4) when PARTIAL_TP_ENABLED.
+Execution: Split entry second leg (T2-1) when SPLIT_ENTRY_ENABLED + EXTREME signal.
+           Partial TP at TP1 (T2-4) when PARTIAL_TP_ENABLED.
            Volatility-adjusted capital sizing (T3-4) when VOL_SIZING_ENABLED.
            Break-even stop (T3-1) when BREAKEVEN_ENABLED.
            Progressive trailing tightening (T4-4) when PROGRESSIVE_TRAILING_ENABLED.
@@ -41,6 +42,9 @@ from config import (
     PARTIAL_TP_ENABLED,
     PROGRESSIVE_TRAILING_ENABLED,
     PROGRESSIVE_TRAILING_STAGES,
+    SPLIT_ENTRY_ATR_MULT,
+    SPLIT_ENTRY_ENABLED,
+    SPLIT_ENTRY_TTL_H,
     STOP_LOSS,
     TAKE_PROFIT,
     TARGET_RISK_PCT,
@@ -209,6 +213,35 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
                     open_trade["tp1_exit_price"]     = tp1_price
                     open_trade["tp1_candle_idx"]     = i   # track candle for same-candle guard
 
+            # T2-1: split-entry second leg — fire if price drops to trigger
+            _split_trig = open_trade.get("split_trigger")
+            if _split_trig and not open_trade.get("split_filled"):
+                _split_age = j - open_trade["entry_candle_idx"]
+                if _split_age > SPLIT_ENTRY_TTL_H:
+                    open_trade["split_trigger"] = None  # TTL expired
+                elif low <= _split_trig:
+                    # Second leg fills at trigger price; combine entries
+                    first_entry  = open_trade["entry"]
+                    first_cap    = open_trade["capital"]
+                    second_entry = _split_trig
+                    avg_entry    = (first_entry + second_entry) / 2
+                    total_cap    = first_cap * 2
+                    # Recompute SL/TP from averaged entry
+                    _sp = open_trade["sl_pct"] / 100  # stored as percentage
+                    _tp = open_trade["tp_pct"] / 100
+                    open_trade["entry"]        = avg_entry
+                    open_trade["sl"]           = avg_entry * (1 - _sp)
+                    open_trade["tp"]           = avg_entry * (1 + _tp)
+                    open_trade["capital"]      = round(total_cap, 2)
+                    open_trade["split_filled"] = True
+                    # Recompute TP1 from new entry
+                    if PARTIAL_TP_ENABLED and open_trade.get("tp1_price") and not open_trade.get("partial_tp1_hit"):
+                        _atr_tp1 = _sp / ATR_SL_MULT if ATR_SL_MULT > 0 else 0
+                        _new_tp1 = avg_entry * (1 + _atr_tp1 * PARTIAL_TP1_ATR_MULT)
+                        open_trade["tp1_price"] = _new_tp1 if _new_tp1 < open_trade["tp"] else None
+                    sl_price = open_trade["sl"]
+                    tp_price = open_trade["tp"]
+
             # T3-1: break-even stop — move SL to entry once price reaches trigger
             _atr_pct_raw = open_trade.get("atr_pct_raw") or 0.0
             if BREAKEVEN_ENABLED and not open_trade.get("breakeven_moved") and _atr_pct_raw:
@@ -342,6 +375,11 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
         if signal == "EXTREME":
             capital = min(capital, CAPITAL * 0.5)
 
+        # T2-1: split-entry pending second leg for EXTREME signals
+        split_trigger: Optional[float] = None
+        if SPLIT_ENTRY_ENABLED and signal == "EXTREME" and atr_pct_raw > 0:
+            split_trigger = entry_price * (1 - atr_pct_raw * SPLIT_ENTRY_ATR_MULT)
+
         open_trade = {
             "symbol":           symbol,
             "signal":           signal,
@@ -360,6 +398,8 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
             "breakeven_moved":  False,
             "trailing_stage":   0,
             "peak_high_be":     None,
+            "split_trigger":    split_trigger,
+            "split_filled":     False,
         }
 
     # If a trade is still open at end of data, force-close at last candle

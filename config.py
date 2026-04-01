@@ -56,6 +56,11 @@ PARTIAL_TP_ENABLED   = True
 PARTIAL_TP1_ATR_MULT = 1.0    # TP1 at entry × (1 + 1.0 × ATR%) — halfway to full TP
 PARTIAL_TP1_QTY_PCT  = 0.50   # fraction of position closed at TP1
 
+# ── Split entry (T2-1) ────────────────────────────────────────────────────────
+SPLIT_ENTRY_ENABLED  = True
+SPLIT_ENTRY_ATR_MULT = 1.0    # second entry triggers at first_fill × (1 - 1 × ATR%)
+SPLIT_ENTRY_TTL_H    = 48     # expire pending entry after 48h (Telegram notice sent)
+
 # ── Scanner internals ─────────────────────────────────────────
 INTERVAL    = "1h"   # candle timeframe
 KLINE_LIMIT = 100    # candles per fetch (Wilder RSI needs ≥ 2×period to converge)

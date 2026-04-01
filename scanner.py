@@ -51,6 +51,7 @@ from config import (  # noqa: E402
     DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
     BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
     PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
+    SPLIT_ENTRY_ENABLED, SPLIT_ENTRY_ATR_MULT, SPLIT_ENTRY_TTL_H,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -199,8 +200,9 @@ def save_state(
             state["peak_portfolio_usdc"] = old.get("peak_portfolio_usdc")   # updated below
             state["cb_alert_sent_at"]  = cb_alert_sent_at or old.get("cb_alert_sent_at")
             state["last_digest_date"]  = old.get("last_digest_date")
-            state["btc_dom_cache"]     = old.get("btc_dom_cache")   # preserve CoinGecko cache
-            state["btc_dom_prev"]      = old.get("btc_dom_prev")    # preserve last dominance value
+            state["btc_dom_cache"]     = old.get("btc_dom_cache")             # preserve CoinGecko cache
+            state["btc_dom_prev"]      = old.get("btc_dom_prev")             # preserve last dominance value
+            state["pending_second_entries"] = old.get("pending_second_entries") or {}  # preserve split-entry pending legs
         if portfolio:
             state["portfolio"] = portfolio                            # overwrite with fresh data
         # Update peak_portfolio_usdc high-water mark (always, even on first state.json write)
@@ -804,6 +806,206 @@ def _save_cooldown(symbol: str) -> None:
             json.dump(state, f, indent=2)
     except Exception:
         pass
+
+# ── Split-entry state helpers (T2-1) ─────────────────────────────────────────
+def _load_pending_second_entries() -> dict[str, Any]:
+    """Return pending_second_entries dict from state.json (empty dict on any failure)."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f).get("pending_second_entries") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_pending_second_entry(symbol: str, data: dict[str, Any]) -> None:
+    """Surgical patch: write a single pending second entry to state.json."""
+    try:
+        state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        pending = state.get("pending_second_entries") or {}
+        pending[symbol] = data
+        state["pending_second_entries"] = pending
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Could not persist pending second entry for {symbol}: {e}")
+
+
+def _clear_pending_second_entry(symbol: str) -> None:
+    """Surgical patch: remove a pending second entry from state.json."""
+    try:
+        state: dict[str, Any] = {}
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                state = json.load(f)
+        pending = state.get("pending_second_entries") or {}
+        pending.pop(symbol, None)
+        state["pending_second_entries"] = pending
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"  ⚠ Could not clear pending second entry for {symbol}: {e}")
+
+
+def _place_split_second_entry(
+    symbol: str,
+    pending: dict[str, Any],
+    current_price: float,
+    closed_klines: list[list[Any]],
+) -> Optional[dict[str, Any]]:
+    """Execute the second half of a split entry.
+
+    Flow:
+    1. Cancel first OCO (pending["first_oco_id"]).
+    2. Buy second half at current_price.
+    3. Place combined OCO for total qty at weighted-average entry TP/SL.
+
+    Returns the combined trade dict on success, None on any unrecoverable failure.
+    Failures are reported via Telegram; pending entry is preserved for retry when
+    the cancel hasn't happened yet (so the next scan can try again).
+    """
+    first_fill = pending["first_fill"]
+    first_qty  = pending["first_qty"]
+    capital_half = pending["capital_half"]
+    sl_pct = pending["sl_pct"]
+    tp_pct = pending["tp_pct"]
+
+    # Step 1: Cancel the first OCO
+    first_oco_id = pending["first_oco_id"]
+    try:
+        signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": first_oco_id})
+        print(f"  Cancelled first OCO #{first_oco_id} for split entry {symbol}")
+    except Exception as cancel_err:
+        send_telegram(
+            f"⚠ *Split entry cancel failed* — `{symbol}` OCO #{first_oco_id} still active. "
+            f"Retry next scan. Error: `{str(cancel_err)[:200]}`"
+        )
+        return None  # preserve pending entry for retry
+
+    # Step 2: Buy second half
+    try:
+        # Get lot size for qty computation
+        info = get("/api/v3/exchangeInfo", {"symbol": symbol})
+        step    = 1.0
+        tick    = 0.01
+        min_qty = 0.0
+        for f in info["symbols"][0]["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step    = float(f["stepSize"])
+                min_qty = float(f["minQty"])
+            elif f["filterType"] == "PRICE_FILTER":
+                tick = float(f["tickSize"])
+        qty_prec  = len(str(step).rstrip('0').split('.')[-1])
+        tick_prec = len(str(tick).rstrip('0').split('.')[-1])
+
+        qty2_raw = capital_half / current_price
+        qty2 = round(math.floor(qty2_raw / step) * step, qty_prec)
+        if qty2 == 0 or qty2 < min_qty:
+            raise ValueError(f"Second qty {qty2} below min_qty {min_qty}")
+
+        second_order = signed_post("/api/v3/order", {
+            "symbol":   symbol,
+            "side":     "BUY",
+            "type":     "MARKET",
+            "quantity": qty2,
+            "newClientOrderId": f"agent-scanner-split2-{int(time.time())}",
+        })
+        second_fill = (float(second_order.get("fills", [{}])[0].get("price", current_price))
+                       if second_order.get("fills") else current_price)
+        second_qty = float(second_order.get("executedQty", qty2))
+    except Exception as buy_err:
+        # OCO was already cancelled — CRITICAL: position partially unprotected
+        send_telegram(
+            f"🚨 *CRITICAL — split second buy FAILED* — `{symbol}` first OCO #{first_oco_id} "
+            f"was cancelled but second buy failed. First half UNPROTECTED. "
+            f"Error: `{str(buy_err)[:200]}`"
+        )
+        # Return a sentinel (not None) to tell the caller to clear pending.
+        # Returning None is reserved for cancel-failure (caller must preserve pending).
+        return {"status": "critical_fail"}  # caller clears pending; no trade to persist
+
+    # Step 3: Place combined OCO at weighted-average entry TP/SL
+    total_qty   = first_qty + second_qty
+    avg_entry   = (first_fill * first_qty + second_fill * second_qty) / total_qty
+    tp2_price   = round(round(avg_entry * (1 + tp_pct) / tick) * tick, tick_prec)
+    sl2_price   = round(round(avg_entry * (1 - sl_pct) / tick) * tick, tick_prec)
+    total_qty_r = round(math.floor(total_qty / step) * step, qty_prec)
+    try:
+        if TRAILING_DELTA > 0:
+            combined_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":              symbol,
+                "side":                "SELL",
+                "quantity":            total_qty_r,
+                "aboveType":           "LIMIT_MAKER",
+                "abovePrice":          tp2_price,
+                "belowType":           "STOP_LOSS",
+                "belowStopPrice":      sl2_price,
+                "belowTrailingDelta":  TRAILING_DELTA,
+                "belowTimeInForce":    "GTC",
+            })
+        else:
+            sl2_limit = round(round(sl2_price * 0.995 / tick) * tick, tick_prec)
+            combined_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":           symbol,
+                "side":             "SELL",
+                "quantity":         total_qty_r,
+                "aboveType":        "LIMIT_MAKER",
+                "abovePrice":       tp2_price,
+                "belowType":        "STOP_LOSS_LIMIT",
+                "belowStopPrice":   sl2_price,
+                "belowPrice":       sl2_limit,
+                "belowTimeInForce": "GTC",
+            })
+    except Exception as oco_err:
+        send_telegram(
+            f"🚨 *Split entry combined OCO FAILED* — `{symbol}` {total_qty_r} UNPROTECTED. "
+            f"Place OCO manually: TP ~${tp2_price} / SL ~${sl2_price}. "
+            f"Error: `{str(oco_err)[:200]}`"
+        )
+        # Return a trade dict with no_oco so the position is visible in state
+        return {
+            "time":     datetime.now().isoformat(),
+            "symbol":   symbol,
+            "entry":    avg_entry,
+            "tp":       tp2_price,
+            "sl":       sl2_price,
+            "qty":      total_qty_r,
+            "capital":  capital_half * 2,
+            "order_id": second_order.get("orderId"),
+            "oco_id":   None,
+            "status":   "no_oco",
+            "split_entry": True,
+            "sl_pct":   sl_pct,
+            "tp_pct":   tp_pct,
+        }
+
+    print(f"  Split entry combined OCO #{combined_oco.get('orderListId')}: "
+          f"avg_entry=${avg_entry:.4f} TP=${tp2_price:.4f} SL=${sl2_price:.4f} qty={total_qty_r}")
+    send_telegram(
+        f"✅ *Split entry complete* — `{symbol}`\n"
+        f"Avg entry: `${avg_entry:.4f}` ({first_qty}@${first_fill:.4f} + {second_qty}@${second_fill:.4f})\n"
+        f"TP `${tp2_price:.4f}` · SL `${sl2_price:.4f}` | OCO #{combined_oco.get('orderListId')}"
+    )
+    return {
+        "time":     datetime.now().isoformat(),
+        "symbol":   symbol,
+        "entry":    avg_entry,
+        "tp":       tp2_price,
+        "sl":       sl2_price,
+        "qty":      total_qty_r,
+        "capital":  capital_half * 2,
+        "order_id": second_order.get("orderId"),
+        "oco_id":   combined_oco.get("orderListId"),
+        "status":   "open",
+        "split_entry": True,
+        "sl_pct":   sl_pct,
+        "tp_pct":   tp_pct,
+    }
+
 
 def _check_sl_outcomes() -> None:
     """Check closed OCO orders — if stop leg filled, trigger SL cooldown.
@@ -1776,13 +1978,15 @@ def _escape_md(text: Any) -> str:
 def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
     """Central capital-sizing rule — single source of truth.
 
-    EXTREME + quality (above SMA, F&G<40) → full CAPITAL ($200)
-    EXTREME crash (falling knife)          → half CAPITAL ($100)
-    STRONG in weak BTC (RSI<35)            → half CAPITAL ($100)
-    Everything else                        → full CAPITAL ($200)
+    EXTREME + quality (above SMA, F&G<40) → CAPITAL/2 (first split leg; second fires at ATR trigger)
+    EXTREME crash (falling knife)          → CAPITAL/2 (falling-knife cap)
+    STRONG in weak BTC (RSI<35)            → CAPITAL/2
+    Everything else                        → full CAPITAL
     """
-    if s["signal_strength"] == "EXTREME" and not s.get("extreme_quality"):
-        return CAPITAL / 2
+    if s["signal_strength"] == "EXTREME" and s.get("extreme_quality"):
+        return CAPITAL / 2   # first split leg (second leg fires at ATR trigger)
+    if s["signal_strength"] == "EXTREME":
+        return CAPITAL / 2   # crash/falling-knife path
     if s["signal_strength"] == "STRONG" and context["btc_rsi"] < 35:
         return CAPITAL / 2
     return CAPITAL
@@ -1894,6 +2098,56 @@ def scan() -> None:
     # _check_sl_outcomes() calls save_state() internally with fg_regime=None,
     # which preserves the existing regime value already on disk.
     _check_sl_outcomes()
+
+    # ── Split-entry: check pending second legs (T2-1) ─────────────────────────
+    # Run before the main scan so second-leg fills are treated as open positions
+    # before the correlation cap and per-symbol guards run.
+    if SPLIT_ENTRY_ENABLED:
+        pending_entries = _load_pending_second_entries()
+        for sym, pending in list(pending_entries.items()):
+            try:
+                entry_age_h = (
+                    datetime.now() - datetime.fromisoformat(pending["time"])
+                ).total_seconds() / 3600
+                if entry_age_h > SPLIT_ENTRY_TTL_H:
+                    _clear_pending_second_entry(sym)
+                    send_telegram(
+                        f"⏱ *Split entry expired* — `{sym}` pending second leg cleared "
+                        f"after {SPLIT_ENTRY_TTL_H}h. No second buy placed."
+                    )
+                    continue
+                cp_resp = get("/api/v3/ticker/price", {"symbol": sym})
+                cp = float(cp_resp["price"])
+                trigger = pending["first_fill"] * (1 - pending["atr_pct"] * SPLIT_ENTRY_ATR_MULT)
+                print(f"  Split entry {sym}: current=${cp:.4f} trigger=${trigger:.4f} "
+                      f"(age {entry_age_h:.1f}h / {SPLIT_ENTRY_TTL_H}h TTL)")
+                if cp <= trigger:
+                    klines = get("/api/v3/klines", {"symbol": sym, "interval": INTERVAL,
+                                                     "limit": KLINE_LIMIT})
+                    trade = _place_split_second_entry(sym, pending, cp, klines[:-1])
+                    if trade is None:
+                        # Cancel failed — pending entry preserved so next scan retries
+                        print(f"  ↩ Split entry cancel failed for {sym} — will retry next scan")
+                    elif trade.get("status") == "critical_fail":
+                        # Cancel succeeded but second buy failed → unrecoverable, clear pending
+                        _clear_pending_second_entry(sym)
+                    else:
+                        # Success (or no_oco status — position exists, just unprotected)
+                        _clear_pending_second_entry(sym)
+                        # Persist combined trade immediately so the correlation cap
+                        # and open-position guard count it in this scan.
+                        try:
+                            _se_state: dict[str, Any] = {}
+                            if os.path.exists(STATE_FILE):
+                                with open(STATE_FILE) as _f:
+                                    _se_state = json.load(_f)
+                            _se_state.setdefault("trades", []).append(trade)
+                            with open(STATE_FILE, "w") as _f:
+                                json.dump(_se_state, _f, indent=2)
+                        except Exception as _e:
+                            print(f"  ⚠ Could not persist split-entry trade: {_e}")
+            except Exception as _split_e:
+                print(f"  ⚠ Split entry check failed for {sym}: {_split_e}")
 
     # ── Market context (fetched once per scan) ────────────────────────────────
     fg_value, fg_class, fg_fresh = get_fear_greed()
@@ -2123,20 +2377,50 @@ def scan() -> None:
 
         cron_mode = os.environ.get("SCANNER_CRON", "") == "1"
         new_trades = []
+
+        def _place_and_arm(s: dict[str, Any]) -> Optional[dict[str, Any]]:
+            """Place buy order and arm split-entry pending leg if applicable."""
+            capital = _calc_capital(s, context)
+            _, _, trade = place_buy_order(s["symbol"], capital, s["price"], s.get("closed_klines"))
+            send_telegram(
+                f"✅ *Order placed*\n"
+                f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"
+                f"TP `${trade['tp']:.4f}` · SL `${trade['sl']:.4f}`\n"
+                f"OCO #{trade['oco_id']}"
+            )
+            # Arm split entry for EXTREME quality signals (T2-1)
+            if (SPLIT_ENTRY_ENABLED
+                    and s["signal_strength"] == "EXTREME"
+                    and s.get("extreme_quality")
+                    and trade.get("status") == "open"):
+                atr_pct = trade.get("sl_pct", STOP_LOSS) / ATR_SL_MULT if ATR_SL_MULT > 0 else STOP_LOSS
+                pending_data = {
+                    "first_fill":    trade["entry"],
+                    "first_qty":     trade["qty"],
+                    "first_oco_id":  trade["oco_id"],
+                    "atr_pct":       atr_pct,
+                    "sl_pct":        trade.get("sl_pct", STOP_LOSS),
+                    "tp_pct":        trade.get("tp_pct", TAKE_PROFIT),
+                    "capital_half":  capital,
+                    "time":          datetime.now().isoformat(),
+                }
+                _save_pending_second_entry(s["symbol"], pending_data)
+                trigger_price = trade["entry"] * (1 - atr_pct * SPLIT_ENTRY_ATR_MULT)
+                send_telegram(
+                    f"🎯 *Split entry armed* — `{s['symbol']}`\n"
+                    f"Second leg triggers at `${trigger_price:.4f}` "
+                    f"({SPLIT_ENTRY_ATR_MULT}× ATR below entry). "
+                    f"TTL: {SPLIT_ENTRY_TTL_H}h."
+                )
+            return trade
+
         if cron_mode:
             print("  [CRON MODE] Waiting for Telegram confirmation...")
             for s in signals:
-                capital = _calc_capital(s, context)
                 if wait_telegram_confirm(s["symbol"], timeout=120):
                     try:
-                        _, _, trade = place_buy_order(s["symbol"], capital, s["price"], s.get("closed_klines"))
+                        trade = _place_and_arm(s)
                         new_trades.append(trade)
-                        send_telegram(
-                            f"✅ *Order placed*\n"
-                            f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"
-                            f"TP `${trade['tp']:.4f}` · SL `${trade['sl']:.4f}`\n"
-                            f"OCO #{trade['oco_id']}"
-                        )
                     except Exception as e:
                         print(f"  ✗ Order failed for {s['symbol']}: {e}")
                         send_telegram(f"❌ Order failed for `{s['symbol']}`: {_escape_md(e)}")
@@ -2145,15 +2429,8 @@ def scan() -> None:
             if confirm.upper() == "CONFIRM":
                 for s in signals:
                     try:
-                        capital = _calc_capital(s, context)
-                        _, _, trade = place_buy_order(s["symbol"], capital, s["price"], s.get("closed_klines"))
+                        trade = _place_and_arm(s)
                         new_trades.append(trade)
-                        send_telegram(
-                            f"✅ *Order placed*\n"
-                            f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"
-                            f"TP `${trade['tp']:.4f}` · SL `${trade['sl']:.4f}`\n"
-                            f"OCO #{trade['oco_id']}"
-                        )
                     except Exception as e:
                         print(f"  ✗ Order failed for {s['symbol']}: {e}")
                         send_telegram(f"❌ Order failed for `{s['symbol']}`: {_escape_md(e)}")

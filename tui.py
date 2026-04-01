@@ -44,6 +44,7 @@ from textual.widgets import (
 # so this import does NOT hijack sys.stdout.
 from scanner import (
     LOG_FILE,
+    MAX_DRAWDOWN_PCT,
     MAX_POSITIONS,
     PAIRS,
     STATE_FILE,
@@ -289,7 +290,7 @@ class PortfolioWidget(Static):
             pnl_col = M_GREEN if open_pnl >= 0 else M_RED
             lines.append(f"[dim]Open P&L:[/] [{pnl_col}]{open_pnl:+.2f} USDC[/]")
 
-        if peak_usdc and peak_usdc > total:
+        if peak_usdc and total is not None and peak_usdc > total:
             dd_pct = (peak_usdc - total) / peak_usdc * 100
             if dd_pct >= 15:
                 lines.append(f"[bold {M_RED}]🛑 HALTED {dd_pct:.1f}% drawdown[/]")
@@ -820,6 +821,15 @@ class ScannerApp(App):
                 dropped = [s["symbol"] for s in candidates[1:]]
                 candidates = candidates[:1]
                 tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']}, dropping {', '.join(dropped)}[/]")
+
+            # Circuit breaker: mirror scanner.py guard (TUI scans are real orders too)
+            if self._peak_usdc and portfolio:
+                _cb_current = portfolio.get("total_usdc")
+                if _cb_current is not None:
+                    _cb_dd = (self._peak_usdc - _cb_current) / self._peak_usdc
+                    if _cb_dd >= MAX_DRAWDOWN_PCT:
+                        tlog(f"[bold red]🛑 CIRCUIT BREAKER: {_cb_dd*100:.1f}% drawdown — no orders placed[/]")
+                        candidates = []
 
             # Per-symbol guards
             signals = []

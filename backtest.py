@@ -218,6 +218,7 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
                     open_trade["peak_high_be"]    = high
                     if open_trade["entry"] > sl_price:
                         sl_price = open_trade["entry"]
+                        open_trade["sl"] = sl_price  # persist — next candle reads open_trade["sl"]
 
             # T4-4: progressive trailing — tighten delta at successive ATR milestones
             if (PROGRESSIVE_TRAILING_ENABLED and TRAILING_DELTA > 0
@@ -234,6 +235,7 @@ def backtest_symbol(symbol: str, klines: list[list[Any]]) -> list[dict[str, Any]
                     _trailing_sl = _peak * (1 - _current_bps / 10000)
                     if _trailing_sl > sl_price:
                         sl_price = _trailing_sl
+                        open_trade["sl"] = sl_price  # persist — next candle reads open_trade["sl"]
 
             tp_hit = high >= tp_price
             sl_hit = low  <= sl_price

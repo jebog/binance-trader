@@ -74,6 +74,17 @@ TRADE_TIMEOUT_H       = 72     # force-exit any position open longer than 72h
 BREAKEVEN_ENABLED  = True
 BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + BREAKEVEN_ATR_MULT × atr_pct)
 
+# ── Progressive trailing stop (T4-4) ──────────────────────────────────────────
+PROGRESSIVE_TRAILING_ENABLED = True
+# After break-even arms, tighten trailing delta at each ATR milestone.
+# Format: list of (atr_mult_trigger, new_trailing_delta_bps).
+# Stages apply in order; each fires exactly once (guarded by trailing_stage index).
+PROGRESSIVE_TRAILING_STAGES: list[tuple[float, int]] = [
+    (1.5, 100),   # at +1.5×ATR: tighten to 100bps (1.0%)
+    (2.0,  75),   # at +2.0×ATR: tighten to  75bps (0.75%)
+    (2.5,  50),   # at +2.5×ATR: tighten to  50bps (0.5%)
+]
+
 # ── Volatility-adjusted capital sizing (T3-4) ─────────────────────────────────
 VOL_SIZING_ENABLED = True
 TARGET_RISK_PCT    = 0.015  # target 1.5% portfolio risk per trade (= 1×ATR as SL floor)

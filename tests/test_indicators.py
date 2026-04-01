@@ -1644,3 +1644,142 @@ class TestEntryRefine:
             if scanner.ENTRY_REFINE_ENABLED:
                 scanner._get_15m_rsi("ETHUSDC")
         assert call_count == []   # never called when disabled
+
+
+# ── T4-4: Progressive trailing stop ──────────────────────────────────────────
+class TestProgressiveTrailing:
+    """Tests for _check_progressive_trailing() — mirrors TestBreakeven pattern."""
+
+    def _make_trade(self, sl_pct: float = 0.03, trailing_stage: int = 0,
+                    breakeven_moved: bool = True) -> dict:
+        # With sl_pct=0.03 and ATR_SL_MULT=1.5: atr_pct = 0.02
+        # Stage 0 trigger: entry*(1 + 1.5*0.02) = entry*1.03
+        return {
+            "symbol":          "ETHUSDC",
+            "time":            datetime.now().isoformat(),
+            "entry":           2000.0,
+            "tp":              2210.0,
+            "sl":              2000.0,   # break-even already at entry
+            "qty":             0.1,
+            "order_id":        111,
+            "oco_id":          222,
+            "status":          "open",
+            "sl_pct":          sl_pct,
+            "tp_pct":          0.07,
+            "breakeven_moved": breakeven_moved,
+            "trailing_stage":  trailing_stage,
+        }
+
+    def _exch_info(self) -> dict:
+        return {"symbols": [{"filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}
+
+    def _mock_oco(self) -> dict:
+        return {"orderListId": 999}
+
+    def test_not_fires_before_breakeven(self):
+        """breakeven_moved=False → no action regardless of price."""
+        import scanner
+        trade = self._make_trade(breakeven_moved=False)
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete") as mock_del:
+            result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
+        assert result is False
+        mock_del.assert_not_called()
+
+    def test_all_stages_applied_guard(self):
+        """trailing_stage == len(stages) → no action."""
+        import scanner
+        trade = self._make_trade(trailing_stage=len(scanner.PROGRESSIVE_TRAILING_STAGES))
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete") as mock_del:
+            result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
+        assert result is False
+        mock_del.assert_not_called()
+
+    def test_disabled_guard(self):
+        """PROGRESSIVE_TRAILING_ENABLED=False → returns immediately."""
+        import scanner
+        trade = self._make_trade()
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", False), \
+             patch("scanner.signed_delete") as mock_del:
+            result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
+        assert result is False
+        mock_del.assert_not_called()
+
+    def test_fires_at_stage1_trigger(self):
+        """Price >= 1.5×ATR trigger → OCO cancelled and re-placed, stage advances to 1."""
+        import scanner
+        trade = self._make_trade()
+        # atr_pct=0.02, stage0 trigger=2000*(1+1.5*0.02)=2060
+        atr_mult, _ = scanner.PROGRESSIVE_TRAILING_STAGES[0]
+        sl_pct = trade["sl_pct"]
+        atr_pct = sl_pct / scanner.ATR_SL_MULT
+        trigger = trade["entry"] * (1 + atr_mult * atr_pct)
+        current_price = trigger + 1.0   # just above trigger
+
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete"), \
+             patch("scanner.get", return_value=self._exch_info()), \
+             patch("scanner.signed_post", return_value=self._mock_oco()), \
+             patch("scanner.send_telegram"), \
+             patch("scanner.os.path.exists", return_value=False):
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
+        assert result is True
+        assert trade["trailing_stage"] == 1
+        assert trade["oco_id"] == 999
+
+    def test_not_fires_below_trigger(self):
+        """Price below trigger → no action."""
+        import scanner
+        trade = self._make_trade()
+        atr_mult, _ = scanner.PROGRESSIVE_TRAILING_STAGES[0]
+        sl_pct = trade["sl_pct"]
+        atr_pct = sl_pct / scanner.ATR_SL_MULT
+        trigger = trade["entry"] * (1 + atr_mult * atr_pct)
+        current_price = trigger - 10.0   # below trigger
+
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete") as mock_del:
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
+        assert result is False
+        mock_del.assert_not_called()
+
+    def test_cancel_fail_does_not_advance_stage(self):
+        """OCO cancel fails → stage NOT incremented (retry next scan)."""
+        import scanner
+        trade = self._make_trade()
+        atr_mult, _ = scanner.PROGRESSIVE_TRAILING_STAGES[0]
+        sl_pct = trade["sl_pct"]
+        atr_pct = sl_pct / scanner.ATR_SL_MULT
+        current_price = trade["entry"] * (1 + atr_mult * atr_pct) + 1.0
+
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete", side_effect=Exception("cancel failed")):
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
+        assert result is False
+        assert trade["trailing_stage"] == 0   # not advanced
+
+    def test_oco_fail_fires_critical_alert_and_advances_stage(self):
+        """Re-OCO fails → Telegram critical alert, status=no_oco, stage incremented."""
+        import scanner
+        trade = self._make_trade()
+        atr_mult, _ = scanner.PROGRESSIVE_TRAILING_STAGES[0]
+        sl_pct = trade["sl_pct"]
+        atr_pct = sl_pct / scanner.ATR_SL_MULT
+        current_price = trade["entry"] * (1 + atr_mult * atr_pct) + 1.0
+
+        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("scanner.signed_delete"), \
+             patch("scanner.get", return_value=self._exch_info()), \
+             patch("scanner.signed_post", side_effect=Exception("OCO rejected")), \
+             patch("scanner.send_telegram") as mock_tg, \
+             patch("scanner.os.path.exists", return_value=False):
+            result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
+        assert result is True
+        assert trade["status"] == "no_oco"
+        assert trade["trailing_stage"] == 1   # advanced to prevent retry loop
+        # Telegram was called with a critical alert
+        args = mock_tg.call_args[0][0]
+        assert "FAILED" in args or "UNPROTECTED" in args

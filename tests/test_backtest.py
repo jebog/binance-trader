@@ -7,12 +7,12 @@ Kline format: [open_time, open, high, low, close, vol]  (Binance format)
 
 Price design — 100-candle declining window:
   prices[k] = 100 - k * 0.5  →  klines[99][4] = 50.5  (entry price)
-  ATR ≈ 0.60  →  sl_pct = 0.02 (clamped to ATR_SL_MIN)
+  ATR ≈ 0.61  →  atr_pct_raw ≈ 0.0122  →  sl_pct = 0.02 (clamped to ATR_SL_MIN)
   sl_price   ≈ 49.49   (entry * 0.98)
   tp_price   ≈ 52.86   (entry * (1 + 0.02 * ATR_TP_MULT/ATR_SL_MULT))
-  be_trigger ≈ 51.17   (entry * (1 + 1×(sl_pct/ATR_SL_MULT)))
-  tp1_price  ≈ 51.17   (same formula — be and tp1 coincide)
-  stage1_trig≈ 51.51   (entry * (1 + 1.5×(sl_pct/ATR_SL_MULT)))
+  be_trigger ≈ 51.11   (entry * (1 + 1 × atr_pct_raw))   — uses raw ATR%, NOT sl_pct
+  tp1_price  ≈ 51.17   (entry * (1 + 1 × sl_pct/ATR_SL_MULT)) — uses clamped sl_pct
+  stage1_trig≈ 51.42   (entry * (1 + 1.5 × atr_pct_raw))
 
 Key implementation note: progressive trailing updates sl_price on the same candle it fires.
 Tests that want clean TP/SL/TIMEOUT outcomes patch BREAKEVEN_ENABLED=False and

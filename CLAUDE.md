@@ -10,7 +10,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 5. On CONFIRM: places a market buy + OCO (TP + trailing stop)
    - EXTREME quality: buys 50% now, arms a split-entry second leg at 1×ATR below fill
    - PARTIAL_TP_ENABLED: places a standalone TP1 LIMIT_MAKER at 1×ATR for half the qty
-6. Generates an HTML dashboard and updates state.json
+6. Generates an HTML dashboard and writes all state to state.db (SQLite, WAL mode)
 7. At 8am: sends a daily Telegram digest (7-day P&L summary, open positions, F&G)
 
 ---
@@ -24,7 +24,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | `tui.py` | Textual TUI — live dashboard, runs scanner in background thread |
 | `tui.tcss` | Catppuccin Mocha theme for the TUI |
 | `backtest.py` | Walk-forward backtest (70% train / 30% test), writes `backtest_results.json` |
-| `state.json` | Runtime state: results, trades, cooldowns, portfolio, sent_signals, peak_portfolio_usdc, fg_regime |
+| `state.db` | **Canonical runtime state** (SQLite, WAL mode): trades, cooldowns, caches, kv sentinels. `state.json` no longer written; `state.json.bak` left behind if migration ran. |
 | `scanner.log` | Append-only log of every scan run |
 | `dashboard.html` | Auto-generated HTML dashboard (written after each scan) |
 
@@ -220,23 +220,36 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 | Split entry armed | One-shot on first-half placement |
 | Split entry expired | One-shot on TTL clearance |
 
-### state.json key reference
+### state.db table/key reference
+
+**SQLite tables (see schema in `scanner.py _DB_SCHEMA`):**
+
+| Table | Written by | Purpose |
+|-------|-----------|---------|
+| `trades` | `insert_trade`, `update_trade_fields` | All trades (no cap). Statuses: `open`, `partial_tp`, `partial_tp_no_oco`, `tp_hit`, `sl_hit`, `no_oco`, `timeout` |
+| `portfolio` + `portfolio_assets` | `save_portfolio` | Latest Binance balance snapshot |
+| `fg_cache` | `set_fg_cache` in `get_fear_greed` | Cached F&G response (singleton, valid 25h) |
+| `btc_dom_cache` | `set_btc_dom_cache` in `get_btc_dominance` | CoinGecko dominance value + timestamp (singleton, 1h cache) |
+| `cooldowns` | `save_cooldown` via `_save_cooldown` | SL cooldown expiry timestamps per symbol |
+| `sent_signals` | `save_sent_signal` in `scan` | Signal dedup ledger |
+| `pending_second_entries` | `save/clear_pending_second_entry` | Split-entry pending legs (T2-1) |
+| `scan_results` | `save_scan_results` | Current scan pair data (overwritten each scan) |
+| `scan_signals` | `save_scan_results` | Active signals this scan |
+| `scan_history` | `append_scan_history` | Rolling 50 scan events |
+| `log_lines` | `get_state_dict` | Rolling 200 log lines (cache) |
+| `kv` | `set_kv` | Scalar sentinels (see below) |
+
+**`kv` table keys:**
 
 | Key | Written by | Purpose |
 |-----|-----------|---------|
-| `trades` | `save_state`, `_check_sl_outcomes` | All trades (last 100). Statuses: `open`, `partial_tp`, `partial_tp_no_oco`, `tp_hit`, `sl_hit`, `no_oco` |
-| `portfolio` | `save_state` | Latest Binance balance snapshot |
 | `peak_portfolio_usdc` | `save_state` | High-water mark for drawdown calculation |
 | `fg_regime` | `save_state` | Last F&G regime bucket (`extreme_fear` / `fear` / `neutral` / `greed` / `extreme_greed`) |
-| `fg_cache` | `get_fear_greed` | Cached F&G response (valid 25h) |
-| `open_pnl` | `save_state` | Aggregate unrealized P&L from last scan (shown in TUI portfolio widget) |
-| `sent_signals` | `scan` | Signal dedup ledger |
-| `cooldowns` | `_save_cooldown` | SL cooldown expiry timestamps per symbol |
+| `open_pnl` | `save_state` | Aggregate unrealized P&L from last scan |
 | `cb_alert_sent_at` | `save_state` | Timestamp of last circuit breaker Telegram alert |
+| `last_scan` | `save_state` | ISO timestamp of last scan completion |
 | `last_digest_date` | digest block in `scan` | ISO date of last morning digest send |
-| `btc_dom_cache` | `get_btc_dominance` | CoinGecko dominance value + timestamp (1h cache, T2-3) |
-| `btc_dom_prev` | scan surgical patch | Previous scan's BTC.D value for rise-detection (T2-3) |
-| `pending_second_entries` | `_save/clear_pending_second_entry` | `{symbol: {first_fill, first_qty, first_oco_id, atr_pct, sl_pct, tp_pct, capital_half, time}}` (T2-1) |
+| `btc_dom_prev` | `scan` | Previous scan's BTC.D value for rise-detection (T2-3) |
 
 **Trade dict extra fields (Tier 2+):**
 
@@ -262,13 +275,15 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 **`markup_escape()` for exceptions** — Exception messages from Binance API responses can contain `[`, `]`, `{`, `}` that break Rich's markup parser. Always wrap `str(e)` in `markup_escape()` before passing to `tlog()`.
 
-**OCO failure guard** — If the market buy fills but the OCO POST fails, `place_buy_order` returns `(order, None, trade_partial)` with `status="no_oco"` and immediately fires a Telegram alert. The position appears in state.json for manual intervention.
+**OCO failure guard** — If the market buy fills but the OCO POST fails, `place_buy_order` returns `(order, None, trade_partial)` with `status="no_oco"` and immediately fires a Telegram alert. The position appears in state.db for manual intervention.
 
-**Binance API weight** — Each scan costs ~30 weight. At 30s interval from TUI = ~60/min, well under the 1200/min limit. The 5s state watcher reads only disk — zero API calls.
+**SQLite WAL mode** — `db_connect()` sets `PRAGMA journal_mode=WAL; synchronous=NORMAL; busy_timeout=5000`. WAL allows the TUI's 5s state reader to run concurrently with the scanner writer — no locking, no data corruption, no surgical-patch pattern needed. This is why the entire JSON surgical-patch architecture was removed.
+
+**Binance API weight** — Each scan costs ~30 weight. At 30s interval from TUI = ~60/min, well under the 1200/min limit. The 5s state watcher reads only SQLite — zero API calls.
 
 **`_order_fill_price()` for exit tracking** — SL/TP fills use `cummulativeQuoteQty / executedQty` from the filled Binance order object (falls back to `price`). Never use the stored `trade["sl"]` or `trade["tp"]` as exit price — for trailing stops the actual fill is higher than the initial activation price.
 
-**Surgical patch for `last_digest_date`** — The digest block re-reads state.json *after* `send_telegram()` completes before writing `last_digest_date`. This avoids overwriting concurrent cooldown writes that may have occurred during the network call.
+**`last_digest_date` is a simple `set_kv()` call** — No re-read needed. WAL mode means the digest's `set_kv()` after `send_telegram()` won't clobber any concurrent scanner write; SQLite serializes writers automatically.
 
 **F&G `is_fresh` guard** — `get_fear_greed()` returns `(value, classification, is_fresh: bool)`. Regime-change alerts only fire when `is_fresh=True` to prevent spurious alerts from the stale `(50, "Neutral")` fallback.
 
@@ -311,26 +326,26 @@ launchctl list com.trading.scanner
 
 ### Clear a stuck SL cooldown
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-del s["cooldowns"]["ETHUSDC"]  # remove specific symbol
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("DELETE FROM cooldowns WHERE symbol = 'ETHUSDC'")
+conn.commit(); conn.close()
 ```
 
 ### Reset the circuit breaker peak
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-del s["peak_portfolio_usdc"]   # will be re-established on next scan
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("DELETE FROM kv WHERE key = 'peak_portfolio_usdc'")  # re-established on next scan
+conn.commit(); conn.close()
 ```
 
 ### Force a digest resend today
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-s["last_digest_date"] = ""     # clear the guard — fires on next scan at DIGEST_HOUR
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('last_digest_date', '')")
+conn.commit(); conn.close()   # fires on next scan at DIGEST_HOUR
 ```
 
 ### Run backtest after changing strategy params
@@ -354,19 +369,20 @@ Set `SPLIT_ENTRY_ENABLED = False` in `config.py`. EXTREME quality signals still 
 
 ### Clear a stuck pending split entry
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-s["pending_second_entries"].pop("ETHUSDC", None)  # or s["pending_second_entries"] = {} to clear all
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("DELETE FROM pending_second_entries WHERE symbol = 'ETHUSDC'")
+# or: conn.execute("DELETE FROM pending_second_entries") to clear all
+conn.commit(); conn.close()
 ```
 
 ### Clear stale BTC dominance cache
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-s.pop("btc_dom_cache", None)
-s.pop("btc_dom_prev", None)
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("DELETE FROM btc_dom_cache")
+conn.execute("DELETE FROM kv WHERE key = 'btc_dom_prev'")
+conn.commit(); conn.close()
 ```
 
 ### Disable break-even stop
@@ -387,12 +403,13 @@ Set `PROGRESSIVE_TRAILING_ENABLED = False` in `config.py`. Break-even stop stays
 ### Reset trailing stage for a trade
 If a trade's `trailing_stage` gets stuck (e.g., after manual OCO intervention):
 ```python
-import json
-with open("state.json") as f: s = json.load(f)
-for t in s["trades"]:
-    if t["symbol"] == "ETHUSDC" and t["status"] == "open":
-        t["trailing_stage"] = 0   # reset to original delta
-with open("state.json", "w") as f: json.dump(s, f, indent=2)
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("""
+    UPDATE trades SET trailing_stage = 0
+    WHERE symbol = 'ETHUSDC' AND status = 'open'
+""")
+conn.commit(); conn.close()
 ```
 
 ---
@@ -406,7 +423,7 @@ with open("state.json", "w") as f: json.dump(s, f, indent=2)
 - **Never hardcode credentials or strategy params outside `config.py`**
 - **Never rename `_scan_ctx` back to `_context`** — it shadows a Textual internal method
 - **Never use `trade["sl"]` or `trade["tp"]` as exit price** — use `_order_fill_price()` on the filled order object; activation price is wrong for trailing stops
-- **Never do a full `json.dump` of a stale state snapshot** after a Telegram send — always re-read state.json first (surgical patch pattern)
+- **Never write to state.json** — it is no longer the persistence layer; `state.db` is canonical. Use `update_trade_fields()`, `set_kv()`, or the appropriate table helper for all state mutations
 - **Never treat all falsy returns from `_place_split_second_entry` the same** — `None` means preserve pending (retry); `{"status":"critical_fail"}` means clear pending (unrecoverable)
 - **Never put `signed_delete` params in the request body** — Binance DELETE reads the query string only
 - **Never reduce `DIVERGENCE_LOOKBACK + 14 + 28` warm-up buffer** — fewer than 28 Wilder smoothing steps corrupts the oldest RSI values

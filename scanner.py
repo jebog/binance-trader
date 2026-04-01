@@ -982,9 +982,11 @@ def _place_split_second_entry(
             "oco_id":   None,
             "status":   "no_oco",
             "split_entry":     True,
+            "signal_strength": "EXTREME",
             "sl_pct":          sl_pct,
             "tp_pct":          tp_pct,
             "breakeven_moved": False,
+            "trailing_stage":  0,
         }
 
     print(f"  Split entry combined OCO #{combined_oco.get('orderListId')}: "
@@ -1006,9 +1008,11 @@ def _place_split_second_entry(
         "oco_id":   combined_oco.get("orderListId"),
         "status":   "open",
         "split_entry":     True,
+        "signal_strength": "EXTREME",
         "sl_pct":          sl_pct,
         "tp_pct":          tp_pct,
         "breakeven_moved": False,
+        "trailing_stage":  0,
     }
 
 
@@ -1587,6 +1591,7 @@ def place_buy_order(
         "sl_pct":          sl_pct,
         "tp_pct":          tp_pct,
         "breakeven_moved": False,
+        "trailing_stage":  0,
     }
 
     # ── Partial TP1 standalone LIMIT_MAKER (T2-4) ────────────────────────────
@@ -2219,6 +2224,73 @@ def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
             return sl_pct, tp_pct
     return STOP_LOSS, TAKE_PROFIT
 
+# ── Performance statistics (T4-1) ────────────────────────────────────────────
+def _safe_fromisoformat(ts: str) -> datetime:
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.min
+
+
+def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute rolling 30-day performance stats from closed trades.
+
+    Sharpe is the per-trade information ratio (mean/std, sample-based).
+    It is not annualised because trades have variable holding periods.
+    """
+    cutoff = datetime.now() - timedelta(days=30)
+    closed = [
+        t for t in trades
+        if t.get("status") in ("tp_hit", "sl_hit", "timeout")
+        and t.get("exit_time")
+        and t.get("pnl_pct") is not None
+        and _safe_fromisoformat(t["exit_time"]) >= cutoff
+    ]
+    if not closed:
+        return {}
+
+    pnls = [t["pnl_pct"] for t in closed]
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]   # strict: zero-pnl neither win nor loss
+
+    mean_pnl = sum(pnls) / len(pnls)
+    # Sample variance (N-1) for unbiased estimate of population std
+    variance = (sum((p - mean_pnl) ** 2 for p in pnls) / (len(pnls) - 1)
+                if len(pnls) > 1 else 0.0)
+    std_pnl  = variance ** 0.5
+    # Per-trade information ratio (not annualised — trades have variable hold times)
+    sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
+
+    gross_profit = sum(wins)   if wins   else 0.0
+    gross_loss   = abs(sum(losses)) if losses else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+
+    max_consec = cur = 0
+    for p in pnls:
+        if p < 0:   # strict: zero-pnl does not extend loss streak
+            cur += 1
+            max_consec = max(max_consec, cur)
+        else:
+            cur = 0
+
+    tier_stats: dict[str, dict[str, int]] = {}
+    for t in closed:
+        tier = t.get("signal_strength", "UNKNOWN")
+        tier_stats.setdefault(tier, {"wins": 0, "total": 0})
+        tier_stats[tier]["total"] += 1
+        if t.get("pnl_pct", 0) > 0:
+            tier_stats[tier]["wins"] += 1
+
+    return {
+        "count":             len(closed),
+        "win_rate":          len(wins) / len(closed),
+        "sharpe":            sharpe,
+        "profit_factor":     profit_factor,
+        "max_consec_losses": max_consec,
+        "tier_stats":        tier_stats,
+    }
+
+
 # ── Daily digest ─────────────────────────────────────────────────────────────
 def _send_daily_digest(state: dict[str, Any]) -> None:
     """Send an 8am morning digest summarising the last 7 days of trading."""
@@ -2280,12 +2352,31 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
         f"\n*Open positions ({len(open_trades)}):*\n" + "\n".join(open_lines)
     ) if open_trades else "\n*Open positions:* None"
 
+    # 30-day performance stats (T4-1)
+    perf = _compute_perf_stats(trades)
+    if perf:
+        pf_str = f"{perf['profit_factor']:.2f}" if perf["profit_factor"] != float("inf") else "∞"
+        tier_lines = "\n  ".join(
+            f"{tier}: {v['wins']}/{v['total']} ({v['wins']/v['total']*100:.0f}%)"
+            for tier, v in sorted(perf["tier_stats"].items())
+            if v["total"] > 0
+        )
+        perf_section = (
+            f"\n\n📈 *30-day stats ({perf['count']} trades)*\n"
+            f"  Win rate: `{perf['win_rate']*100:.1f}%` | P.Factor: `{pf_str}` | IR: `{perf['sharpe']:.2f}`\n"
+            f"  Max consec losses: `{perf['max_consec_losses']}`"
+            + (f"\n  {tier_lines}" if tier_lines else "")
+        )
+    else:
+        perf_section = ""
+
     msg = (
         f"📊 *Morning Digest — {now.strftime('%a %b %-d')}*"
         f"{portfolio_line}"
         f"{fg_str}"
         f"{trades_section}"
         f"{open_section}"
+        f"{perf_section}"
         f"\n\n_Next scan in ~30 min_"
     )
     send_telegram(msg)
@@ -2619,6 +2710,7 @@ def scan() -> None:
             """Place buy order and arm split-entry pending leg if applicable."""
             capital = _calc_capital(s, context)
             _, _, trade = place_buy_order(s["symbol"], capital, s["price"], s.get("closed_klines"))
+            trade["signal_strength"] = s.get("signal_strength", "UNKNOWN")
             send_telegram(
                 f"✅ *Order placed*\n"
                 f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"

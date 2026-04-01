@@ -12,7 +12,7 @@ from datetime import datetime
 from unittest.mock import patch, MagicMock
 
 # ── Import pure functions directly (no side effects on import) ────────────────
-from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence
+from scanner import calc_rsi, calc_sma, calc_atr, detect_bullish_divergence, _compute_perf_stats
 from backtest import (
     calc_rsi as bt_calc_rsi,
     calc_sma as bt_calc_sma,
@@ -1453,3 +1453,120 @@ class TestBacktestParity:
             signal = "EXTREME"
             blocked = bt.DIVERGENCE_ENABLED and signal in ("STRONG", "MODERATE") and False
         assert not blocked  # EXTREME is not in ("STRONG", "MODERATE")
+
+
+# ── T4-1: Performance stats ───────────────────────────────────────────────────
+class TestPerfStats:
+    """Tests for _compute_perf_stats() — pure function, no I/O."""
+
+    def _trade(self, pnl_pct: float, status: str = "tp_hit",
+               signal_strength: str = "STRONG", days_ago: float = 1.0) -> dict:
+        from datetime import timedelta
+        exit_time = (datetime.now() - timedelta(days=days_ago)).isoformat()
+        return {
+            "status": status,
+            "pnl_pct": pnl_pct,
+            "exit_time": exit_time,
+            "signal_strength": signal_strength,
+        }
+
+    def test_empty_returns_empty_dict(self):
+        assert _compute_perf_stats([]) == {}
+
+    def test_no_closed_trades_returns_empty(self):
+        trades = [{"status": "open", "pnl_pct": 5.0, "exit_time": datetime.now().isoformat()}]
+        assert _compute_perf_stats(trades) == {}
+
+    def test_filters_older_than_30_days(self):
+        recent = self._trade(5.0, days_ago=1)
+        old = self._trade(-3.0, days_ago=31)
+        result = _compute_perf_stats([recent, old])
+        assert result["count"] == 1
+        assert result["win_rate"] == pytest.approx(1.0)
+
+    def test_win_rate(self):
+        trades = [
+            self._trade(5.0, "tp_hit"),
+            self._trade(3.0, "tp_hit"),
+            self._trade(-2.0, "sl_hit"),
+        ]
+        result = _compute_perf_stats(trades)
+        assert result["win_rate"] == pytest.approx(2 / 3, rel=1e-6)
+
+    def test_profit_factor_mixed(self):
+        trades = [
+            self._trade(6.0, "tp_hit"),
+            self._trade(-3.0, "sl_hit"),
+        ]
+        result = _compute_perf_stats(trades)
+        assert result["profit_factor"] == pytest.approx(2.0, rel=1e-6)
+
+    def test_profit_factor_all_wins_is_inf(self):
+        trades = [self._trade(5.0), self._trade(3.0)]
+        result = _compute_perf_stats(trades)
+        assert result["profit_factor"] == float("inf")
+
+    def test_sharpe_positive_for_winning_trades(self):
+        # IR = mean/std; with consistent wins std>0, mean>0 → IR>0
+        trades = [self._trade(5.0), self._trade(4.0), self._trade(6.0)]
+        result = _compute_perf_stats(trades)
+        assert result["sharpe"] > 0
+
+    def test_sharpe_single_trade_is_zero(self):
+        # std=0 for single trade → Sharpe defaults to 0.0
+        result = _compute_perf_stats([self._trade(5.0)])
+        assert result["sharpe"] == pytest.approx(0.0)
+        assert result["win_rate"] == pytest.approx(1.0)
+
+    def test_max_consec_losses(self):
+        trades = [
+            self._trade(3.0, "tp_hit"),
+            self._trade(-1.0, "sl_hit"),
+            self._trade(-2.0, "sl_hit"),
+            self._trade(-1.5, "sl_hit"),
+            self._trade(4.0, "tp_hit"),
+            self._trade(-1.0, "sl_hit"),
+        ]
+        result = _compute_perf_stats(trades)
+        assert result["max_consec_losses"] == 3
+
+    def test_all_losses_case(self):
+        trades = [self._trade(-1.0, "sl_hit"), self._trade(-2.0, "sl_hit")]
+        result = _compute_perf_stats(trades)
+        assert result["win_rate"] == pytest.approx(0.0)
+        assert result["profit_factor"] == pytest.approx(0.0)
+        assert result["max_consec_losses"] == 2
+
+    def test_breakeven_trade_not_counted_as_loss(self):
+        # pnl_pct=0 is neither win nor loss; max_consec_losses not incremented
+        trades = [self._trade(0.0, "tp_hit"), self._trade(-1.0, "sl_hit")]
+        result = _compute_perf_stats(trades)
+        assert result["max_consec_losses"] == 1  # only the -1.0 trade
+
+    def test_per_tier_win_rate(self):
+        trades = [
+            self._trade(5.0, "tp_hit", "EXTREME"),
+            self._trade(-2.0, "sl_hit", "EXTREME"),
+            self._trade(3.0, "tp_hit", "STRONG"),
+        ]
+        result = _compute_perf_stats(trades)
+        assert result["tier_stats"]["EXTREME"]["wins"] == 1
+        assert result["tier_stats"]["EXTREME"]["total"] == 2
+        assert result["tier_stats"]["STRONG"]["wins"] == 1
+        assert result["tier_stats"]["STRONG"]["total"] == 1
+
+    def test_timeout_trades_included(self):
+        trades = [self._trade(-1.0, "timeout")]
+        result = _compute_perf_stats(trades)
+        assert result["count"] == 1
+
+    def test_partial_tp_excluded(self):
+        # partial_tp is not a terminal status — must not appear in stats
+        from datetime import timedelta
+        trades = [{
+            "status": "partial_tp",
+            "pnl_pct": 3.0,
+            "exit_time": datetime.now().isoformat(),
+            "signal_strength": "STRONG",
+        }]
+        assert _compute_perf_stats(trades) == {}

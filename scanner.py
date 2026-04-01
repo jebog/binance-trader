@@ -3482,6 +3482,13 @@ def scan() -> None:
                 json.dump(_dom_state, f, indent=2)
         except Exception as e:
             print(f"  ⚠ Could not persist btc_dom_prev: {e}")
+        # SQLite dual-write (replaces JSON surgical patch in cleanup branch)
+        try:
+            _bdp_conn = db_connect()
+            set_kv(_bdp_conn, "btc_dom_prev", str(btc_dom))
+            _bdp_conn.close()
+        except Exception:
+            pass
 
     # ── F&G regime-change alert (fires once per threshold crossing) ───────────
     # Skip when F&G data is stale (fallback 50/"Neutral") to avoid spurious alerts
@@ -3662,7 +3669,15 @@ def scan() -> None:
                 f"Cost: `${capital} USDC`"
             )
             send_telegram(msg)
-            sent_signals[dedup_key] = datetime.now().isoformat()
+            _sent_ts = datetime.now().isoformat()
+            sent_signals[dedup_key] = _sent_ts
+            # SQLite dual-write
+            try:
+                _ss_conn = db_connect()
+                save_sent_signal(_ss_conn, dedup_key, _sent_ts)
+                _ss_conn.close()
+            except Exception:
+                pass
         _save_sent_signals(sent_signals)
 
     if signals:
@@ -3799,6 +3814,13 @@ def scan() -> None:
                 _patch["last_digest_date"] = str(now.date())
                 with open(STATE_FILE, "w") as _df:
                     json.dump(_patch, _df, indent=2)
+                # SQLite dual-write
+                try:
+                    _ldd_conn = db_connect()
+                    set_kv(_ldd_conn, "last_digest_date", str(now.date()))
+                    _ldd_conn.close()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"  ⚠ Daily digest failed: {e}")
 

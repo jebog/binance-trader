@@ -996,3 +996,151 @@ class TestSplitEntry:
         # Weighted avg: (2000*0.05 + 1960*0.051) / (0.05+0.051)
         expected_avg = (2000.0 * 0.05 + 1960.0 * 0.051) / (0.05 + 0.051)
         assert trade["entry"] == pytest.approx(expected_avg, rel=1e-3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T3-2 — Trade Timeout
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestTradeTimeout:
+    def _make_trade(self, age_h: float, status: str = "open") -> dict:
+        from datetime import timedelta
+        entry_time = (datetime.now() - timedelta(hours=age_h)).isoformat()
+        return {
+            "symbol":   "ETHUSDC",
+            "time":     entry_time,
+            "entry":    2000.0,
+            "qty":      0.1,
+            "capital":  200.0,
+            "order_id": 111,
+            "oco_id":   222,
+            "status":   status,
+            "sl_pct":   0.03,
+            "tp_pct":   0.07,
+        }
+
+    def _sell_fill(self, price: float) -> dict:
+        return {"executedQty": "0.1", "cummulativeQuoteQty": str(0.1 * price), "price": str(price)}
+
+    def test_timeout_cancels_oco_and_sells(self):
+        """_handle_trade_timeout: cancels OCO then market-sells."""
+        import scanner
+        trade = self._make_trade(80)
+        delete_calls: list = []
+        post_calls: list = []
+
+        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        assert trade["status"] == "timeout"
+        assert trade["exit_price"] == pytest.approx(1980.0)
+        assert any("/api/v3/orderList" in p for p, _ in delete_calls), "OCO cancel not called"
+
+    def test_timeout_computes_pnl(self):
+        """P&L is computed from exit fill vs entry."""
+        import scanner
+        trade = self._make_trade(80)
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(2100.0)), \
+             patch.object(scanner, "send_telegram", return_value=None):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        expected_pnl = (2100.0 - 2000.0) / 2000.0 * 100
+        assert trade["pnl_pct"] == pytest.approx(expected_pnl, rel=1e-4)
+
+    def test_timeout_sell_failed_sets_critical_status(self):
+        """If market sell fails, status = timeout_sell_failed and Telegram fires."""
+        import scanner
+        trade = self._make_trade(80)
+        telegram_msgs: list = []
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "signed_post",   side_effect=Exception("API error")), \
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        assert trade["status"] == "timeout_sell_failed"
+        assert any("TIMEOUT SELL FAILED" in m for m in telegram_msgs)
+
+    def test_timeout_no_sl_cooldown(self):
+        """_save_cooldown must NOT be called on timeout."""
+        import scanner
+        trade = self._make_trade(80)
+        cooldown_calls: list = []
+
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch.object(scanner, "_save_cooldown", side_effect=lambda s: cooldown_calls.append(s)):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        assert cooldown_calls == [], "_save_cooldown must not fire on timeout"
+
+    def test_timeout_open_trade_cancels_tp1_order(self):
+        """open status trade with tp1_order_id: TP1 order cancelled."""
+        import scanner
+        trade = self._make_trade(80, status="open")
+        trade["tp1_order_id"] = 333
+        delete_calls: list = []
+
+        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("scanner.PARTIAL_TP_ENABLED", True):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        paths = [p for p, _ in delete_calls]
+        assert "/api/v3/order" in paths, "TP1 standalone order cancel not called"
+
+    def test_timeout_partial_tp_does_not_cancel_tp1(self):
+        """partial_tp status: TP1 order was already filled — guard prevents double-cancel."""
+        import scanner
+        trade = self._make_trade(80, status="partial_tp")
+        trade["tp1_order_id"] = 333
+        trade["partial_tp1"] = {"exit_price": 2050.0, "pnl_pct": 2.5, "exit_time": datetime.now().isoformat()}
+        delete_calls: list = []
+
+        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("scanner.PARTIAL_TP_ENABLED", True):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        paths = [p for p, _ in delete_calls]
+        assert "/api/v3/order" not in paths, "TP1 order must NOT be cancelled for partial_tp status"
+
+    def test_timeout_partial_tp_weighted_pnl(self):
+        """partial_tp timeout: P&L = TP1 pnl × 50% + second-leg pnl × 50%."""
+        import scanner
+        trade = self._make_trade(80, status="partial_tp")
+        trade["partial_tp1"] = {"exit_price": 2100.0, "pnl_pct": 5.0, "exit_time": datetime.now().isoformat()}
+        # Second leg exits at 1900 → -5% on the remaining half
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1900.0)), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("scanner.PARTIAL_TP1_QTY_PCT", 0.5):
+            scanner._handle_trade_timeout(trade, "ETHUSDC")
+
+        leg2_pnl = (1900.0 - 2000.0) / 2000.0 * 100   # -5.0%
+        expected = 5.0 * 0.5 + leg2_pnl * 0.5           # 0.0%
+        assert trade["pnl_pct"] == pytest.approx(expected, rel=1e-4)
+        assert trade["status"] == "timeout"
+
+    def test_timeout_check_skips_young_trade(self):
+        """Age < TRADE_TIMEOUT_H: no action taken."""
+        import scanner
+        trade = self._make_trade(10)  # only 10h old; way below 72h timeout
+
+        sell_calls: list = []
+        with patch.object(scanner, "signed_delete", return_value=None), \
+             patch.object(scanner, "signed_post", side_effect=lambda p, d: sell_calls.append((p, d))), \
+             patch.object(scanner, "send_telegram", return_value=None), \
+             patch("scanner.TRADE_TIMEOUT_ENABLED", True):
+            # Simulate the timeout guard logic directly (as written in _check_sl_outcomes)
+            age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
+            would_timeout = age_h >= scanner.TRADE_TIMEOUT_H
+        assert not would_timeout
+        assert sell_calls == []

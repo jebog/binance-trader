@@ -74,6 +74,35 @@ PARTIAL_TP1_QTY_PCT  = 0.50   # fraction closed at TP1
 SPLIT_ENTRY_ENABLED  = True
 SPLIT_ENTRY_ATR_MULT = 1.0    # second entry triggers at first_fill × (1 - 1×ATR%)
 SPLIT_ENTRY_TTL_H    = 48     # expire pending entry after 48h
+
+# T3-2: Trade timeout
+TRADE_TIMEOUT_ENABLED = True
+TRADE_TIMEOUT_H       = 72    # force-exit any position open longer than 72h
+
+# T3-1: Break-even stop
+BREAKEVEN_ENABLED  = True
+BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + 1×ATR%)
+
+# T3-4: Volatility-adjusted capital sizing
+VOL_SIZING_ENABLED = True
+TARGET_RISK_PCT    = 0.015  # target 1.5% portfolio risk per trade
+VOL_SIZING_MIN     = 0.25   # floor: never below 25% of CAPITAL
+VOL_SIZING_MAX     = 1.00   # ceiling: never above 100% of CAPITAL
+
+# T4-2: 15m entry refinement
+ENTRY_REFINE_ENABLED     = True
+ENTRY_REFINE_15M_RSI_MAX = 45    # skip if 15m RSI > this (momentum peaked on shorter TF)
+ENTRY_REFINE_15M_LIMIT   = 50    # candles to fetch (35 Wilder steps for convergence)
+
+# T4-3: Dynamic pair scoring
+PAIR_SCORE_ENABLED    = True
+PAIR_SCORE_MIN_TRADES = 3     # min closed trades to compute score (else neutral 0.5)
+PAIR_SCORE_LOOKBACK   = 20    # last N closed trades per symbol
+
+# T4-4: Progressive trailing stop
+PROGRESSIVE_TRAILING_ENABLED = True
+# WARNING: do not reorder stages while open trades are active (trades track by index)
+PROGRESSIVE_TRAILING_STAGES = [(1.5, 100), (2.0, 75), (2.5, 50)]  # (atr_mult, bps)
 ```
 
 ---
@@ -114,6 +143,17 @@ F&G < 20 (Extreme Fear) blocks MODERATE signals. BTC RSI < 30 + below SMA blocks
 - **RSI divergence (T2-2)**: blocks STRONG/MODERATE when price makes a lower low AND RSI also makes a lower low (confirmed weakness). `detect_bullish_divergence()` returns `True` (divergence ok), `False` (block), `None` (allow).
 - **BTC dominance (T2-3)**: blocks MODERATE when BTC.D rises >0.5% scan-over-scan. `get_btc_dominance()` caches CoinGecko result 1h. Returns `None` on failure → fail-open.
 
+**Tier 3 position management:**
+- **Break-even stop (T3-1)**: when price ≥ entry × (1 + `BREAKEVEN_ATR_MULT` × ATR%), cancels OCO and replaces with SL at entry. Fires once per trade (`breakeven_moved=True` guard). `_check_breakeven()` in scanner.py.
+- **Trade timeout (T3-2)**: if any open trade has been open > `TRADE_TIMEOUT_H` hours, places a market sell and marks `status="timeout"`. Checked in `scan()` before break-even phase.
+- **Volatility-adjusted sizing (T3-4)**: capital per trade = `TARGET_RISK_PCT × portfolio / atr_pct`, clamped to `[VOL_SIZING_MIN, VOL_SIZING_MAX] × CAPITAL`. Falls back to `CAPITAL` if ATR unavailable.
+
+**Tier 4 analytics and entry quality:**
+- **Performance reporting (T4-1)**: `_compute_perf_stats()` computes per-trade IR (mean/std of pnl_pct), profit factor, max consecutive losses, and per-tier win rates from the trailing 30 days of closed trades. Appended to daily digest if any closed trades exist.
+- **15m entry refinement (T4-2)**: before placing an order, `_get_15m_rsi()` fetches 50 15m candles and computes RSI. If RSI > `ENTRY_REFINE_15M_RSI_MAX` (default 45), the signal is deferred this scan (logged + Telegram in cron mode). Fail-open: API error → allow.
+- **Dynamic pair scoring (T4-3)**: correlation cap (≥3 candidates) sorts by `_pair_score()` instead of RSI alone. Score = win_rate × profit_factor from last 20 closed trades per symbol. Fewer than 3 trades → neutral score 0.5. All-wins → returns win_rate (avoids huge epsilon-divided value).
+- **Progressive trailing stop (T4-4)**: after break-even arms, `_check_progressive_trailing()` tightens trailing delta at 1.5×/2×/2.5×ATR milestones (stages 1/2/3). Each stage cancels OCO and re-places with tighter `new_bps`. Cancel failure → retry next scan (stage not advanced). Re-OCO failure → critical Telegram + `no_oco` + advance stage (prevent retry loop). Stage tracked via `trade["trailing_stage"]` integer.
+
 ### Multi-timeframe (daily trend filter)
 
 Each `analyze()` call fetches 30 daily candles to compute `daily_rsi` and check `daily_bullish`:
@@ -126,15 +166,19 @@ The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTRE
 ### Scan phases (scanner.py `scan()` and tui.py `action_trigger_scan`)
 
 1. **Check SL outcomes** — scan closed OCO orders, mark tp_hit/sl_hit/partial_tp; detect TP1 fills; compute weighted P&L for partial_tp exits
-2. **Split-entry check (T2-1)** — check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
-3. **Fetch context** — Fear & Greed, BTC RSI/SMA/price, BTC dominance; fire F&G regime-change alert if threshold crossed
-4. **Fetch portfolio** — live Binance balances
-5. **Analyze all pairs** — collect candidates; apply divergence (T2-2) and dom-rising (T2-3) gates inside `analyze()`
-6. **Correlation cap** — if ≥ 3 candidates, keep only lowest RSI (avoid concentrated BTC exposure)
-7. **Circuit breaker** — if drawdown from `peak_portfolio_usdc` ≥ `MAX_DRAWDOWN_PCT`, clear candidates and halt
-8. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
-9. **Place orders** — `_place_and_arm()`: market buy → OCO → TP1 LIMIT_MAKER (T2-4) → arm split-entry pending (T2-1 EXTREME quality)
-10. **Daily digest** — if `now.hour == DIGEST_HOUR` and not yet sent today, fire 7-day summary to Telegram
+2. **Trade timeout (T3-2)** — force-exit any position open > `TRADE_TIMEOUT_H` hours; marks `status="timeout"`
+3. **Split-entry check (T2-1)** — check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
+4. **Break-even stop (T3-1)** — for each open+partial_tp trade: if price ≥ break-even trigger, cancel OCO + re-place with SL at entry; sets `breakeven_moved=True`
+5. **Progressive trailing (T4-4)** — for each break-even-armed trade: check 1.5×/2×/2.5×ATR milestones; tighten trailing delta at each stage; advances `trailing_stage` index
+6. **Fetch context** — Fear & Greed, BTC RSI/SMA/price, BTC dominance; fire F&G regime-change alert if threshold crossed
+7. **Fetch portfolio** — live Binance balances
+8. **Analyze all pairs** — collect candidates; apply divergence (T2-2) and dom-rising (T2-3) gates inside `analyze()`
+9. **Correlation cap** — if ≥ 3 candidates, sort by `_pair_score()` win_rate×profit_factor (T4-3); keep top 1
+10. **Circuit breaker** — if drawdown from `peak_portfolio_usdc` ≥ `MAX_DRAWDOWN_PCT`, clear candidates and halt
+11. **Per-symbol guards** — skip if: open position exists, SL cooldown active, MAX_POSITIONS reached
+12. **15m entry refinement (T4-2)** — fetch 50 15m candles; compute RSI; defer if RSI > `ENTRY_REFINE_15M_RSI_MAX`; fail-open
+13. **Place orders** — `_place_and_arm()`: market buy → OCO → TP1 LIMIT_MAKER (T2-4) → arm split-entry pending (T2-1 EXTREME quality)
+14. **Daily digest** — if `now.hour == DIGEST_HOUR` and not yet sent today, fire 7-day summary + 30-day perf stats (T4-1) to Telegram
 
 ### State machine per trade
 
@@ -194,7 +238,7 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 | `btc_dom_prev` | scan surgical patch | Previous scan's BTC.D value for rise-detection (T2-3) |
 | `pending_second_entries` | `_save/clear_pending_second_entry` | `{symbol: {first_fill, first_qty, first_oco_id, atr_pct, sl_pct, tp_pct, capital_half, time}}` (T2-1) |
 
-**Trade dict extra fields (Tier 2):**
+**Trade dict extra fields (Tier 2+):**
 
 | Field | Set by | Meaning |
 |-------|--------|---------|
@@ -202,6 +246,9 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 | `tp1_order_id`, `tp1_price`, `tp1_qty` | `place_buy_order` | Partial TP1 LIMIT_MAKER details (T2-4) |
 | `partial_tp1` | `_handle_partial_tp1` | `{exit_price, pnl_pct, exit_time}` for the first half exit |
 | `split_entry` | `_place_split_second_entry` | `True` when trade is the combined second-leg result |
+| `breakeven_moved` | `_check_breakeven` | `True` once break-even stop has been armed (T3-1) |
+| `trailing_stage` | `place_buy_order`, `_check_progressive_trailing` | `0`=original delta; `1/2/3`=stage applied (T4-4) |
+| `signal_strength` | `_place_and_arm` | `"EXTREME"/"STRONG"/"MODERATE"` — used by T4-1 per-tier stats and T4-3 pair score |
 
 ---
 
@@ -322,6 +369,32 @@ s.pop("btc_dom_prev", None)
 with open("state.json", "w") as f: json.dump(s, f, indent=2)
 ```
 
+### Disable break-even stop
+Set `BREAKEVEN_ENABLED = False` in `config.py`. SL remains at original ATR-based level for entire trade duration.
+
+### Disable trade timeout
+Set `TRADE_TIMEOUT_ENABLED = False` in `config.py`. Positions can stay open indefinitely until OCO fills.
+
+### Disable 15m entry refinement
+Set `ENTRY_REFINE_ENABLED = False` in `config.py`. Orders placed without checking 15m RSI momentum state.
+
+### Disable dynamic pair scoring
+Set `PAIR_SCORE_ENABLED = False` in `config.py`. Correlation cap falls back to lowest-RSI sort (original behavior).
+
+### Disable progressive trailing
+Set `PROGRESSIVE_TRAILING_ENABLED = False` in `config.py`. Break-even stop stays at entry price for all ATR milestones.
+
+### Reset trailing stage for a trade
+If a trade's `trailing_stage` gets stuck (e.g., after manual OCO intervention):
+```python
+import json
+with open("state.json") as f: s = json.load(f)
+for t in s["trades"]:
+    if t["symbol"] == "ETHUSDC" and t["status"] == "open":
+        t["trailing_stage"] = 0   # reset to original delta
+with open("state.json", "w") as f: json.dump(s, f, indent=2)
+```
+
 ---
 
 ## What NOT to do
@@ -338,3 +411,6 @@ with open("state.json", "w") as f: json.dump(s, f, indent=2)
 - **Never put `signed_delete` params in the request body** — Binance DELETE reads the query string only
 - **Never reduce `DIVERGENCE_LOOKBACK + 14 + 28` warm-up buffer** — fewer than 28 Wilder smoothing steps corrupts the oldest RSI values
 - **Never add `partial_tp_no_oco` to `active_statuses`** — these positions need manual intervention; the scanner should not monitor them automatically
+- **Never reorder `PROGRESSIVE_TRAILING_STAGES` while trades are active** — trades track progress via integer index; reordering changes which trigger/bps applies to the current stage
+- **Never annualize the per-trade IR in `_compute_perf_stats`** — trades have variable hold times, not fixed scan-period returns; annualizing with 17520 (scan periods/year) produces meaningless values
+- **Never skip the 15m RSI warm-up candles** — `ENTRY_REFINE_15M_LIMIT=50` gives 35 Wilder smoothing steps; fewer than ~28 produces RSI values with >20% error near thresholds

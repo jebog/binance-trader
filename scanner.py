@@ -1439,7 +1439,8 @@ def scan() -> None:
     cooldowns = _load_cooldowns()
     _open_pos   = get_open_positions()
     open_count  = len(_open_pos)
-    open_pnl_usdc: Optional[float] = sum(p["pnl"] for p in _open_pos if p.get("pnl") is not None) or None
+    _pnl_vals     = [p["pnl"] for p in _open_pos if p.get("pnl") is not None]
+    open_pnl_usdc = sum(_pnl_vals) if _pnl_vals else None
 
     # ── Phase 1: Analyze all pairs, collect raw candidates ───────────────────
     candidates = []
@@ -1515,10 +1516,9 @@ def scan() -> None:
                 f"{icon} `{pair:<5}` ${r['price']:<10.4f} RSI:`{r['rsi']:<5}` 24h:`{r['change24h']:+.2f}%`"
                 + (f"  *{r['signal_strength']}*" if r["signal_strength"] != "NONE" else "")
             )
-        positions = get_open_positions()
-        if positions:
+        if _open_pos:
             lines.append("\n📈 *Positions*")
-            for p in positions:
+            for p in _open_pos:
                 pair    = p["symbol"].replace("USDC", "")
                 pnl_str = (f"{p['pnl_pct']:+.2f}%  `{'%.2f' % p['pnl']}$`"
                            if p["pnl"] is not None else "n/a")

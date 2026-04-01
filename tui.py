@@ -774,7 +774,8 @@ class ScannerApp(App):
             cooldowns  = _load_cooldowns()
             positions  = get_open_positions()
             open_count = len(positions)
-            open_pnl   = sum(p["pnl"] for p in positions if p.get("pnl") is not None) or None
+            _pnl_vals  = [p["pnl"] for p in positions if p.get("pnl") is not None]
+            open_pnl   = sum(_pnl_vals) if _pnl_vals else None
             scan_bar   = self._scan_bar  # reference captured on main thread in watch_scanning
 
             for symbol in PAIRS:
@@ -828,6 +829,7 @@ class ScannerApp(App):
                 [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                   "signal_strength": s["signal_strength"]} for s in signals],
                 portfolio=portfolio,
+                open_pnl=open_pnl,
             )
             if portfolio:
                 try:
@@ -985,7 +987,7 @@ class ScannerApp(App):
             if p.get("time"):
                 try:
                     delta_h = (datetime.now() - datetime.fromisoformat(p["time"])).total_seconds() / 3600
-                    held_str = f"{delta_h/24:.1f}d" if delta_h >= 48 else f"{delta_h:.0f}h"
+                    held_str = f"{delta_h/24:.1f}d" if delta_h >= 24 else f"{delta_h:.0f}h"
                 except Exception:
                     pass
             table.add_row(

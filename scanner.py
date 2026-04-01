@@ -48,6 +48,7 @@ from config import (  # noqa: E402
     WEBHOOK_URL,
     PAIRS, CAPITAL,
     MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
+    ENTRY_REFINE_ENABLED, ENTRY_REFINE_15M_RSI_MAX, ENTRY_REFINE_15M_LIMIT,
     DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
     BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
     PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
@@ -2213,6 +2214,18 @@ def _calc_capital(s: dict[str, Any], context: dict[str, Any]) -> float:
         return CAPITAL / 2
     return CAPITAL
 
+def _get_15m_rsi(symbol: str) -> Optional[float]:
+    """Fetch latest 15m RSI for a symbol. Returns None on failure (fail-open)."""
+    try:
+        klines = get("/api/v3/klines", {"symbol": symbol, "interval": "15m",
+                                        "limit": ENTRY_REFINE_15M_LIMIT})
+        closes = [float(k[4]) for k in klines]
+        return calc_rsi(closes)
+    except Exception as e:
+        print(f"  ⚠ 15m RSI fetch failed for {symbol}: {e} — fail-open")
+        return None
+
+
 def _estimate_sl_tp_pct(s: dict[str, Any]) -> tuple[float, float]:
     """Estimate SL/TP % for pre-order display — mirrors place_buy_order ATR logic."""
     if ATR_SL_MULT > 0 and s.get("closed_klines"):
@@ -2747,6 +2760,11 @@ def scan() -> None:
             print("  [CRON MODE] Waiting for Telegram confirmation...")
             for s in signals:
                 if wait_telegram_confirm(s["symbol"], timeout=120):
+                    if ENTRY_REFINE_ENABLED:
+                        rsi_15m = _get_15m_rsi(s["symbol"])
+                        if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
+                            print(f"  ⏩ {s['symbol']} 15m RSI {rsi_15m:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
+                            continue
                     try:
                         trade = _place_and_arm(s)
                         new_trades.append(trade)
@@ -2757,6 +2775,11 @@ def scan() -> None:
             confirm = input("\n  Type CONFIRM to place order(s), or SKIP to skip: ").strip()
             if confirm.upper() == "CONFIRM":
                 for s in signals:
+                    if ENTRY_REFINE_ENABLED:
+                        rsi_15m = _get_15m_rsi(s["symbol"])
+                        if rsi_15m is not None and rsi_15m > ENTRY_REFINE_15M_RSI_MAX:
+                            print(f"  ⏩ {s['symbol']} 15m RSI {rsi_15m:.1f} > {ENTRY_REFINE_15M_RSI_MAX} — deferred")
+                            continue
                     try:
                         trade = _place_and_arm(s)
                         new_trades.append(trade)

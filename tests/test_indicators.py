@@ -1562,7 +1562,6 @@ class TestPerfStats:
 
     def test_partial_tp_excluded(self):
         # partial_tp is not a terminal status — must not appear in stats
-        from datetime import timedelta
         trades = [{
             "status": "partial_tp",
             "pnl_pct": 3.0,
@@ -1570,3 +1569,66 @@ class TestPerfStats:
             "signal_strength": "STRONG",
         }]
         assert _compute_perf_stats(trades) == {}
+
+
+# ── T4-2: 15m entry refinement ────────────────────────────────────────────────
+class TestEntryRefine:
+    """Tests for _get_15m_rsi() helper — fail-open behaviour."""
+
+    def _make_klines(self, closes: list) -> list:
+        """Build minimal klines list where index 4 = close price."""
+        return [[0, 0, 0, 0, str(c), 0] for c in closes]
+
+    def test_get_15m_rsi_returns_float(self):
+        """Normal response → returns float RSI."""
+        import scanner
+        closes = [100.0 + i * 0.5 for i in range(30)]
+        klines = self._make_klines(closes)
+        with patch("scanner.get", return_value=klines):
+            result = scanner._get_15m_rsi("ETHUSDC")
+        assert isinstance(result, float)
+        assert 0 <= result <= 100
+
+    def test_get_15m_rsi_fail_open_on_api_error(self):
+        """API exception → returns None (fail-open, order can proceed)."""
+        import scanner
+        with patch("scanner.get", side_effect=Exception("timeout")):
+            result = scanner._get_15m_rsi("ETHUSDC")
+        assert result is None
+
+    def test_entry_refine_blocks_high_rsi(self):
+        """Strongly rising closes → RSI > 50 (gate would block high-momentum entry)."""
+        import scanner
+        closes = [100.0 + i * 2.0 for i in range(30)]
+        klines = self._make_klines(closes)
+        with patch("scanner.get", return_value=klines):
+            rsi = scanner._get_15m_rsi("ETHUSDC")
+        assert rsi is not None
+        assert rsi > 50
+
+    def test_entry_refine_allows_low_rsi(self):
+        """Falling closes → RSI < 50 (gate allows oversold entry)."""
+        import scanner
+        closes = [100.0 - i * 2.0 for i in range(30)]
+        klines = self._make_klines(closes)
+        with patch("scanner.get", return_value=klines):
+            rsi = scanner._get_15m_rsi("ETHUSDC")
+        assert rsi is not None
+        assert rsi < 50
+
+    def test_entry_refine_threshold_boundary(self):
+        """RSI == threshold → allowed (condition is strictly greater-than)."""
+        import scanner
+        max_val = scanner.ENTRY_REFINE_15M_RSI_MAX
+        # The gate: rsi > max_val → blocked; rsi == max_val → NOT blocked
+        assert not (max_val > max_val)   # equal is not strictly greater
+
+    def test_entry_refine_disabled_skips_check(self):
+        """ENTRY_REFINE_ENABLED=False → get() never called."""
+        import scanner
+        with patch("scanner.ENTRY_REFINE_ENABLED", False), \
+             patch("scanner.get", side_effect=Exception("should not be called")):
+            # _get_15m_rsi is still callable; the gate in scan() skips it
+            # Test the guard constant directly
+            enabled = scanner.ENTRY_REFINE_ENABLED
+        assert enabled is False

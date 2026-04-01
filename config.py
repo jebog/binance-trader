@@ -46,6 +46,11 @@ DIVERGENCE_ENABLED     = True
 DIVERGENCE_LOOKBACK    = 20     # candles to scan for swing lows
 DIVERGENCE_SWING_DEPTH = 0.005  # swing low must be ≥ 0.5% below both neighbors
 
+# ── 15m entry refinement (T4-2) ──────────────────────────────────────────────
+ENTRY_REFINE_ENABLED     = True
+ENTRY_REFINE_15M_RSI_MAX = 45    # skip order if 15m RSI > this (momentum peaked on shorter TF)
+ENTRY_REFINE_15M_LIMIT   = 30    # candles to fetch (Wilder RSI needs ≥ 28 steps to converge)
+
 # ── BTC dominance filter (T2-3) ───────────────────────────────────────────────
 BTC_DOM_ENABLED        = True
 BTC_DOM_CACHE_H        = 1       # cache lifetime hours (CoinGecko free tier: ~50 req/min)

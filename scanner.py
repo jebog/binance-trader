@@ -50,6 +50,7 @@ from config import (  # noqa: E402
     MAX_POSITIONS, SL_COOLDOWN_H, MAX_DRAWDOWN_PCT, DIGEST_HOUR,
     DIVERGENCE_ENABLED, DIVERGENCE_LOOKBACK, DIVERGENCE_SWING_DEPTH,
     BTC_DOM_ENABLED, BTC_DOM_CACHE_H, BTC_DOM_RISE_THRESHOLD,
+    PARTIAL_TP_ENABLED, PARTIAL_TP1_ATR_MULT, PARTIAL_TP1_QTY_PCT,
     STOP_LOSS, TAKE_PROFIT,
     TRAILING_DELTA,
     ATR_SL_MULT, ATR_TP_MULT, ATR_SL_MIN, ATR_SL_MAX,
@@ -255,6 +256,30 @@ def signed_post(path: str, params: dict[str, Any]) -> Any:
             "User-Agent": "binance-spot/1.1.0 (Scanner)",
             "X-MBX-APIKEY": API_KEY,
             "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise Exception(f"HTTP {e.code} — {body}") from None
+
+def signed_delete(path: str, params: dict[str, Any]) -> Any:
+    """Authenticated DELETE request — used to cancel OCO order lists.
+
+    Binance DELETE endpoints read params from the query string, not the body.
+    """
+    params["timestamp"] = int(time.time() * 1000)
+    query = urllib.parse.urlencode(params)
+    sig = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = sig
+    full_url = BASE_URL + path + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        full_url, data=None, method="DELETE",
+        headers={
+            "User-Agent": "binance-spot/1.1.0 (Scanner)",
+            "X-MBX-APIKEY": API_KEY,
         }
     )
     try:
@@ -781,16 +806,23 @@ def _save_cooldown(symbol: str) -> None:
         pass
 
 def _check_sl_outcomes() -> None:
-    """Check closed OCO orders — if stop leg filled, trigger SL cooldown."""
+    """Check closed OCO orders — if stop leg filled, trigger SL cooldown.
+    Also checks for partial TP1 fills (T2-4) on trades with tp1_order_id.
+    """
     if not os.path.exists(STATE_FILE):
         return
     try:
         with open(STATE_FILE) as f:
             state = json.load(f)
-        open_trades = [t for t in (state.get("trades") or []) if t.get("status") == "open"]
-        if not open_trades:
+        # Include partial_tp trades — their new OCO can still hit TP2 or SL
+        active_statuses = ("open", "partial_tp")
+        active_trades = [
+            t for t in (state.get("trades") or [])
+            if t.get("status") in active_statuses
+        ]
+        if not active_trades:
             return
-        oco_ids = {t["oco_id"]: t for t in open_trades if t.get("oco_id")}
+        oco_ids = {t["oco_id"]: t for t in active_trades if t.get("oco_id")}
         if not oco_ids:
             return
         for oco_id, trade in oco_ids.items():
@@ -799,7 +831,7 @@ def _check_sl_outcomes() -> None:
                 # Check all orders for the symbol to find TP or SL fill.
                 # Scan all filled legs before deciding — prefer TP in edge case
                 # where both legs somehow register FILLED (race condition).
-                all_orders = signed_get("/api/v3/allOrders", {"symbol": symbol, "limit": 10})
+                all_orders = signed_get("/api/v3/allOrders", {"symbol": symbol, "limit": 20})
                 tp_filled = False
                 sl_filled = False
                 filled_tp_order: Optional[dict[str, Any]] = None
@@ -813,43 +845,213 @@ def _check_sl_outcomes() -> None:
                         elif o.get("type") in ("STOP_LOSS_LIMIT", "STOP_LOSS"):
                             sl_filled = True
                             filled_sl_order = o
+
+                # Check for partial TP1 fill (T2-4) — only on trades still "open"
+                # (not yet transitioned to partial_tp).
+                if PARTIAL_TP_ENABLED and trade.get("tp1_order_id") and trade.get("status") == "open":
+                    tp1_filled_order = next(
+                        (o for o in all_orders
+                         if str(o.get("orderId")) == str(trade["tp1_order_id"])
+                         and o.get("status") == "FILLED"),
+                        None,
+                    )
+                    if tp1_filled_order:
+                        _handle_partial_tp1(trade, tp1_filled_order)
+                        # Immediately flush the partial_tp transition to state.json
+                        # (surgical patch) so that a crash before the main persistence
+                        # loop does not cause double-processing on the next scan.
+                        try:
+                            _patch: dict[str, Any] = {}
+                            if os.path.exists(STATE_FILE):
+                                with open(STATE_FILE) as _f:
+                                    _patch = json.load(_f)
+                            for _t in (_patch.get("trades") or []):
+                                if str(_t.get("order_id")) == str(trade.get("order_id")):
+                                    _t["status"]     = trade["status"]
+                                    _t["partial_tp1"] = trade.get("partial_tp1")
+                                    _t["oco_id"]     = trade.get("oco_id")
+                                    _t["qty"]        = trade.get("qty")
+                                    break
+                            with open(STATE_FILE, "w") as _f:
+                                json.dump(_patch, _f, indent=2)
+                        except Exception:
+                            pass  # best-effort; main persistence loop is the authoritative write
+                        # Skip OCO terminal-state checks this cycle —
+                        # TP2/SL will be caught on the next scan.
+                        continue
+
                 if tp_filled:
                     print(f"  ✓ TP hit detected for {symbol}")
-                    send_telegram(f"✅ TP hit on `{symbol}` — target reached")
-                    trade["status"]     = "tp_hit"
+                    # Compute final P&L — may be weighted average for partial_tp trades
                     ep = (_order_fill_price(filled_tp_order)
                           if filled_tp_order else trade.get("tp"))
-                    trade["exit_price"] = ep
                     entry = trade.get("entry")
-                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
-                    trade["exit_time"] = datetime.now().isoformat()
+                    if trade.get("status") == "partial_tp" and trade.get("partial_tp1"):
+                        # Weighted average: TP1 exit (50%) + TP2 exit (50%)
+                        p1 = trade["partial_tp1"]
+                        tp1_pnl = p1.get("pnl_pct") or 0.0
+                        tp2_pnl = (ep - entry) / entry * 100 if (entry and ep) else 0.0
+                        final_pnl = tp1_pnl * PARTIAL_TP1_QTY_PCT + tp2_pnl * (1 - PARTIAL_TP1_QTY_PCT)
+                    else:
+                        final_pnl = (ep - entry) / entry * 100 if (entry and ep) else None
+                    send_telegram(f"✅ TP hit on `{symbol}` — target reached")
+                    trade["status"]     = "tp_hit"
+                    trade["exit_price"] = ep
+                    trade["pnl_pct"]    = final_pnl
+                    trade["exit_time"]  = datetime.now().isoformat()
                 elif sl_filled:
                     print(f"  ⚠ SL hit detected for {symbol} — cooldown {SL_COOLDOWN_H}h")
-                    send_telegram(f"🔴 SL hit on `{symbol}` — pausing signals {SL_COOLDOWN_H}h")
                     _save_cooldown(symbol)
-                    trade["status"]     = "sl_hit"
                     ep = (_order_fill_price(filled_sl_order)
                           if filled_sl_order else trade.get("sl"))
-                    trade["exit_price"] = ep
                     entry = trade.get("entry")
-                    trade["pnl_pct"]   = (ep - entry) / entry * 100 if (entry and ep) else None
-                    trade["exit_time"] = datetime.now().isoformat()
+                    if trade.get("status") == "partial_tp" and trade.get("partial_tp1"):
+                        p1 = trade["partial_tp1"]
+                        tp1_pnl = p1.get("pnl_pct") or 0.0
+                        sl_pnl  = (ep - entry) / entry * 100 if (entry and ep) else 0.0
+                        final_pnl = tp1_pnl * PARTIAL_TP1_QTY_PCT + sl_pnl * (1 - PARTIAL_TP1_QTY_PCT)
+                        send_telegram(
+                            f"🔴 SL hit on `{symbol}` — partial TP1 was profitable. "
+                            f"Net P&L: {final_pnl:+.2f}%. Pausing {SL_COOLDOWN_H}h."
+                        )
+                    else:
+                        final_pnl = (ep - entry) / entry * 100 if (entry and ep) else None
+                        send_telegram(f"🔴 SL hit on `{symbol}` — pausing signals {SL_COOLDOWN_H}h")
+                    trade["status"]     = "sl_hit"
+                    trade["exit_price"] = ep
+                    trade["pnl_pct"]    = final_pnl
+                    trade["exit_time"]  = datetime.now().isoformat()
             except Exception:
                 pass
-        # Persist updated trade statuses (tp_hit / sl_hit)
+        # Persist updated trade statuses (tp_hit / sl_hit / partial_tp)
+        # Re-read state.json after all API calls to avoid clobbering concurrent writes.
         with open(STATE_FILE) as f:
             state = json.load(f)
+        # Build lookup by order_id (oco_ids key is oco_id, not a stable trade key;
+        # use order_id as tiebreaker when multiple trades share a symbol — rare).
+        resolved_by_order: dict[str, dict[str, Any]] = {
+            str(t.get("order_id")): t for _, t in oco_ids.items()
+        }
         for t in (state.get("trades") or []):
-            resolved = oco_ids.get(t.get("oco_id"))
-            if resolved and resolved.get("status") in ("tp_hit", "sl_hit"):
+            resolved = resolved_by_order.get(str(t.get("order_id")))
+            if resolved and resolved.get("status") not in ("open",):
                 t["status"]     = resolved["status"]
                 t["exit_price"] = resolved.get("exit_price")
                 t["pnl_pct"]    = resolved.get("pnl_pct")
                 t["exit_time"]  = resolved.get("exit_time")
+                # Propagate partial_tp fields
+                if resolved.get("partial_tp1"):
+                    t["partial_tp1"] = resolved["partial_tp1"]
+                if resolved.get("oco_id") is not None:
+                    t["oco_id"] = resolved["oco_id"]
+                if resolved.get("qty") is not None:
+                    t["qty"] = resolved["qty"]
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
     except Exception as e:
         print(f"  ⚠ SL outcome check failed: {e}")
+
+# ── Partial TP1 handler (T2-4) ───────────────────────────────────────────────
+def _handle_partial_tp1(trade: dict[str, Any], tp1_order: dict[str, Any]) -> None:
+    """React to a TP1 LIMIT_MAKER fill: record partial exit, cancel original OCO,
+    place a new OCO for the remaining qty at TP2/SL.
+
+    Called from _check_sl_outcomes() when trade["tp1_order_id"] is found FILLED.
+    All mutations are written back to the caller's in-memory trade dict; the
+    caller's persistence loop then flushes them to state.json.
+    """
+    symbol   = trade["symbol"]
+    tp1_fill = _order_fill_price(tp1_order) or trade.get("tp1_price")
+    entry    = trade.get("entry", 0.0)
+    tp1_pnl  = (tp1_fill - entry) / entry * 100 if (tp1_fill and entry) else None
+    trade["partial_tp1"] = {
+        "exit_price": tp1_fill,
+        "pnl_pct":    tp1_pnl,
+        "exit_time":  datetime.now().isoformat(),
+    }
+    print(f"  ✓ Partial TP1 filled for {symbol} @ ${tp1_fill:.4f} ({tp1_pnl:+.2f}% on half position)")
+
+    # Cancel original OCO (full-position protection) before placing reduced OCO
+    oco_id = trade.get("oco_id")
+    try:
+        signed_delete("/api/v3/orderList", {"symbol": symbol, "orderListId": oco_id})
+        print(f"  Cancelled original OCO #{oco_id}")
+    except Exception as cancel_err:
+        msg = (f"🚨 *Partial TP1 OCO cancel failed* — `{symbol}` original OCO #{oco_id} "
+               f"still active. Error: `{str(cancel_err)[:200]}`")
+        print(f"  ✗ {msg}")
+        send_telegram(msg)
+        trade["status"] = "partial_tp_no_oco"
+        return
+
+    # Place new OCO for remaining qty at original TP2 / SL levels
+    remaining_qty = round(trade.get("qty", 0) - trade.get("tp1_qty", 0), 8)
+    tp2_price  = trade.get("tp")
+    sl_price   = trade.get("sl")
+    try:
+        # Re-fetch exchange info for tick/step precision
+        info = get("/api/v3/exchangeInfo", {"symbol": symbol})
+        step    = 1.0
+        tick    = 0.01
+        min_qty = 0.0
+        for f in info["symbols"][0]["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step    = float(f["stepSize"])
+                min_qty = float(f["minQty"])
+            elif f["filterType"] == "PRICE_FILTER":
+                tick = float(f["tickSize"])
+        qty_prec  = len(str(step).rstrip('0').split('.')[-1])
+        tick_prec = len(str(tick).rstrip('0').split('.')[-1])
+        remaining_qty = round(math.floor(remaining_qty / step) * step, qty_prec)
+
+        if remaining_qty == 0 or remaining_qty < min_qty:
+            msg = (f"🚨 *Partial TP1 re-OCO skipped* — `{symbol}` remaining qty "
+                   f"{remaining_qty} < min_qty {min_qty}. Manual close required.")
+            print(f"  ✗ {msg}")
+            send_telegram(msg)
+            trade["status"] = "partial_tp_no_oco"
+            return
+
+        if TRAILING_DELTA > 0:
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":              symbol,
+                "side":                "SELL",
+                "quantity":            remaining_qty,
+                "aboveType":           "LIMIT_MAKER",
+                "abovePrice":          tp2_price,
+                "belowType":           "STOP_LOSS",
+                "belowStopPrice":      sl_price,
+                "belowTrailingDelta":  TRAILING_DELTA,
+                "belowTimeInForce":    "GTC",
+            })
+        else:
+            sl_limit = round(round(sl_price * 0.995 / tick) * tick, tick_prec)
+            new_oco = signed_post("/api/v3/orderList/oco", {
+                "symbol":           symbol,
+                "side":             "SELL",
+                "quantity":         remaining_qty,
+                "aboveType":        "LIMIT_MAKER",
+                "abovePrice":       tp2_price,
+                "belowType":        "STOP_LOSS_LIMIT",
+                "belowStopPrice":   sl_price,
+                "belowPrice":       sl_limit,
+                "belowTimeInForce": "GTC",
+            })
+        trade["oco_id"] = new_oco.get("orderListId")
+        trade["qty"]    = remaining_qty
+        trade["status"] = "partial_tp"
+        print(f"  New OCO placed for remaining {remaining_qty} {symbol}: #{trade['oco_id']}")
+        send_telegram(
+            f"📊 *Partial TP1 hit* — `{symbol}` half closed @ `${tp1_fill:.4f}` "
+            f"({tp1_pnl:+.2f}%). Riding remainder to TP2 `${tp2_price:.4f}`."
+        )
+    except Exception as new_oco_err:
+        msg = (f"🚨 *Partial TP1 re-OCO FAILED* — `{symbol}` {remaining_qty} UNPROTECTED. "
+               f"Place OCO manually. Error: `{str(new_oco_err)[:200]}`")
+        print(f"  ✗ {msg}")
+        send_telegram(msg)
+        trade["status"] = "partial_tp_no_oco"
+
 
 # ── Order placement ──────────────────────────────────────────────────────────
 def place_buy_order(
@@ -979,7 +1181,43 @@ def place_buy_order(
         "order_id":    order.get("orderId"),
         "oco_id":      oco.get("orderListId"),
         "status":      "open",
+        "sl_pct":      sl_pct,
+        "tp_pct":      tp_pct,
     }
+
+    # ── Partial TP1 standalone LIMIT_MAKER (T2-4) ────────────────────────────
+    # Place a separate LIMIT_MAKER for PARTIAL_TP1_QTY_PCT of the position at TP1
+    # (1.0× ATR from entry). If this fills, _handle_partial_tp1() cancels the
+    # original OCO and re-OCOs the remaining qty at the original TP2/SL levels.
+    if PARTIAL_TP_ENABLED:
+        try:
+            # TP1 = entry × (1 + ATR% × PARTIAL_TP1_ATR_MULT)
+            # ATR% is derived from sl_pct and ATR_SL_MULT so the ratio is consistent.
+            atr_pct = sl_pct / ATR_SL_MULT if ATR_SL_MULT > 0 else sl_pct
+            tp1_pct = atr_pct * PARTIAL_TP1_ATR_MULT
+            tp1_price_raw = fill_price * (1 + tp1_pct)
+            tp1_price = round(round(tp1_price_raw / tick) * tick, tick_prec)
+            tp1_qty_raw = actual_qty * PARTIAL_TP1_QTY_PCT
+            tp1_qty = round(math.floor(tp1_qty_raw / step) * step, qty_prec)
+            if tp1_qty >= min_qty and tp1_price < tp_price:
+                tp1_order = signed_post("/api/v3/order", {
+                    "symbol":           symbol,
+                    "side":             "SELL",
+                    "type":             "LIMIT_MAKER",
+                    "quantity":         tp1_qty,
+                    "price":            tp1_price,
+                    "newClientOrderId": f"partial-tp1-{int(time.time() * 1000)}",
+                })
+                trade["tp1_order_id"] = tp1_order.get("orderId")
+                trade["tp1_price"]    = tp1_price
+                trade["tp1_qty"]      = tp1_qty
+                print(f"  Partial TP1 placed: {tp1_qty} @ ${tp1_price:.4f} (orderId:{trade['tp1_order_id']})")
+            else:
+                print(f"  Partial TP1 skipped: qty {tp1_qty} < min_qty {min_qty} or tp1≥tp2")
+        except Exception as tp1_err:
+            # TP1 failure is non-fatal — full position still protected by OCO
+            print(f"  ⚠ Partial TP1 placement failed (non-fatal): {tp1_err}")
+
     return order, oco, trade
 
 # ── Dashboard ────────────────────────────────────────────────────────────────

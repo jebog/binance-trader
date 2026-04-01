@@ -734,3 +734,151 @@ class TestDetectBullishDivergence:
         # 0.3% dip at position 15
         closes[14], closes[15], closes[16] = 100.0, 99.7, 100.0
         assert detect_bullish_divergence(closes, rsi_series, swing_depth=0.005) is None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Partial TP1 (T2-4) — unit tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPartialTp1:
+    """Unit tests for T2-4 partial take-profit logic."""
+
+    def test_tp1_price_computation(self):
+        """TP1 = entry × (1 + ATR% × PARTIAL_TP1_ATR_MULT) where ATR% = sl_pct / ATR_SL_MULT."""
+        import scanner
+        # With ATR_SL_MULT=1.5, sl_pct=0.03:  ATR% = 0.02, TP1 = entry × 1.02
+        atr_pct   = 0.03 / scanner.ATR_SL_MULT
+        tp1_pct   = atr_pct * scanner.PARTIAL_TP1_ATR_MULT
+        entry     = 100.0
+        expected  = entry * (1 + tp1_pct)
+        assert expected == pytest.approx(entry * (1 + 0.03 / scanner.ATR_SL_MULT * scanner.PARTIAL_TP1_ATR_MULT), rel=1e-6)
+
+    def test_tp1_price_less_than_tp2(self):
+        """TP1 (1× ATR) must always be below TP2 (3.5× ATR) when ATR_TP_MULT > PARTIAL_TP1_ATR_MULT."""
+        import scanner
+        sl_pct   = 0.03
+        atr_pct  = sl_pct / scanner.ATR_SL_MULT
+        tp2_pct  = sl_pct * (scanner.ATR_TP_MULT / scanner.ATR_SL_MULT)
+        tp1_pct  = atr_pct * scanner.PARTIAL_TP1_ATR_MULT
+        assert tp1_pct < tp2_pct, "TP1 must be closer to entry than TP2"
+
+    def test_pnl_weighted_average(self):
+        """Final P&L for a partial_tp trade = TP1_pnl × 0.5 + TP2_pnl × 0.5."""
+        import scanner
+        tp1_pnl_pct = 2.0    # TP1 hit: +2%
+        tp2_pnl_pct = 7.0    # TP2 hit: +7%
+        qty_pct     = scanner.PARTIAL_TP1_QTY_PCT  # 0.5
+        expected    = tp1_pnl_pct * qty_pct + tp2_pnl_pct * (1 - qty_pct)
+        assert expected == pytest.approx(4.5)
+
+    def test_handle_partial_tp1_calls_cancel_and_re_oco(self):
+        """_handle_partial_tp1 must call signed_delete (cancel) then signed_post (new OCO)."""
+        import scanner, json
+
+        trade = {
+            "symbol":      "ETHUSDC",
+            "entry":       2000.0,
+            "tp":          2140.0,
+            "sl":          1940.0,
+            "qty":         0.1,
+            "tp1_qty":     0.05,
+            "tp1_price":   2020.0,
+            "tp1_order_id": 12345,
+            "oco_id":      99,
+            "status":      "open",
+            "sl_pct":      0.03,
+            "tp_pct":      0.07,
+        }
+        tp1_order = {
+            "orderId":              12345,
+            "status":               "FILLED",
+            "cummulativeQuoteQty":  "101.0",
+            "executedQty":          "0.05",
+        }
+        exch_info = {
+            "symbols": [{"filters": [
+                {"filterType": "LOT_SIZE",     "stepSize": "0.001", "minQty": "0.001"},
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+            ]}]
+        }
+
+        delete_calls = []
+        post_calls   = []
+
+        def fake_delete(path, params):
+            delete_calls.append((path, params))
+            return {"orderListId": 99}
+
+        def fake_post(path, params):
+            post_calls.append((path, params))
+            return {"orderListId": 200}
+
+        def fake_get(path, params=None):
+            if "exchangeInfo" in path:
+                return exch_info
+            raise AssertionError(f"Unexpected get({path})")
+
+        with patch.object(scanner, "signed_delete", side_effect=fake_delete), \
+             patch.object(scanner, "signed_post",   side_effect=fake_post), \
+             patch.object(scanner, "get",           side_effect=fake_get), \
+             patch.object(scanner, "send_telegram",  return_value=None):
+            scanner._handle_partial_tp1(trade, tp1_order)
+
+        assert len(delete_calls) == 1, "cancel OCO must be called exactly once"
+        assert "/orderList" in delete_calls[0][0]
+        assert len(post_calls) == 1, "new OCO must be placed exactly once"
+        assert trade["status"] == "partial_tp"
+        assert trade["oco_id"] == 200
+
+    def test_handle_partial_tp1_cancel_fail_sets_no_oco(self):
+        """When OCO cancel fails, trade status must be partial_tp_no_oco (critical alert)."""
+        import scanner
+
+        trade = {
+            "symbol": "ETHUSDC", "entry": 2000.0, "tp": 2140.0, "sl": 1940.0,
+            "qty": 0.1, "tp1_qty": 0.05, "tp1_price": 2020.0, "tp1_order_id": 12345,
+            "oco_id": 99, "status": "open",
+        }
+        tp1_order = {
+            "orderId": 12345, "status": "FILLED",
+            "cummulativeQuoteQty": "101.0", "executedQty": "0.05",
+        }
+        telegram_calls = []
+
+        with patch.object(scanner, "signed_delete", side_effect=Exception("Network timeout")), \
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
+            scanner._handle_partial_tp1(trade, tp1_order)
+
+        assert trade["status"] == "partial_tp_no_oco"
+        assert any("cancel failed" in m.lower() or "cancel" in m for m in telegram_calls), (
+            "A Telegram alert must be sent when OCO cancel fails"
+        )
+
+    def test_handle_partial_tp1_re_oco_fail_sets_no_oco(self):
+        """When re-OCO fails after cancel, status = partial_tp_no_oco + critical Telegram."""
+        import scanner
+
+        trade = {
+            "symbol": "ETHUSDC", "entry": 2000.0, "tp": 2140.0, "sl": 1940.0,
+            "qty": 0.1, "tp1_qty": 0.05, "tp1_price": 2020.0, "tp1_order_id": 12345,
+            "oco_id": 99, "status": "open",
+        }
+        tp1_order = {
+            "orderId": 12345, "status": "FILLED",
+            "cummulativeQuoteQty": "101.0", "executedQty": "0.05",
+        }
+        exch_info = {"symbols": [{"filters": [
+            {"filterType": "LOT_SIZE",     "stepSize": "0.001", "minQty": "0.001"},
+            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        ]}]}
+        telegram_calls = []
+
+        with patch.object(scanner, "signed_delete", return_value={"orderListId": 99}), \
+             patch.object(scanner, "signed_post",   side_effect=Exception("OCO rejected")), \
+             patch.object(scanner, "get",           return_value=exch_info), \
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
+            scanner._handle_partial_tp1(trade, tp1_order)
+
+        assert trade["status"] == "partial_tp_no_oco"
+        assert any("unprotected" in m.lower() for m in telegram_calls), (
+            "A critical 'UNPROTECTED' Telegram alert must be sent when re-OCO fails"
+        )

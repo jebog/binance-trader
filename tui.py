@@ -39,9 +39,10 @@ from textual.widgets import (
     TabPane,
 )
 
-# ── Import scanner functions ──────────────────────────────────────────────────
+# ── Import config + scanner functions ─────────────────────────────────────────
 # TeeLogger is guarded by `if __name__ == "__main__"` in scanner.py,
 # so this import does NOT hijack sys.stdout.
+from config import PAIR_SCORE_ENABLED
 from scanner import (
     LOG_FILE,
     MAX_DRAWDOWN_PCT,
@@ -53,10 +54,12 @@ from scanner import (
     _escape_md,
     _estimate_sl_tp_pct,
     _load_cooldowns,
+    _pair_score,
     analyze,
     db_connect,
     db_init,
     generate_dashboard,
+    get_all_trades,
     get_btc_context,
     get_fear_greed,
     get_open_positions,
@@ -434,12 +437,12 @@ class EquityWidget(Widget):
             entry = float(t.get("entry") or 0)
             if entry == 0:
                 continue
-            if t["status"] == "tp_hit" and t.get("tp"):
-                pnl = (float(t["tp"]) - entry) / entry * 100
-            elif t["status"] == "sl_hit" and t.get("sl"):
-                pnl = (float(t["sl"]) - entry) / entry * 100
-            else:
+            # Use exit_price (actual fill) — not tp/sl (activation price is wrong
+            # for trailing stops per CLAUDE.md).
+            ep = t.get("exit_price") or (t.get("tp") if t["status"] == "tp_hit" else t.get("sl"))
+            if not ep:
                 continue
+            pnl = (float(ep) - entry) / entry * 100
             cumulative += pnl
             series.append(cumulative)
 
@@ -838,12 +841,24 @@ class ScannerApp(App):
                 finally:
                     self.call_from_thread(scan_bar.advance, 1)
 
-            # Correlation cap (before per-symbol guards)
+            # Correlation cap — mirrors scanner.py scan phase 2 (T4-3)
             if len(candidates) >= 3:
-                candidates.sort(key=lambda s: s["rsi"])
+                if PAIR_SCORE_ENABLED:
+                    try:
+                        _ps_conn = db_connect()
+                        _ps_trades = get_all_trades(_ps_conn)
+                        _ps_conn.close()
+                    except Exception:
+                        _ps_trades = []
+                    _scores = {s["symbol"]: _pair_score(s["symbol"], _ps_trades) for s in candidates}
+                    candidates.sort(key=lambda s: _scores[s["symbol"]], reverse=True)
+                    reason = f"best score ({_scores[candidates[0]['symbol']]:.2f})"
+                else:
+                    candidates.sort(key=lambda s: s["rsi"])
+                    reason = "lowest RSI"
                 dropped = [s["symbol"] for s in candidates[1:]]
                 candidates = candidates[:1]
-                tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']}, dropping {', '.join(dropped)}[/]")
+                tlog(f"[yellow]⚠ Correlation cap — keeping {candidates[0]['symbol']} ({reason}), dropping {', '.join(dropped)}[/]")
 
             # Circuit breaker: mirror scanner.py guard (TUI scans are real orders too)
             if self._peak_usdc and portfolio:

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import statistics
+import time
 from datetime import datetime
 
 from rich.markup import escape as markup_escape
@@ -61,6 +63,7 @@ from scanner import (
     analyze,
     apply_correlation_cap,
     build_market_context,
+    calc_atr,
     db_connect,
     db_init,
     generate_dashboard,
@@ -265,10 +268,36 @@ class PairCard(Widget):
         else:
             daily_str = ""
 
+        # ATR% computation from closed klines
+        atr_str = ""
+        klines = result.get("closed_klines") or []
+        if klines:
+            atr_val = calc_atr(klines)
+            if atr_val is not None:
+                close_price = float(klines[-1][4])
+                if close_price > 0:
+                    atr_pct = atr_val / close_price * 100
+                    atr_str = f"[{M_SUBTEXT}]ATR:{atr_pct:.1f}%[/]"
+
+        # Divergence status
+        div_val = result.get("divergence")
+        if div_val is True:
+            div_str = f"  [{M_GREEN}]Div:\u2713[/]"
+        elif div_val is False:
+            div_str = f"  [{M_RED}]Div:\u2717[/]"
+        else:
+            div_str = ""
+
+        # Split entry badge for EXTREME quality
+        split_str = ""
+        if tier == "EXTREME" and result.get("extreme_quality"):
+            split_str = f"  [{M_MAUVE}]\u2605Split[/]"
+
         return (
             f"[bold {M_BLUE}]{name:<5}[/] [{chg_col}]{chg_str}[/]\n"
             f"[bold {M_TEXT}]{price_fmt}[/]\n"
             f"1h:[{rsi_col}]{rsi:.1f}[/]{daily_str}  {above}{mom}{vol}\n"
+            f"{atr_str}{div_str}{split_str}\n"
             f"[{sig_col}]{tier}[/]"
         )
 
@@ -366,9 +395,47 @@ class PerformanceWidget(Static):
         losses   = len(closed) - wins
         win_rate = wins / len(closed) * 100
         col = M_GREEN if win_rate >= 50 else M_ORANGE
+
+        # Profit factor
+        wins_pnl = [float(t.get("pnl_pct") or 0) for t in closed if t.get("status") == "tp_hit"]
+        losses_pnl = [float(t.get("pnl_pct") or 0) for t in closed if t.get("status") == "sl_hit"]
+        sum_wins = sum(wins_pnl) if wins_pnl else 0
+        sum_losses = abs(sum(losses_pnl)) if losses_pnl else 0
+        pf = sum_wins / sum_losses if sum_losses > 0 else 0.0
+
+        # Sharpe ratio (non-annualized, per-trade)
+        pnl_vals = [float(t.get("pnl_pct") or 0) for t in closed]
+        if len(pnl_vals) >= 2:
+            std = statistics.stdev(pnl_vals)
+            sharpe = statistics.mean(pnl_vals) / std if std > 0 else 0.0
+        else:
+            sharpe = 0.0
+
+        # Max consecutive losses
+        max_consec = 0
+        cur_consec = 0
+        for t in closed:
+            if t.get("status") == "sl_hit":
+                cur_consec += 1
+                max_consec = max(max_consec, cur_consec)
+            else:
+                cur_consec = 0
+
+        # Break-even saves: SL hit but exit >= entry and breakeven was armed
+        be_saves = sum(
+            1 for t in closed
+            if t.get("status") == "sl_hit"
+            and t.get("breakeven_moved")
+            and float(t.get("exit_price") or 0) >= float(t.get("entry") or 1)
+        )
+
+        sharpe_col = M_GREEN if sharpe > 0 else M_RED
+        pf_col = M_GREEN if pf >= 1.0 else M_ORANGE
         return (
-            f"[{col}]{wins}W[/] / [{M_RED}]{losses}L[/]  [{col}]{win_rate:.0f}% WR[/]\n"
-            f"[dim]{len(closed)} total closed trades[/]"
+            f"[{col}]{wins}W[/] / [{M_RED}]{losses}L[/]  "
+            f"[{col}]{win_rate:.0f}% WR[/]  [dim]({len(closed)} closed)[/]\n"
+            f"[{pf_col}]PF:{pf:.1f}[/]  [{sharpe_col}]Sharpe:{sharpe:.2f}[/]\n"
+            f"[{M_SUBTEXT}]Streak:{max_consec}[/]  [{M_SUBTEXT}]BE saves:{be_saves}[/]"
         )
 
     def update_trades(self, trades: list) -> None:
@@ -540,6 +607,9 @@ class ScannerApp(App):
     btc_price:      reactive[float] = reactive(0.0)
     btc_rsi:        reactive[float] = reactive(50.0)
     btc_above_sma:  reactive[bool]  = reactive(True)
+    btc_dom:        reactive[float | None] = reactive(None)
+    btc_dom_rising: reactive[bool]  = reactive(False)
+    open_pnl_usdc:  reactive[float | None] = reactive(None)
 
     # Internal state initialised in __init__ (NOT class-level to avoid shared mutable defaults)
     # _pair_results, _portfolio, _positions, _cooldowns, _trades, _scan_ctx, _notified_outcomes
@@ -558,6 +628,7 @@ class ScannerApp(App):
         self._scan_bar:          ProgressBar | None = None  # captured on main thread in watch_scanning
         self._scan_interval:     int               = AUTO_SCAN_INTERVAL
         self._scan_timer                           = None   # Timer ref for settings-driven reset
+        self._next_scan_at:      float             = 0.0    # monotonic timestamp for countdown
 
     def compose(self) -> ComposeResult:
         # ── Header
@@ -606,7 +677,7 @@ class ScannerApp(App):
 
                 with TabPane("History", id="tab-history"):
                     history_table = DataTable(id="history-table", show_cursor=False)
-                    history_table.add_columns("Time", "Symbol", "Entry", "Outcome", "Signal")
+                    history_table.add_columns("Time", "Symbol", "Entry", "Exit", "P&L", "Outcome", "Signal")
                     yield history_table
 
                 with TabPane("Backtest", id="tab-backtest"):
@@ -700,6 +771,17 @@ class ScannerApp(App):
 
         self.last_scan = (state.get("last_scan") or "")[:19]
 
+        # BTC.D from cached state
+        btc_dom_cache = state.get("btc_dom_cache")
+        if btc_dom_cache and btc_dom_cache.get("value") is not None:
+            self.btc_dom = float(btc_dom_cache["value"])
+        # Open P&L from kv
+        if state.get("open_pnl") is not None:
+            self.open_pnl_usdc = float(state["open_pnl"])
+
+        # Status bar: health dot + countdown
+        self._update_status_bar(state)
+
         # Toast on new TP/SL outcomes (seeded on mount to avoid toasting history)
         for t in self._trades:
             if t.get("status") in ("tp_hit", "sl_hit"):
@@ -768,18 +850,71 @@ class ScannerApp(App):
             self._scan_bar.display = False
 
     def watch_last_scan(self, ts: str) -> None:
+        # Status bar is now primarily driven by _update_status_bar;
+        # this watcher updates the fallback when no state is available yet
+        if ts == "\u2014":
+            self.query_one("#status-last-scan", Label).update("")
+
+    def _update_status_bar(self, state: dict | None = None) -> None:
+        """Update status bar with health dot, countdown, and last scan time."""
+        parts = []
+
+        # Health dot: green if last_scan_ok < 300s, else red
+        healthy = False
+        if state:
+            last_ok = state.get("last_scan_ok")
+            if last_ok:
+                try:
+                    age = (datetime.now() - datetime.fromisoformat(last_ok)).total_seconds()
+                    healthy = age < 300
+                except Exception:
+                    pass
+        dot_col = M_GREEN if healthy else M_RED
+        parts.append(f"[{dot_col}]\u25cf[/]")
+
+        # Countdown to next scan
+        if self._next_scan_at > 0:
+            remaining = max(0, int(self._next_scan_at - time.monotonic()))
+            parts.append(f"[{M_SUBTEXT}]Next: {remaining}s[/]")
+
+        # Last scan time
+        if self.last_scan and self.last_scan != "\u2014":
+            # Show just the time portion
+            scan_time = self.last_scan[-8:] if len(self.last_scan) >= 8 else self.last_scan
+            parts.append(f"[{M_MUTED}]Last: {scan_time}[/]")
+
         self.query_one("#status-last-scan", Label).update(
-            f"[dim]Last scan: {ts}[/]" if ts != "—" else ""
+            " | ".join(parts) if parts else ""
         )
 
     def _update_header_context(self) -> None:
         btc_arrow  = f"[{M_GREEN}]↑[/]" if self.btc_above_sma else f"[{M_RED}]↓[/]"
         fg_col     = M_RED if self.fg_value < 25 else (M_GREEN if self.fg_value > 75 else M_YELLOW)
         btc_rsi_col = M_ORANGE if self.btc_rsi < 40 else M_TEXT
+
+        # BTC.D segment
+        btc_dom_part = ""
+        if self.btc_dom is not None:
+            dom_arrow = "↑" if self.btc_dom_rising else "↓"
+            btc_dom_part = (
+                f"  [{M_MUTED}]|[/]  [{M_SUBTEXT}]BTC.D:[/]"
+                f"[{M_TEXT}]{self.btc_dom:.1f}%{dom_arrow}[/]"
+            )
+
+        # Open P&L segment
+        pnl_part = ""
+        if self.open_pnl_usdc is not None:
+            pnl_col = M_GREEN if self.open_pnl_usdc >= 0 else M_RED
+            pnl_part = (
+                f"  [{M_MUTED}]|[/]  [{M_MUTED}]P&L:[/] "
+                f"[{pnl_col}]{self.open_pnl_usdc:+.2f}$[/]"
+            )
+
         self.query_one("#header-context", Label).update(
             f"  [{M_MUTED}]F&G:[/] [{fg_col}]{self.fg_value} {self.fg_class}[/]  "
             f"[{M_MUTED}]|[/]  [{M_SUBTEXT}]BTC[/] [bold {M_TEXT}]${self.btc_price:,.0f}[/]  "
             f"[{M_MUTED}]RSI[/] [{btc_rsi_col}]{self.btc_rsi:.1f}[/] {btc_arrow}"
+            f"{btc_dom_part}{pnl_part}"
         )
 
     # ── Scan worker (off main thread) ─────────────────────────────────────────
@@ -800,6 +935,9 @@ class ScannerApp(App):
             self.call_from_thread(setattr, self, "btc_price",    context["btc_price"])
             self.call_from_thread(setattr, self, "btc_rsi",      context["btc_rsi"])
             self.call_from_thread(setattr, self, "btc_above_sma",context["btc_above_sma"])
+            if context.get("btc_dom") is not None:
+                self.call_from_thread(setattr, self, "btc_dom",        context["btc_dom"])
+                self.call_from_thread(setattr, self, "btc_dom_rising", bool(context.get("btc_dom_rising")))
             self.call_from_thread(self._update_header_context)
 
             # ── F&G regime-change alert ──────────────────────────────────────
@@ -1075,6 +1213,15 @@ class ScannerApp(App):
         self._open_pnl     = msg.open_pnl
         self._scan_ctx      = msg.context
         self.last_scan     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._next_scan_at = time.monotonic() + self._scan_interval
+
+        # Header enrichment: BTC.D + open P&L
+        if msg.context.get("btc_dom") is not None:
+            self.btc_dom = msg.context["btc_dom"]
+            self.btc_dom_rising = bool(msg.context.get("btc_dom_rising"))
+        if msg.open_pnl is not None:
+            self.open_pnl_usdc = msg.open_pnl
+        self._update_header_context()
 
         # Update pair cards
         results_by_symbol = {r["symbol"]: r for r in msg.results}
@@ -1183,6 +1330,15 @@ class ScannerApp(App):
             tp       = f"${p['tp']:.4f}"       if p.get("tp")      else "—"
             sl       = f"${p['sl']:.4f}"       if p.get("sl")      else "—"
             qty      = str(p.get("qty") or "—")
+
+            # Symbol decorations: breakeven shield + trailing stage
+            sym_display = p["symbol"]
+            if p.get("breakeven_moved"):
+                sym_display = f"\U0001f6e1 {sym_display}"
+            trail_stage = p.get("trailing_stage") or 0
+            if trail_stage > 0:
+                sym_display = f"{sym_display} S{trail_stage}"
+
             # "Held" — time since entry (hours or days)
             held_str = "—"
             if p.get("time"):
@@ -1192,24 +1348,48 @@ class ScannerApp(App):
                 except Exception:
                     pass
             table.add_row(
-                p["symbol"], qty, entry, cur, tp, sl, pnl_cell, held_str,
+                sym_display, qty, entry, cur, tp, sl, pnl_cell, held_str,
             )
 
     def _refresh_history_table(self, trades: list[dict]) -> None:
         table = self.query_one("#history-table", DataTable)
         table.clear()
         closed = [t for t in trades if t.get("status") in ("tp_hit", "sl_hit")]
-        for t in reversed(closed[-10:]):
+        for t in reversed(closed[-20:]):
             status  = t.get("status", "open")
-            outcome = {"tp_hit": "TP ✓", "sl_hit": "SL ✗", "open": "open"}.get(status, status)
+            entry_val = float(t.get("entry") or 0)
+            exit_val = t.get("exit_price")
+
+            # Breakeven save detection: SL hit but exited at or above entry
+            is_be_save = (
+                status == "sl_hit"
+                and t.get("breakeven_moved")
+                and exit_val is not None
+                and float(exit_val) >= entry_val
+            )
+            outcome_base = {"tp_hit": "TP \u2713", "sl_hit": "SL \u2717", "open": "open"}.get(status, status)
+            outcome = f"\U0001f6e1 {outcome_base}" if is_be_save else outcome_base
+
             ts      = (t.get("time") or "")[:16]
-            entry   = f"${t.get('entry', 0):.4f}"
+            entry   = f"${entry_val:.4f}"
+            exit_str = f"${float(exit_val):.4f}" if exit_val is not None else "\u2014"
+
+            # P&L column — colored
+            pnl_pct = t.get("pnl_pct")
+            if pnl_pct is not None:
+                pnl_cell = Text(f"{float(pnl_pct):+.2f}%",
+                                style="bold green" if float(pnl_pct) >= 0 else "bold red")
+            else:
+                pnl_cell = Text("\u2014")
+
             table.add_row(
                 ts,
-                t.get("symbol", "—"),
+                t.get("symbol", "\u2014"),
                 entry,
+                exit_str,
+                pnl_cell,
                 outcome,
-                t.get("signal_strength", "—"),
+                t.get("signal_strength", "\u2014"),
             )
 
     # ── Actions ───────────────────────────────────────────────────────────────

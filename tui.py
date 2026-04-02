@@ -710,20 +710,15 @@ class ScannerApp(App):
         # Load backtest results from disk (shown immediately, no API call)
         self.query_one("#backtest-widget", BacktestWidget).refresh_backtest()
 
-        # Seed known trade outcomes so we don't toast historical tp/sl hits on startup
+        # Seed known trade outcomes so we don't toast historical tp/sl hits on startup.
+        # Must include CLOSED trades — get_open_trades only returns open/partial_tp.
         try:
             _seed_conn = db_connect()
             db_init(_seed_conn)
-            seed_trades = get_open_trades(_seed_conn)
+            seed_trades = get_open_trades(_seed_conn) + get_closed_trades(_seed_conn)
             _seed_conn.close()
         except Exception:
             seed_trades = []
-        if not seed_trades:
-            try:
-                with open(STATE_FILE) as f:
-                    seed_trades = json.load(f).get("trades") or []
-            except Exception:
-                seed_trades = []
         for t in seed_trades:
             if t.get("status") in ("tp_hit", "sl_hit"):
                 key = (t.get("oco_id") or t.get("time", ""), t["status"])

@@ -424,14 +424,28 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
 
         if TRADE_TIMEOUT_ENABLED:
             timed_out_ids: set[str] = set()
+            timed_out_trades: list[dict[str, Any]] = []
             for trade in active_trades:
                 try:
                     age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
                     if age_h >= TRADE_TIMEOUT_H:
                         _handle_trade_timeout(trade, trade["symbol"])
                         timed_out_ids.add(str(trade.get("order_id", "")))
+                        timed_out_trades.append(trade)
                 except Exception as _to_e:
                     print(f"  \u26a0 Timeout check failed for {trade.get('symbol', '?')}: {_to_e}")
+            # Persist timed-out trades to DB immediately
+            for t in timed_out_trades:
+                _oid = str(t.get("order_id", ""))
+                if _oid:
+                    try:
+                        update_trade_fields(conn, _oid,
+                                            status=t["status"],
+                                            exit_price=t.get("exit_price"),
+                                            pnl_pct=t.get("pnl_pct"),
+                                            exit_time=t.get("exit_time"))
+                    except Exception:
+                        pass
             if timed_out_ids:
                 active_trades = [t for t in active_trades if str(t.get("order_id", "")) not in timed_out_ids]
 

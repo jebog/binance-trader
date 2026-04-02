@@ -52,6 +52,7 @@ from scanner import (
     PAIRS,
     STATE_FILE,
     _calc_capital,
+    _check_15m_rsi_gate,
     _check_fg_regime_change,
     _check_sl_outcomes,
     _escape_md,
@@ -73,6 +74,7 @@ from scanner import (
     get_open_trades,
     get_portfolio,
     get_state_dict,
+    insert_trade,
     load_sent_signals,
     place_buy_order,
     release_scan_lock,
@@ -1300,6 +1302,12 @@ class ScannerApp(App):
             tlog(f"[dim]⏭ {signal['symbol']} — skipped by user[/]")
             return
 
+        # 15m RSI gate — defer if momentum peaked on shorter timeframe
+        blocked_rsi = _check_15m_rsi_gate(signal["symbol"])
+        if blocked_rsi is not None:
+            tlog(f"[yellow]⏩ {signal['symbol']} 15m RSI {blocked_rsi:.1f} — deferred[/]")
+            return
+
         tlog(f"[bold cyan]Placing order for {signal['symbol']}...[/]")
         try:
             _, _, trade = place_buy_order(
@@ -1308,26 +1316,40 @@ class ScannerApp(App):
                 signal["price"],
                 signal.get("closed_klines"),
             )
-            tlog(
-                f"[green bold]✓ Order placed — {signal['symbol']}  "
-                f"qty {trade['qty']}  entry ${trade['entry']:.4f}  "
-                f"TP ${trade['tp']:.4f}  SL ${trade['sl']:.4f}[/]"
-            )
-            self.call_from_thread(
-                self.notify,
-                f"{signal['symbol']}  qty {trade['qty']}  @ ${trade['entry']:.4f}"
-                f"\nTP ${trade['tp']:.4f}  ·  SL ${trade['sl']:.4f}",
-                title="✅ Order placed",
-                severity="information",
-                timeout=15,
-            )
-            send_telegram(
-                f"✅ *Order placed*\n"
-                f"`{signal['symbol']}` {trade['qty']} @ `${trade['entry']:.4f}`\n"
-                f"TP `${trade['tp']:.4f}` · SL `${trade['sl']:.4f}`\n"
-                f"OCO #{trade['oco_id']}"
-            )
-            # Persist and refresh
+            trade["signal_strength"] = signal.get("signal_strength", "UNKNOWN")
+            # Guard: no_oco trades have no tp/sl keys
+            if trade.get("status") == "open" and trade.get("tp"):
+                tlog(
+                    f"[green bold]✓ Order placed — {signal['symbol']}  "
+                    f"qty {trade['qty']}  entry ${trade['entry']:.4f}  "
+                    f"TP ${trade['tp']:.4f}  SL ${trade['sl']:.4f}[/]"
+                )
+                self.call_from_thread(
+                    self.notify,
+                    f"{signal['symbol']}  qty {trade['qty']}  @ ${trade['entry']:.4f}"
+                    f"\nTP ${trade['tp']:.4f}  ·  SL ${trade['sl']:.4f}",
+                    title="✅ Order placed",
+                    severity="information",
+                    timeout=15,
+                )
+                send_telegram(
+                    f"✅ *Order placed*\n"
+                    f"`{signal['symbol']}` {trade['qty']} @ `${trade['entry']:.4f}`\n"
+                    f"TP `${trade['tp']:.4f}` · SL `${trade['sl']:.4f}`\n"
+                    f"OCO #{trade['oco_id']}"
+                )
+            else:
+                tlog(f"[red bold]⚠ {signal['symbol']} — order placed but OCO failed (no_oco)[/]")
+
+            # Persist trade to state.db
+            try:
+                _pc = db_connect()
+                db_init(_pc)
+                insert_trade(_pc, trade)
+                _pc.close()
+            except Exception as _pe:
+                tlog(f"[red]⚠ Trade persist failed: {markup_escape(str(_pe))}[/]")
+
             self.call_from_thread(self._read_state_file)
         except Exception as e:
             tlog(f"[red bold]✗ Order failed: {markup_escape(str(e))}[/]")

@@ -82,11 +82,19 @@ def analyze(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
     extreme_signal = rsi < 25
     extreme_quality = extreme_signal and above_sma and fg < 40
 
-    strong_signal = rsi < 32 and above_sma and fg < 75 and not daily_bearish and divergence_ok
+    # BTC panic: RSI < 30 AND below SMA → block STRONG (per CLAUDE.md spec)
+    btc_rsi = context.get("btc_rsi", 50)
+    btc_panic = btc_rsi < 30 and not btc_above
+
+    strong_signal = (
+        rsi < 32 and above_sma and fg < 75
+        and not daily_bearish and divergence_ok
+        and not btc_panic
+    )
 
     moderate_signal = (
         rsi < 40 and above_sma and vol_surge and momentum_up
-        and fg < 60
+        and fg >= 20 and fg < 60  # block in extreme fear (<20) AND greed (>=60)
         and btc_above
         and daily_bullish
         and divergence_ok

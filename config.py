@@ -22,6 +22,12 @@ TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 # ── Webhook (optional — leave empty to disable) ───────────────
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
+# ── Cron mode (launchd) ──────────────────────────────────────
+# Set CRON_ENABLED=true in .env to enable the launchd cron job.
+# When false, run_scanner.sh exits immediately (no-op).
+# The TUI has full feature parity — cron is optional.
+CRON_ENABLED = os.getenv("CRON_ENABLED", "false").lower() == "true"
+
 # ── Trading pairs & capital ───────────────────────────────────
 PAIRS   = ["ETHUSDC", "ADAUSDC", "DOGEUSDC", "BNBUSDC", "SOLUSDC", "XRPUSDC"]
 CAPITAL = 200.0   # USDC per trade

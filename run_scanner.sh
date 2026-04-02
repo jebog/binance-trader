@@ -6,10 +6,22 @@ SCANNER_DIR="/Users/jebog/Documents/Claude/Projects/Trading"
 LOG_FILE="$SCANNER_DIR/scanner.log"
 PYTHON="/Users/jebog/.pyenv/versions/3.12.4/bin/python3"
 
-# Load Binance credentials
-if [ -f "$HOME/.env" ]; then
-    export BINANCE_API_KEY=$(grep '^BINANCE_API_KEY=' "$HOME/.env" | cut -d= -f2-)
-    export BINANCE_SECRET_KEY=$(grep '^BINANCE_SECRET_KEY=' "$HOME/.env" | cut -d= -f2-)
+# Load .env (credentials + CRON_ENABLED toggle)
+if [ -f "$SCANNER_DIR/.env" ]; then
+    set -a
+    source "$SCANNER_DIR/.env"
+    set +a
+elif [ -f "$HOME/.env" ]; then
+    set -a
+    source "$HOME/.env"
+    set +a
+fi
+
+# ── Cron toggle: exit early if disabled ──────────────────────────
+# Set CRON_ENABLED=true in .env to enable. Default: disabled.
+if [ "${CRON_ENABLED:-false}" != "true" ]; then
+    echo "$(date) — CRON_ENABLED is not true, skipping scan" >> "$LOG_FILE"
+    exit 0
 fi
 
 echo "--- $(date) ---" >> "$LOG_FILE"

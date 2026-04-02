@@ -205,7 +205,7 @@ Tab:hover {
     background: $surface;
     border: solid $overlay;
     padding: 0 1;
-    height: 9;
+    height: 11;
     layout: vertical;
 }
 

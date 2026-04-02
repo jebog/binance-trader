@@ -470,12 +470,13 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
             capital = _calc_capital(s, context)
             _, _, trade = place_buy_order(s["symbol"], capital, s["price"], s.get("closed_klines"))
             trade["signal_strength"] = s.get("signal_strength", "UNKNOWN")
-            send_telegram(
-                f"\u2705 *Order placed*\n"
-                f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"
-                f"TP `${trade['tp']:.4f}` \u00b7 SL `${trade['sl']:.4f}`\n"
-                f"OCO #{trade['oco_id']}"
-            )
+            if trade.get("status") == "open" and trade.get("tp"):
+                send_telegram(
+                    f"\u2705 *Order placed*\n"
+                    f"`{s['symbol']}` {trade['qty']} units @ `${trade['entry']:.4f}`\n"
+                    f"TP `${trade['tp']:.4f}` \u00b7 SL `${trade['sl']:.4f}`\n"
+                    f"OCO #{trade['oco_id']}"
+                )
             if (SPLIT_ENTRY_ENABLED
                     and s["signal_strength"] == "EXTREME"
                     and s.get("extreme_quality")

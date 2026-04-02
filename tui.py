@@ -727,13 +727,43 @@ class ScannerApp(App):
         # Hide progress bar until first scan starts
         self.query_one("#scan-progress", ProgressBar).display = False
 
-        # Immediately read state.json for instant display
+        # Immediately read state for instant display
         self._read_state_file()
         # Start timers
         self.set_interval(STATE_READ_INTERVAL, self._read_state_file)
         self._scan_timer = self.set_interval(self._scan_interval, self.action_trigger_scan)
         # Kick off first scan right away
         self.call_after_refresh(self.action_trigger_scan)
+        # Auto-import Binance trade history (once per 24h, background thread)
+        self._auto_import_history()
+
+    # ── Auto-import Binance trade history (background, once per 24h) ────────
+    @work(thread=True, name="history-import")
+    def _auto_import_history(self) -> None:
+        try:
+            _conn = db_connect()
+            db_init(_conn)
+            last_import = get_kv(_conn, "last_history_import") or ""
+            if last_import:
+                age_h = (datetime.now() - datetime.fromisoformat(last_import)).total_seconds() / 3600
+                if age_h < 24:
+                    _conn.close()
+                    return
+            from import_history import sync_history
+            n = sync_history(_conn)
+            set_kv(_conn, "last_history_import", datetime.now().isoformat())
+            _conn.close()
+            if n > 0:
+                self.call_from_thread(
+                    self.notify,
+                    f"Imported {n} historical trade{'s' if n > 1 else ''} from Binance",
+                    title="Trade History",
+                    severity="information",
+                    timeout=8,
+                )
+                self.call_from_thread(self._read_state_file)
+        except Exception:
+            pass
 
     # ── State file watcher (cheap, disk-only) ─────────────────────────────────
     def _read_state_file(self) -> None:

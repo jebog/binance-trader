@@ -112,6 +112,46 @@ def pair_trades(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return trades
 
 
+def sync_history(conn: Any = None) -> int:
+    """Import new Binance trades into state.db. Returns count of new trades imported.
+
+    Reusable by TUI auto-import. Idempotent — skips existing order_ids.
+    """
+    _own = conn is None
+    if _own:
+        conn = db_connect()
+        db_init(conn)
+
+    existing = {row[0] for row in conn.execute("SELECT order_id FROM trades").fetchall()}
+    all_trades: list[dict] = []
+
+    for symbol in PAIRS:
+        try:
+            fills = fetch_all_trades(symbol)
+            orders = aggregate_orders(fills)
+            trades = pair_trades(orders)
+            new = [t for t in trades if str(t["order_id"]) not in existing]
+            all_trades.extend(new)
+        except Exception:
+            pass
+
+    for t in sorted(all_trades, key=lambda x: x["time"]):
+        trade_dict = {
+            "order_id": t["order_id"], "symbol": t["symbol"], "time": t["time"],
+            "entry": t["entry"], "tp": t["tp"], "sl": t["sl"], "qty": t["qty"],
+            "capital": t["capital"], "oco_id": t.get("oco_id"), "status": t["status"],
+            "exit_price": t["exit_price"], "pnl_pct": t["pnl_pct"],
+            "exit_time": t["exit_time"], "signal_strength": t["signal_strength"],
+            "sl_pct": t["sl_pct"], "tp_pct": t["tp_pct"],
+            "breakeven_moved": False, "trailing_stage": 0,
+        }
+        insert_trade(conn, trade_dict)
+
+    if _own:
+        conn.close()
+    return len(all_trades)
+
+
 def main() -> None:
     dry_run = "--dry-run" in sys.argv
 

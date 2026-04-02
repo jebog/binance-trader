@@ -403,9 +403,7 @@ def _check_sl_outcomes(conn: Optional[sqlite3.Connection] = None) -> None:
             try:
                 _lock_age = (datetime.now() - datetime.fromisoformat(_lock_ts)).total_seconds()
                 if _lock_age < 60:
-                    if _own_conn:
-                        conn.close()
-                    return
+                    return  # finally block handles conn.close()
             except (ValueError, TypeError):
                 pass
         set_kv(conn, "sl_check_lock", datetime.now().isoformat())

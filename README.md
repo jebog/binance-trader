@@ -112,13 +112,15 @@ python3 tui.py
 
 Full real-time terminal dashboard. See [TUI App](#tui-app) below.
 
-### Cron / Telegram mode
+### Cron / Telegram mode (optional)
 
 ```bash
 SCANNER_CRON=1 python3 scanner.py
 ```
 
 No stdin prompt. If a signal fires, the scanner sends a Telegram alert and waits up to 120 seconds for a `CONFIRM` or `SKIP` reply. This is what `run_scanner.sh` uses with launchd.
+
+**Cron is optional.** The TUI has full feature parity (signal dedup, F&G regime alerts, daily digest, Telegram summaries, health sentinel). To enable cron, set `CRON_ENABLED=true` in `.env`. To disable, set it to `false` — the launchd job exits immediately.
 
 ---
 

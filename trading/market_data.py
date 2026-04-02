@@ -61,7 +61,7 @@ def get_fear_greed() -> tuple[int, str, bool]:
     cached = _read_cache()
     if cached:
         print(f"  \u21a9 Using cached F&G: {cached[0]} ({cached[1]})")
-        return cached[0], cached[1], True
+        return cached[0], cached[1], False  # stale cache — not fresh
 
     print("  \u26a0 F&G cache expired or missing \u2014 using neutral 50, filters may be inactive")
     send_telegram("\u26a0\ufe0f F&G cache expired \u2014 sentiment filter inactive, using neutral 50")

@@ -134,28 +134,37 @@ python3 tui.py
 ### Layout
 
 ```
-┌─ Header ───────────────────────────────────────────────────────────────┐
-│  ◉ TRADING SCANNER   F&G: 45 Fear  │  BTC $66,395  RSI:52.1 ↑  ████  │
-├─ Left panel (30) ────┬─ Market ─ Positions ─ History ─ Backtest ───── │
-│ PORTFOLIO  $2,706    │  ┌─ ETHUSDC ──────┐  ┌─ ADAUSDC ──────┐        │
-│ Open P&L: +$4.20     │  │ $1,998   RSI 44│  │ $0.248   RSI 38│        │
-│ ETH  51%  ████████   │  │ 1d:52  NONE    │  │ 1d:41  NONE    │        │
-│ USDC 45%  ███████    │  │ ▁▂▃▄▅▆▇█▇▆▅   │  │ ▃▃▄▅▆▇▇▆▇█▇   │        │
-│ ADA   4%  ▌          │  └────────────────┘  └────────────────┘        │
-│                      │                                                  │
-│ COOLDOWNS            │                                                  │
-│ None active          │                                                  │
-│                      │                                                  │
-│ PERFORMANCE          │                                                  │
-│ 0W / 0L  —% WR       │                                                  │
-├─ Log strip ──────────┴──────────────────────────────────────────────── │
-│  10:01:30  ETH RSI 44.5 1d:52 — NONE | ADA RSI 38.2 1d:41 — NONE     │
-├─ Status bar ───────────────────────────────────────────────────────── │
-│  [S] Scan [R] Refresh [P] Panel [E] Equity [C] Settings [L] Log [Q]  │
-└────────────────────────────────────────────────────────────────────── ┘
+┌─ Header ─────────────────────────────────────────────────────────────────────┐
+│ ◉ TRADING SCANNER  F&G:45 Fear │ BTC $66,395 RSI:52 ↑ │ BTC.D:56%↑ │ P&L:+$4│
+├─ Left panel (30) ────┬─ Market ─ Positions ─ History ─ Backtest ──────────── │
+│ PORTFOLIO  $2,706    │  ┌─ ETHUSDC ──────┐  ┌─ ADAUSDC ──────┐              │
+│ Open P&L: +$4.20     │  │ $1,998   RSI 44│  │ $0.248   RSI 38│              │
+│ ETH  51%  ████████   │  │ 1d:52  NONE    │  │ 1d:41  NONE    │              │
+│ USDC 45%  ███████    │  │ ATR:2.1% Div:✓ │  │ ATR:1.8% Div:✓ │              │
+│ ADA   4%  ▌          │  │ ▁▂▃▄▅▆▇█▇▆▅   │  │ ▃▃▄▅▆▇▇▆▇█▇   │              │
+│                      │  └────────────────┘  └────────────────┘              │
+│ COOLDOWNS            │                                                       │
+│ None active          │  Positions tab: Symbol 🛡S2 │ Entry │ P&L +2.1% (grn)│
+│                      │  History tab:   Exit price + P&L% + 🛡 BE saves      │
+│ PERFORMANCE          │                                                       │
+│ 5W / 2L  71% WR     │                                                       │
+│ PF:2.3  Sharpe:0.85 │                                                       │
+│ Streak:2  BE saves:1│                                                       │
+├─ Log strip ──────────┴───────────────────────────────────────────────────── │
+│  10:01:30  ETH 1h:44.5 1d:52 +0.3% NONE  │  ADA 1h:38.2 1d:41 -1.2% NONE  │
+├─ Status bar ─────────────────────────────────────────────────────────────── │
+│  [S]can [E]quity [L]og [⚙]Settings     ● Next: 25s │ Last: 10:01:30       │
+└──────────────────────────────────────────────────────────────────────────── ┘
 ```
 
-The portfolio panel also shows a drawdown warning when the portfolio is below its high-water mark: `⚠ Drawdown: X.X%` (orange, ≥10%) or `🛑 HALTED X.X%` (red, ≥15%).
+**Dashboard features:**
+- **Header**: F&G index, BTC price/RSI/trend, BTC dominance with rising indicator, colored open P&L
+- **Pair cards**: Price sparkline, 1h + daily RSI, ATR% volatility, divergence status, split-entry badge for EXTREME
+- **Positions tab**: Colored P&L, 🛡 break-even icon, S1/S2/S3 trailing stage on symbol
+- **History tab**: 20 rows with exit price, colored P&L%, 🛡 breakeven save marker
+- **Performance**: Win rate, profit factor, Sharpe ratio, max loss streak, breakeven saves
+- **Status bar**: Health dot (● green/red), countdown to next scan, last scan timestamp
+- **Portfolio panel**: Drawdown warning `⚠ Drawdown: X.X%` (orange ≥10%) or `🛑 HALTED X.X%` (red ≥15%)
 
 ### Key bindings
 

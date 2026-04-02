@@ -1064,8 +1064,9 @@ class ScannerApp(App):
                 except Exception:
                     pass
 
-            # ── Telegram scan summary ──────────────────────────────────────
-            if results:
+            # ── Telegram scan summary (only when signals found — TUI scans every
+            #    30s so routine "no signal" scans stay silent on Telegram) ────
+            if signals:
                 try:
                     _t_conn = db_connect()
                     db_init(_t_conn)

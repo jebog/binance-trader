@@ -12,6 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import trading.analytics
+import trading.market_data
+import trading.orders
+import trading.positions
+import trading.signals
 from backtest import (
     calc_atr as bt_calc_atr,
 )
@@ -243,7 +248,7 @@ class TestAnalyzeSignalTiers:
             interval = (params or {}).get("interval", "1h")
             return d1_klines if interval == "1d" else h1_klines
 
-        with patch.object(scanner, "get", side_effect=fake_get):
+        with patch.object(trading.signals, "get", side_effect=fake_get):
             return scanner.analyze("ETHUSDC", context)
 
     def _run_analyze_rsi_controlled(
@@ -320,8 +325,8 @@ class TestAnalyzeSignalTiers:
         def mock_calc_rsi(closes, period=14):
             return daily_rsi if len(closes) < 50 else h1_rsi
 
-        with patch.object(scanner, "get", side_effect=fake_get), \
-             patch.object(scanner, "calc_rsi", side_effect=mock_calc_rsi):
+        with patch.object(trading.signals, "get", side_effect=fake_get), \
+             patch.object(trading.signals, "calc_rsi", side_effect=mock_calc_rsi):
             return scanner.analyze("ETHUSDC", context)
 
     def test_extreme_signal_rsi_below_25(self):
@@ -446,14 +451,13 @@ class TestAnalyzeSignalTiers:
     def test_divergence_false_blocks_strong_signal(self):
         # When detect_bullish_divergence returns False (confirmed weakness),
         # a STRONG-eligible RSI should be blocked.
-        import scanner
         result = self._run_analyze_rsi_controlled(
             h1_rsi=30.0, fg=50, btc_above=True, daily_rsi=40.0,
         )
         # Verify baseline: without divergence filter STRONG would fire
         assert result["signal_strength"] in ("STRONG", "NONE")
 
-        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+        with patch.object(trading.signals, "detect_bullish_divergence", return_value=False):
             result2 = self._run_analyze_rsi_controlled(
                 h1_rsi=30.0, fg=50, btc_above=True, daily_rsi=40.0,
             )
@@ -463,8 +467,7 @@ class TestAnalyzeSignalTiers:
 
     def test_divergence_false_blocks_moderate_signal(self):
         # When detect_bullish_divergence returns False, MODERATE is blocked.
-        import scanner
-        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+        with patch.object(trading.signals, "detect_bullish_divergence", return_value=False):
             result = self._run_analyze_rsi_controlled(
                 h1_rsi=38.0, fg=50, btc_above=True, daily_rsi=50.0,
                 vol_surge=True, above_sma=True, momentum_up=True,
@@ -475,8 +478,7 @@ class TestAnalyzeSignalTiers:
 
     def test_divergence_false_does_not_block_extreme(self):
         # EXTREME bypasses the divergence gate — deep panic is always worth catching.
-        import scanner
-        with patch.object(scanner, "detect_bullish_divergence", return_value=False):
+        with patch.object(trading.signals, "detect_bullish_divergence", return_value=False):
             result = self._run_analyze_rsi_controlled(
                 h1_rsi=22.0, fg=30, btc_above=True, daily_rsi=50.0,
             )
@@ -552,19 +554,19 @@ class TestCalcCapital:
     def test_strong_weak_btc_half_capital(self):
         # Fallback path (VOL_SIZING_ENABLED=False): STRONG in weak BTC → CAPITAL/2
         s = {"signal_strength": "STRONG", "extreme_quality": False}
-        with patch("scanner.VOL_SIZING_ENABLED", False):
+        with patch("trading.analytics.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 34.9}) == self.CAPITAL / 2
 
     def test_strong_normal_btc_full_capital(self):
         # Fallback path: STRONG with normal BTC → full CAPITAL
         s = {"signal_strength": "STRONG", "extreme_quality": False}
-        with patch("scanner.VOL_SIZING_ENABLED", False):
+        with patch("trading.analytics.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 35.0}) == self.CAPITAL
 
     def test_moderate_always_full_capital(self):
         # Fallback path: MODERATE → full CAPITAL regardless of BTC RSI
         s = {"signal_strength": "MODERATE", "extreme_quality": False}
-        with patch("scanner.VOL_SIZING_ENABLED", False):
+        with patch("trading.analytics.VOL_SIZING_ENABLED", False):
             assert self.fn(s, {"btc_rsi": 20.0}) == self.CAPITAL
             assert self.fn(s, {"btc_rsi": 50.0}) == self.CAPITAL
 
@@ -630,7 +632,7 @@ class TestVolSizing:
         """With VOL_SIZING_ENABLED=False: old ad-hoc rules apply."""
         import scanner
         s = self._signal(strength="STRONG", atr=1.0, price=100.0)
-        with patch("scanner.VOL_SIZING_ENABLED", False):
+        with patch("trading.analytics.VOL_SIZING_ENABLED", False):
             capital_weak_btc = scanner._calc_capital(s, {"btc_rsi": 34.9})
             capital_norm_btc = scanner._calc_capital(s, {"btc_rsi": 50.0})
         assert capital_weak_btc == scanner.CAPITAL / 2
@@ -672,8 +674,8 @@ class TestIsBtcDomRising:
         import scanner
 
         mock_conn = MagicMock()
-        with patch("scanner.db_connect", return_value=mock_conn), \
-             patch("scanner.get_kv", return_value=str(prev_value) if prev_value is not None else None):
+        with patch("trading.market_data.db_connect", return_value=mock_conn), \
+             patch("trading.market_data.get_kv", return_value=str(prev_value) if prev_value is not None else None):
             return scanner._is_btc_dom_rising(current)
 
     def test_none_current_returns_false(self):
@@ -924,10 +926,10 @@ class TestPartialTp1:
                 return exch_info
             raise AssertionError(f"Unexpected get({path})")
 
-        with patch.object(scanner, "signed_delete", side_effect=fake_delete), \
-             patch.object(scanner, "signed_post",   side_effect=fake_post), \
-             patch.object(scanner, "get",           side_effect=fake_get), \
-             patch.object(scanner, "send_telegram",  return_value=None):
+        with patch.object(trading.positions, "signed_delete", side_effect=fake_delete), \
+             patch.object(trading.positions, "signed_post",   side_effect=fake_post), \
+             patch.object(trading.positions, "get",           side_effect=fake_get), \
+             patch.object(trading.positions, "send_telegram",  return_value=None):
             scanner._handle_partial_tp1(trade, tp1_order)
 
         assert len(delete_calls) == 1, "cancel OCO must be called exactly once"
@@ -951,8 +953,8 @@ class TestPartialTp1:
         }
         telegram_calls = []
 
-        with patch.object(scanner, "signed_delete", side_effect=Exception("Network timeout")), \
-             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
+        with patch.object(trading.positions, "signed_delete", side_effect=Exception("Network timeout")), \
+             patch.object(trading.positions, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
             scanner._handle_partial_tp1(trade, tp1_order)
 
         assert trade["status"] == "partial_tp_no_oco"
@@ -979,10 +981,10 @@ class TestPartialTp1:
         ]}]}
         telegram_calls = []
 
-        with patch.object(scanner, "signed_delete", return_value={"orderListId": 99}), \
-             patch.object(scanner, "signed_post",   side_effect=Exception("OCO rejected")), \
-             patch.object(scanner, "get",           return_value=exch_info), \
-             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
+        with patch.object(trading.positions, "signed_delete", return_value={"orderListId": 99}), \
+             patch.object(trading.positions, "signed_post",   side_effect=Exception("OCO rejected")), \
+             patch.object(trading.positions, "get",           return_value=exch_info), \
+             patch.object(trading.positions, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
             scanner._handle_partial_tp1(trade, tp1_order)
 
         assert trade["status"] == "partial_tp_no_oco"
@@ -1054,8 +1056,8 @@ class TestSplitEntry:
             "capital_half": 100.0,
             "time":         datetime.now().isoformat(),
         }
-        with patch.object(scanner, "signed_delete", side_effect=Exception("timeout")), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.orders, "signed_delete", side_effect=Exception("timeout")), \
+             patch.object(trading.orders, "send_telegram", return_value=None):
             result = scanner._place_split_second_entry("ETHUSDC", pending, 1960.0, [])
         assert result is None, "None return means pending entry should be preserved for retry"
 
@@ -1084,12 +1086,12 @@ class TestSplitEntry:
         }
         post_calls = []
 
-        with patch.object(scanner, "signed_delete", return_value={}), \
-             patch.object(scanner, "signed_post",   side_effect=lambda p, d: (
+        with patch.object(trading.orders, "signed_delete", return_value={}), \
+             patch.object(trading.orders, "signed_post",   side_effect=lambda p, d: (
                  post_calls.append((p, d)) or (buy_response if "order" == p.split("/")[-1] else {"orderListId": 200})
              )), \
-             patch.object(scanner, "get",           return_value=exch_info), \
-             patch.object(scanner, "send_telegram", return_value=None):
+             patch.object(trading.orders, "get",           return_value=exch_info), \
+             patch.object(trading.orders, "send_telegram", return_value=None):
             trade = scanner._place_split_second_entry("ETHUSDC", pending, 1960.0, [])
 
         assert trade is not None
@@ -1130,9 +1132,9 @@ class TestTradeTimeout:
         trade = self._make_trade(80)
         delete_calls: list = []
 
-        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         assert trade["status"] == "timeout"
@@ -1144,9 +1146,9 @@ class TestTradeTimeout:
         import scanner
         trade = self._make_trade(80)
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(2100.0)), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(2100.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         expected_pnl = (2100.0 - 2000.0) / 2000.0 * 100
@@ -1158,9 +1160,9 @@ class TestTradeTimeout:
         trade = self._make_trade(80)
         telegram_msgs: list = []
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "signed_post",   side_effect=Exception("API error")), \
-             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "signed_post",   side_effect=Exception("API error")), \
+             patch.object(trading.positions, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         assert trade["status"] == "timeout_sell_failed"
@@ -1172,10 +1174,10 @@ class TestTradeTimeout:
         trade = self._make_trade(80)
         cooldown_calls: list = []
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch.object(scanner, "_save_cooldown", side_effect=lambda s: cooldown_calls.append(s)):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None), \
+             patch.object(trading.positions, "_save_cooldown", side_effect=lambda s: cooldown_calls.append(s)):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         assert cooldown_calls == [], "_save_cooldown must not fire on timeout"
@@ -1187,10 +1189,10 @@ class TestTradeTimeout:
         trade["tp1_order_id"] = 333
         delete_calls: list = []
 
-        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("scanner.PARTIAL_TP_ENABLED", True):
+        with patch.object(trading.positions, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None), \
+             patch("trading.positions.PARTIAL_TP_ENABLED", True):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         paths = [p for p, _ in delete_calls]
@@ -1204,10 +1206,10 @@ class TestTradeTimeout:
         trade["partial_tp1"] = {"exit_price": 2050.0, "pnl_pct": 2.5, "exit_time": datetime.now().isoformat()}
         delete_calls: list = []
 
-        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1980.0)), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("scanner.PARTIAL_TP_ENABLED", True):
+        with patch.object(trading.positions, "signed_delete", side_effect=lambda p, d: delete_calls.append((p, d))), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(1980.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None), \
+             patch("trading.positions.PARTIAL_TP_ENABLED", True):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         paths = [p for p, _ in delete_calls]
@@ -1219,10 +1221,10 @@ class TestTradeTimeout:
         trade = self._make_trade(80, status="partial_tp")
         trade["partial_tp1"] = {"exit_price": 2100.0, "pnl_pct": 5.0, "exit_time": datetime.now().isoformat()}
         # Second leg exits at 1900 → -5% on the remaining half
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "signed_post",   return_value=self._sell_fill(1900.0)), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("scanner.PARTIAL_TP1_QTY_PCT", 0.5):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "signed_post",   return_value=self._sell_fill(1900.0)), \
+             patch.object(trading.positions, "send_telegram", return_value=None), \
+             patch("trading.positions.PARTIAL_TP1_QTY_PCT", 0.5):
             scanner._handle_trade_timeout(trade, "ETHUSDC")
 
         leg2_pnl = (1900.0 - 2000.0) / 2000.0 * 100   # -5.0%
@@ -1283,12 +1285,10 @@ class TestBreakeven:
         current_price = 2000.0 * (1 + 0.02 * scanner.BREAKEVEN_ATR_MULT) + 1.0
 
         oco_calls: list = []
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   side_effect=lambda p, d: (oco_calls.append(d) or {"orderListId": 999})), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("builtins.open", MagicMock(return_value=MagicMock(__enter__=lambda s: s, __exit__=MagicMock(return_value=False), read=lambda: "{}"))), \
-             patch("scanner.os.path.exists", return_value=False):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   side_effect=lambda p, d: (oco_calls.append(d) or {"orderListId": 999})), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
 
         assert result is True
@@ -1302,8 +1302,8 @@ class TestBreakeven:
         trade = self._make_trade()
         current_price = 2000.0 * (1 + 0.02 * scanner.BREAKEVEN_ATR_MULT) - 1.0  # just below
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
 
         assert result is False
@@ -1316,7 +1316,7 @@ class TestBreakeven:
         trade["breakeven_moved"] = True
 
         delete_calls: list = []
-        with patch.object(scanner, "signed_delete", side_effect=lambda p, d: delete_calls.append(p)):
+        with patch.object(trading.positions, "signed_delete", side_effect=lambda p, d: delete_calls.append(p)):
             result = scanner._check_breakeven(trade, 99999.0, "ETHUSDC")
 
         assert result is False
@@ -1328,8 +1328,8 @@ class TestBreakeven:
         trade = self._make_trade()
         current_price = 2000.0 * 1.05  # well above trigger
 
-        with patch.object(scanner, "signed_delete", side_effect=Exception("timeout")), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", side_effect=Exception("timeout")), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
 
         assert result is False
@@ -1342,11 +1342,10 @@ class TestBreakeven:
         current_price = 2000.0 * 1.05
         telegram_msgs: list = []
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   side_effect=Exception("LOT_SIZE")), \
-             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)), \
-             patch("scanner.os.path.exists", return_value=False):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   side_effect=Exception("LOT_SIZE")), \
+             patch.object(trading.positions, "send_telegram", side_effect=lambda m: telegram_msgs.append(m)):
             result = scanner._check_breakeven(trade, current_price, "ETHUSDC")
 
         assert result is True
@@ -1360,11 +1359,10 @@ class TestBreakeven:
         trade = self._make_trade()
         current_price = 2000.0 * 1.05  # trigger is ~2040 with 2% ATR
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   return_value={"orderListId": 500}), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("scanner.os.path.exists", return_value=False):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   return_value={"orderListId": 500}), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             scanner._check_breakeven(trade, current_price, "ETHUSDC")
 
         # SL should be entry rounded to tick=0.01 → 2000.0 exactly
@@ -1383,10 +1381,10 @@ class TestBreakeven:
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   return_value={"orderListId": 777}), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   return_value={"orderListId": 777}), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             scanner._check_breakeven(trade, current_price, "ETHUSDC", conn)
 
         # Verify DB was updated
@@ -1413,10 +1411,10 @@ class TestBreakeven:
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   side_effect=Exception("LOT_SIZE")), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   side_effect=Exception("LOT_SIZE")), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             scanner._check_breakeven(trade, current_price, "ETHUSDC", conn)
 
         row = conn.execute(
@@ -1467,10 +1465,10 @@ class TestProgressiveTrailingDB:
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   return_value={"orderListId": 888}), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   return_value={"orderListId": 888}), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC", conn)
 
         assert result is True
@@ -1492,10 +1490,10 @@ class TestProgressiveTrailingDB:
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
-        with patch.object(scanner, "signed_delete", return_value=None), \
-             patch.object(scanner, "get",           return_value=self._exch_info()), \
-             patch.object(scanner, "signed_post",   side_effect=Exception("PRICE")), \
-             patch.object(scanner, "send_telegram", return_value=None):
+        with patch.object(trading.positions, "signed_delete", return_value=None), \
+             patch.object(trading.positions, "get",           return_value=self._exch_info()), \
+             patch.object(trading.positions, "signed_post",   side_effect=Exception("PRICE")), \
+             patch.object(trading.positions, "send_telegram", return_value=None):
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC", conn)
 
         assert result is True
@@ -1723,7 +1721,7 @@ class TestEntryRefine:
         import scanner
         closes = [100.0 + i * 0.5 for i in range(30)]
         klines = self._make_klines(closes)
-        with patch("scanner.get", return_value=klines):
+        with patch("trading.signals.get", return_value=klines):
             result = scanner._get_15m_rsi("ETHUSDC")
         assert isinstance(result, float)
         assert 0 <= result <= 100
@@ -1731,7 +1729,7 @@ class TestEntryRefine:
     def test_get_15m_rsi_fail_open_on_api_error(self):
         """API exception → returns None (fail-open, order can proceed)."""
         import scanner
-        with patch("scanner.get", side_effect=Exception("timeout")):
+        with patch("trading.signals.get", side_effect=Exception("timeout")):
             result = scanner._get_15m_rsi("ETHUSDC")
         assert result is None
 
@@ -1740,7 +1738,7 @@ class TestEntryRefine:
         import scanner
         closes = [100.0 + i * 2.0 for i in range(30)]
         klines = self._make_klines(closes)
-        with patch("scanner.get", return_value=klines):
+        with patch("trading.signals.get", return_value=klines):
             rsi = scanner._get_15m_rsi("ETHUSDC")
         assert rsi is not None
         assert rsi > 50
@@ -1750,7 +1748,7 @@ class TestEntryRefine:
         import scanner
         closes = [100.0 - i * 2.0 for i in range(30)]
         klines = self._make_klines(closes)
-        with patch("scanner.get", return_value=klines):
+        with patch("trading.signals.get", return_value=klines):
             rsi = scanner._get_15m_rsi("ETHUSDC")
         assert rsi is not None
         assert rsi < 50
@@ -1760,15 +1758,15 @@ class TestEntryRefine:
         import scanner
         max_val = scanner.ENTRY_REFINE_15M_RSI_MAX
         # Patch _get_15m_rsi to return exactly the threshold value
-        with patch("scanner._get_15m_rsi", return_value=float(max_val)), \
-             patch("scanner.ENTRY_REFINE_ENABLED", True):
+        with patch("trading.signals._get_15m_rsi", return_value=float(max_val)), \
+             patch("trading.signals.ENTRY_REFINE_ENABLED", True):
             result = _check_15m_rsi_gate("ETHUSDC")
         assert result is None   # equal is not greater → entry proceeds
 
     def test_entry_refine_disabled_skips_check(self):
         """ENTRY_REFINE_ENABLED=False → _get_15m_rsi never called, gate returns None."""
-        with patch("scanner._get_15m_rsi") as mock_rsi, \
-             patch("scanner.ENTRY_REFINE_ENABLED", False):
+        with patch("trading.signals._get_15m_rsi") as mock_rsi, \
+             patch("trading.signals.ENTRY_REFINE_ENABLED", False):
             result = _check_15m_rsi_gate("ETHUSDC")
         assert result is None          # disabled → no deferral
         mock_rsi.assert_not_called()   # helper never invoked
@@ -1876,8 +1874,8 @@ class TestProgressiveTrailing:
         """breakeven_moved=False → no action regardless of price."""
         import scanner
         trade = self._make_trade(breakeven_moved=False)
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete") as mock_del:
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete") as mock_del:
             result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
         assert result is False
         mock_del.assert_not_called()
@@ -1886,8 +1884,8 @@ class TestProgressiveTrailing:
         """trailing_stage == len(stages) → no action."""
         import scanner
         trade = self._make_trade(trailing_stage=len(scanner.PROGRESSIVE_TRAILING_STAGES))
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete") as mock_del:
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete") as mock_del:
             result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
         assert result is False
         mock_del.assert_not_called()
@@ -1896,8 +1894,8 @@ class TestProgressiveTrailing:
         """PROGRESSIVE_TRAILING_ENABLED=False → returns immediately."""
         import scanner
         trade = self._make_trade()
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", False), \
-             patch("scanner.signed_delete") as mock_del:
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", False), \
+             patch("trading.positions.signed_delete") as mock_del:
             result = scanner._check_progressive_trailing(trade, 999999.0, "ETHUSDC")
         assert result is False
         mock_del.assert_not_called()
@@ -1913,12 +1911,11 @@ class TestProgressiveTrailing:
         trigger = trade["entry"] * (1 + atr_mult * atr_pct)
         current_price = trigger + 1.0   # just above trigger
 
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete"), \
-             patch("scanner.get", return_value=self._exch_info()), \
-             patch("scanner.signed_post", return_value=self._mock_oco()), \
-             patch("scanner.send_telegram"), \
-             patch("scanner.os.path.exists", return_value=False):
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete"), \
+             patch("trading.positions.get", return_value=self._exch_info()), \
+             patch("trading.positions.signed_post", return_value=self._mock_oco()), \
+             patch("trading.positions.send_telegram"):
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
         assert result is True
         assert trade["trailing_stage"] == 1
@@ -1934,8 +1931,8 @@ class TestProgressiveTrailing:
         trigger = trade["entry"] * (1 + atr_mult * atr_pct)
         current_price = trigger - 10.0   # below trigger
 
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete") as mock_del:
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete") as mock_del:
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
         assert result is False
         mock_del.assert_not_called()
@@ -1949,8 +1946,8 @@ class TestProgressiveTrailing:
         atr_pct = sl_pct / scanner.ATR_SL_MULT
         current_price = trade["entry"] * (1 + atr_mult * atr_pct) + 1.0
 
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete", side_effect=Exception("cancel failed")):
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete", side_effect=Exception("cancel failed")):
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
         assert result is False
         assert trade["trailing_stage"] == 0   # not advanced
@@ -1964,12 +1961,11 @@ class TestProgressiveTrailing:
         atr_pct = sl_pct / scanner.ATR_SL_MULT
         current_price = trade["entry"] * (1 + atr_mult * atr_pct) + 1.0
 
-        with patch("scanner.PROGRESSIVE_TRAILING_ENABLED", True), \
-             patch("scanner.signed_delete"), \
-             patch("scanner.get", return_value=self._exch_info()), \
-             patch("scanner.signed_post", side_effect=Exception("OCO rejected")), \
-             patch("scanner.send_telegram") as mock_tg, \
-             patch("scanner.os.path.exists", return_value=False):
+        with patch("trading.positions.PROGRESSIVE_TRAILING_ENABLED", True), \
+             patch("trading.positions.signed_delete"), \
+             patch("trading.positions.get", return_value=self._exch_info()), \
+             patch("trading.positions.signed_post", side_effect=Exception("OCO rejected")), \
+             patch("trading.positions.send_telegram") as mock_tg:
             result = scanner._check_progressive_trailing(trade, current_price, "ETHUSDC")
         assert result is True
         assert trade["status"] == "no_oco"

@@ -42,6 +42,7 @@ from textual.widgets import (
 # ── Import config + scanner functions ─────────────────────────────────────────
 # TeeLogger is guarded by `if __name__ == "__main__"` in scanner.py,
 # so this import does NOT hijack sys.stdout.
+from config import DIGEST_HOUR
 from scanner import (
     LOG_FILE,
     MAX_DRAWDOWN_PCT,
@@ -49,10 +50,13 @@ from scanner import (
     PAIRS,
     STATE_FILE,
     _calc_capital,
+    _check_fg_regime_change,
     _check_sl_outcomes,
     _escape_md,
     _estimate_sl_tp_pct,
+    _fg_regime,
     _load_cooldowns,
+    _send_daily_digest,
     acquire_scan_lock,
     analyze,
     apply_correlation_cap,
@@ -60,16 +64,21 @@ from scanner import (
     db_connect,
     db_init,
     generate_dashboard,
+    get_closed_trades,
+    get_kv,
     get_open_positions,
     get_open_trades,
     get_portfolio,
     get_state_dict,
+    load_sent_signals,
     place_buy_order,
     release_scan_lock,
     run_position_management,
     run_split_entry_checks,
+    save_sent_signal,
     save_state,
     send_telegram,
+    set_kv,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -793,6 +802,21 @@ class ScannerApp(App):
             self.call_from_thread(setattr, self, "btc_above_sma",context["btc_above_sma"])
             self.call_from_thread(self._update_header_context)
 
+            # ── F&G regime-change alert ──────────────────────────────────────
+            fg_fresh = context.get("fg_fresh", False)
+            fg_value = context["fg_value"]
+            try:
+                _tui_conn = db_connect()
+                db_init(_tui_conn)
+                old_fg_regime = get_kv(_tui_conn, "fg_regime") or _fg_regime(fg_value)
+                if fg_fresh:
+                    new_fg_regime = _check_fg_regime_change(fg_value, context["fg_class"], old_fg_regime)
+                else:
+                    new_fg_regime = old_fg_regime
+                _tui_conn.close()
+            except Exception:
+                new_fg_regime = None
+
             tlog("Fetching portfolio...")
             portfolio = get_portfolio()
 
@@ -884,12 +908,13 @@ class ScannerApp(App):
                 else:
                     signals.append(result)
 
-            # Save state
+            # Save state (include fg_regime for regime-change tracking)
             save_state(
                 results,
                 [{"symbol": s["symbol"], "price": s["price"], "rsi": s["rsi"],
                   "signal_strength": s["signal_strength"]} for s in signals],
                 portfolio=portfolio,
+                fg_regime=new_fg_regime,
                 open_pnl=open_pnl,
             )
             if portfolio:
@@ -900,6 +925,115 @@ class ScannerApp(App):
                     _dash_conn.close()
                 except Exception:
                     pass
+
+            # ── Telegram scan summary ──────────────────────────────────────
+            if results:
+                try:
+                    _t_conn = db_connect()
+                    db_init(_t_conn)
+                    closed = get_closed_trades(_t_conn)
+                    _t_conn.close()
+                    perf_line = ""
+                    if closed:
+                        _wins = sum(1 for t in closed if t.get("status") == "tp_hit")
+                        _total = len(closed)
+                        perf_line = f"\n\U0001f4ca Trades: `{_wins}W/{_total-_wins}L` ({_wins/_total*100:.0f}% WR)"
+                except Exception:
+                    perf_line = ""
+
+                icons = {"EXTREME": "\U0001f534", "STRONG": "\U0001f7e0",
+                         "MODERATE": "\U0001f7e1", "NONE": "\u26aa"}
+                btc_trend = "\u2191" if context["btc_above_sma"] else "\u2193"
+                tg_lines = [
+                    f"\U0001f4ca *Scan {datetime.now().strftime('%H:%M')}*\n"
+                    f"F&G: `{context['fg_value']}` {context['fg_class']}  |  "
+                    f"BTC `${context['btc_price']:,.0f}` RSI:`{context['btc_rsi']}` {btc_trend}\n"
+                ]
+                for r in results:
+                    icon = icons.get(r["signal_strength"], "\u26aa")
+                    pair = r["symbol"].replace("USDC", "")
+                    tg_lines.append(
+                        f"{icon} `{pair:<5}` ${r['price']:<10.4f} RSI:`{r['rsi']:<5}` "
+                        f"24h:`{r['change24h']:+.2f}%`"
+                        + (f"  *{r['signal_strength']}*" if r["signal_strength"] != "NONE" else "")
+                    )
+                if positions:
+                    tg_lines.append("\n\U0001f4c8 *Positions*")
+                    for p in positions:
+                        pair = p["symbol"].replace("USDC", "")
+                        pnl_str = (f"{p['pnl_pct']:+.2f}%  `{'%.2f' % p['pnl']}$`"
+                                   if p.get("pnl") is not None else "n/a")
+                        entry_s = f"${p['entry']:.4f}" if p.get("entry") else "?"
+                        cur_s = f"${p['current']:.4f}" if p.get("current") else "?"
+                        tg_lines.append(f"`{pair}` {p.get('qty', '?')} \u00b7 {entry_s}\u2192{cur_s} {pnl_str}")
+                if perf_line:
+                    tg_lines.append(perf_line)
+                send_telegram("\n".join(tg_lines))
+
+            # ── Signal dedup (2h suppression per symbol:tier) ──────────────
+            if signals:
+                SIGNAL_DEDUP_H = 2
+                try:
+                    _sd_conn = db_connect()
+                    db_init(_sd_conn)
+                    sent_signals = load_sent_signals(_sd_conn)
+                    _sd_conn.close()
+                except Exception:
+                    sent_signals = {}
+
+                deduped_signals = []
+                for s in signals:
+                    dedup_key = f"{s['symbol']}:{s['signal_strength']}"
+                    last_sent = sent_signals.get(dedup_key)
+                    if last_sent:
+                        age_h = (datetime.now() - datetime.fromisoformat(last_sent)).total_seconds() / 3600
+                        if age_h < SIGNAL_DEDUP_H:
+                            tlog(f"[dim]{s['symbol']} — alert suppressed ({age_h:.1f}h ago)[/]")
+                            continue
+                    deduped_signals.append(s)
+                    # Persist dedup timestamp
+                    try:
+                        _ss_conn = db_connect()
+                        db_init(_ss_conn)
+                        save_sent_signal(_ss_conn, dedup_key, datetime.now().isoformat())
+                        _ss_conn.close()
+                    except Exception:
+                        pass
+                    # Send Telegram signal alert
+                    capital = _calc_capital(s, context)
+                    sl_pct, tp_pct = _estimate_sl_tp_pct(s)
+                    send_telegram(
+                        f"\U0001f4e1 *{s['signal_strength']} BUY SIGNAL*\n"
+                        f"Pair: `{s['symbol']}`\n"
+                        f"Entry: `${s['price']:.4f}` | RSI: `{s['rsi']}`\n"
+                        f"TP: `${s['price'] * (1 + tp_pct):.4f}` (+{tp_pct*100:.1f}%)  "
+                        f"SL: `${s['price'] * (1 - sl_pct):.4f}` (-{sl_pct*100:.1f}%)\n"
+                        f"Cost: `${capital} USDC`"
+                    )
+                signals = deduped_signals  # only show modals for non-suppressed signals
+
+            # ── Daily digest (once per calendar day at DIGEST_HOUR) ────────
+            try:
+                _dd_conn = db_connect()
+                db_init(_dd_conn)
+                now = datetime.now()
+                last_digest = get_kv(_dd_conn, "last_digest_date") or ""
+                if now.hour == DIGEST_HOUR and str(now.date()) != last_digest:
+                    _send_daily_digest(get_state_dict(_dd_conn))
+                    set_kv(_dd_conn, "last_digest_date", str(now.date()))
+                    tlog("[cyan]Daily digest sent[/]")
+                _dd_conn.close()
+            except Exception as _dd_e:
+                tlog(f"[dim]Digest check failed: {markup_escape(str(_dd_e))}[/]")
+
+            # ── Health sentinel ────────────────────────────────────────────
+            try:
+                _h_conn = db_connect()
+                db_init(_h_conn)
+                set_kv(_h_conn, "last_scan_ok", datetime.now().isoformat())
+                _h_conn.close()
+            except Exception:
+                pass
 
             release_scan_lock()
             tlog(f"[green]Scan complete — {len(results)} pairs, {len(signals)} signal(s)[/]")

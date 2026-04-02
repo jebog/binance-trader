@@ -20,12 +20,25 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | File | Role |
 |------|------|
 | `config.py` | **Single source of truth for all settings** — edit this, nothing else |
-| `scanner.py` | Core engine: signals, orders, state, Telegram, dashboard, digest |
+| `scanner.py` | **Thin facade** — re-exports all names from `trading/`, owns `scan()`, `_scan_body()`, `TeeLogger`, `get_health()` |
+| `trading/` | **Package** (13 modules) — all logic lives here |
+| `trading/db.py` | SQLite schema, CRUD helpers, `save_state()`, `get_state_dict()` |
+| `trading/http_client.py` | `get()`, `signed_get/post/delete()` — Binance REST API (1-retry on transient errors) |
+| `trading/indicators.py` | `calc_rsi()`, `calc_sma()`, `calc_atr()`, `detect_bullish_divergence()` — pure math |
+| `trading/market_data.py` | `get_fear_greed()`, `get_btc_context()`, `get_btc_dominance()`, `get_portfolio()` |
+| `trading/signals.py` | `analyze()`, `_check_15m_rsi_gate()` — signal classification |
+| `trading/orders.py` | `place_buy_order()`, split-entry helpers, cooldowns |
+| `trading/positions.py` | `_check_breakeven()`, `_check_progressive_trailing()`, `_check_sl_outcomes()` |
+| `trading/analytics.py` | `_calc_capital()`, `_compute_perf_stats()`, `_pair_score()`, `_send_daily_digest()` |
+| `trading/dashboard.py` | HTML dashboard generation |
+| `trading/scan_helpers.py` | `build_market_context()`, `apply_correlation_cap()`, `run_position_management()`, `run_split_entry_checks()` |
+| `trading/notify.py` | `send_telegram()`, `call_webhook()`, `notify_mac()` |
+| `trading/logger.py` | `logger` (structured logging to file + console), path constants |
 | `tui.py` | Textual TUI — live dashboard, runs scanner in background thread |
 | `tui.tcss` | Catppuccin Mocha theme for the TUI |
-| `backtest.py` | Walk-forward backtest (70% train / 30% test), writes `backtest_results.json` |
-| `state.db` | **Canonical runtime state** (SQLite, WAL mode): trades, cooldowns, caches, kv sentinels. `state.json` no longer written; `state.json.bak` left behind if migration ran. |
-| `scanner.log` | Append-only log of every scan run |
+| `backtest.py` | Walk-forward backtest (70/30 split), Monte Carlo, Sharpe/drawdown metrics |
+| `state.db` | **Canonical runtime state** (SQLite, WAL mode): trades, cooldowns, caches, kv sentinels |
+| `scanner.log` | Append-only structured log (via `trading.logger`) |
 | `dashboard.html` | Auto-generated HTML dashboard (written after each scan) |
 
 ---
@@ -144,8 +157,8 @@ F&G < 20 (Extreme Fear) blocks MODERATE signals. BTC RSI < 30 + below SMA blocks
 - **BTC dominance (T2-3)**: blocks MODERATE when BTC.D rises >0.5% scan-over-scan. `get_btc_dominance()` caches CoinGecko result 1h. Returns `None` on failure → fail-open.
 
 **Tier 3 position management:**
-- **Break-even stop (T3-1)**: when price ≥ entry × (1 + `BREAKEVEN_ATR_MULT` × ATR%), cancels OCO and replaces with SL at entry. Fires once per trade (`breakeven_moved=True` guard). `_check_breakeven()` in scanner.py.
-- **Trade timeout (T3-2)**: if any open trade has been open > `TRADE_TIMEOUT_H` hours, places a market sell and marks `status="timeout"`. Checked in `scan()` before break-even phase.
+- **Break-even stop (T3-1)**: when price ≥ entry × (1 + `BREAKEVEN_ATR_MULT` × ATR%), cancels OCO and replaces with SL at entry. Fires once per trade (`breakeven_moved=True` guard). `_check_breakeven()` in `trading/positions.py`.
+- **Trade timeout (T3-2)**: if any open trade has been open > `TRADE_TIMEOUT_H` hours, places a market sell and marks `status="timeout"`. Runs BEFORE the OCO loop in `_check_sl_outcomes()` so `no_oco` trades are also age-checked.
 - **Volatility-adjusted sizing (T3-4)**: capital per trade = `TARGET_RISK_PCT × portfolio / atr_pct`, clamped to `[VOL_SIZING_MIN, VOL_SIZING_MAX] × CAPITAL`. Falls back to `CAPITAL` if ATR unavailable.
 
 **Tier 4 analytics and entry quality:**
@@ -163,7 +176,7 @@ Each `analyze()` call fetches 30 daily candles to compute `daily_rsi` and check 
 
 The daily RSI is displayed in TUI pair cards (`1d:XX`) and scan log lines. EXTREME signals bypass the daily filter to catch capitulation bottoms.
 
-### Shared scan helpers (scanner.py — used by both `scan()` and TUI)
+### Shared scan helpers (`trading/scan_helpers.py` — used by both `scan()` and TUI)
 
 | Helper | Purpose |
 |--------|---------|
@@ -223,17 +236,18 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 | Alert | Dedup mechanism |
 |-------|----------------|
-| Trade signals | `sent_signals` in state.json keyed by `symbol:tier`, suppressed 2h |
-| F&G regime change | `fg_regime` in state.json — only fires when bucket changes |
-| Circuit breaker | `cb_alert_sent_at` in state.json — suppressed for 4h |
-| Daily digest | `last_digest_date` in state.json — once per calendar day |
+| Trade signals | `sent_signals` table keyed by `symbol:tier`, suppressed 2h |
+| F&G regime change | `fg_regime` in kv table — only fires when bucket changes |
+| Circuit breaker | `cb_alert_sent_at` in kv table — suppressed for 4h |
+| Daily digest | `last_digest_date` in kv table — once per calendar day |
+| SL outcome check | `sl_check_lock` in kv table — 60s TTL prevents TUI/cron double-processing |
 | Partial TP1 hit | One-shot — fires on state transition to `partial_tp` |
 | Split entry armed | One-shot on first-half placement |
 | Split entry expired | One-shot on TTL clearance |
 
 ### state.db table/key reference
 
-**SQLite tables (see schema in `scanner.py _DB_SCHEMA`):**
+**SQLite tables (see schema in `trading/db.py _DB_SCHEMA`):**
 
 | Table | Written by | Purpose |
 |-------|-----------|---------|
@@ -261,6 +275,8 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 | `last_scan` | `save_state` | ISO timestamp of last scan completion |
 | `last_digest_date` | digest block in `scan` | ISO date of last morning digest send |
 | `btc_dom_prev` | `scan` | Previous scan's BTC.D value for rise-detection (T2-3) |
+| `sl_check_lock` | `_check_sl_outcomes` | Scan-lock timestamp — prevents double-processing (60s TTL) |
+| `last_scan_ok` | `_scan_body` | ISO timestamp of last successful scan — used by `get_health()` |
 
 **Trade dict extra fields (Tier 2+):**
 
@@ -278,7 +294,9 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 ## Key design decisions
 
-**TeeLogger guard** — `scanner.py` line 36: `if __name__ == "__main__": sys.stdout = TeeLogger()`. Without this, importing scanner from tui.py would hijack Textual's stdout.
+**Facade re-export pattern** — `scanner.py` is a thin facade (574 lines) that re-exports every name from `trading/`. All callers (`tui.py`, `backtest.py`, tests) use `from scanner import X` unchanged. Test mocks must patch at the `trading.*` module level (where names are looked up), not at `scanner.*`.
+
+**TeeLogger guard** — `scanner.py` line 35: `if __name__ == "__main__": sys.stdout = TeeLogger()`. Without this, importing scanner from tui.py would hijack Textual's stdout. Must stay in scanner.py, not in any `trading/` submodule.
 
 **`_scan_ctx` not `_context`** — Textual has an internal `App._context()` method. A class attribute named `_context` shadows it and crashes `app.run()`. Always use `_scan_ctx` in `ScannerApp`.
 
@@ -364,6 +382,17 @@ conn.commit(); conn.close()   # fires on next scan at DIGEST_HOUR
 python3 backtest.py
 # Results written to backtest_results.json
 # TUI left panel "BACKTEST" section reads this file automatically
+# Output includes: Sharpe ratio, max drawdown, max consecutive losses,
+# Monte Carlo P5/P50/P95 confidence intervals (1000 bootstrap sims)
+```
+
+### Check scanner health
+```python
+from scanner import get_health, db_connect, db_init
+conn = db_connect(); db_init(conn)
+print(get_health(conn))
+# {'last_scan_ok': '...', 'healthy': True, 'age_seconds': 120.5, 'stuck_positions': 0}
+conn.close()
 ```
 
 ### Disable the divergence filter
@@ -442,3 +471,5 @@ conn.commit(); conn.close()
 - **Never reorder `PROGRESSIVE_TRAILING_STAGES` while trades are active** — trades track progress via integer index; reordering changes which trigger/bps applies to the current stage
 - **Never annualize the per-trade IR in `_compute_perf_stats`** — trades have variable hold times, not fixed scan-period returns; annualizing with 17520 (scan periods/year) produces meaningless values
 - **Never skip the 15m RSI warm-up candles** — `ENTRY_REFINE_15M_LIMIT=50` gives 35 Wilder smoothing steps; fewer than ~28 produces RSI values with >20% error near thresholds
+- **Never patch `scanner.X` in tests for functions that live in `trading/`** — use `patch("trading.module.X")` where `module` is the one that imports the name. Python mocking patches where a name is looked up, not where it's defined
+- **Never import from `scanner` inside `trading/` modules** — this creates circular imports. Dependency arrows only point downward: config → logger → db → notify → http_client → indicators → market_data → signals → orders → positions → analytics → dashboard → scan_helpers

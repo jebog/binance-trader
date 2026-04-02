@@ -51,16 +51,30 @@ SCANNER_CRON=1 python3 scanner.py
 ```
 Trading/
 ├── config.py               Single source of truth for all settings (reads from .env)
-├── scanner.py              Core engine — indicators, signals, orders, state, Telegram
+├── scanner.py              Thin facade — re-exports from trading/, owns scan() + TeeLogger
+├── trading/                Package — all logic split into focused modules:
+│   ├── db.py               SQLite schema, CRUD, save_state, get_state_dict
+│   ├── http_client.py      Binance REST API helpers (1-retry on transient errors)
+│   ├── indicators.py       calc_rsi, calc_sma, calc_atr, divergence detection
+│   ├── market_data.py      F&G, BTC context, dominance, portfolio
+│   ├── signals.py          analyze(), 15m RSI gate
+│   ├── orders.py           place_buy_order, split-entry, cooldowns
+│   ├── positions.py        break-even, trailing, timeout, SL outcomes
+│   ├── analytics.py        perf stats, pair score, digest, capital sizing
+│   ├── dashboard.py        HTML dashboard generation
+│   ├── scan_helpers.py     Shared helpers (context, correlation cap, position mgmt)
+│   ├── notify.py           Telegram, webhook, macOS notifications
+│   └── logger.py           Structured logging setup, path constants
 ├── tui.py                  Real-time TUI dashboard (Textual)
 ├── tui.tcss                Catppuccin Mocha theme for the TUI
-├── backtest.py             Walk-forward backtester (stdlib only, no look-ahead)
+├── backtest.py             Walk-forward backtester + Monte Carlo + Sharpe/drawdown
+├── tests/                  201 tests (indicators, DB, backtest, integration)
 ├── run_scanner.sh          Shell wrapper for launchd (loads .env, runs cron mode)
 ├── requirements.txt        Python dependencies
 ├── .env.example            Credential template — copy to .env and fill in values
 ├── LICENSE                 MIT
 ├── state.db                SQLite runtime state — WAL mode, canonical store (gitignored)
-├── scanner.log             Append-only run log (gitignored)
+├── scanner.log             Append-only structured log (gitignored)
 └── backtest_results.json   Output of last backtest run (gitignored)
 
 ~/.agent/diagrams/
@@ -428,14 +442,34 @@ Fetches 1000 hourly candles (~41 days) per pair from Binance's public API and si
 
 Results are written to `backtest_results.json` and printed to stdout.
 
+### Simulated features
+
+| Feature | Status |
+|---------|--------|
+| RSI divergence filter (T2-2) | ✅ |
+| Split entry second leg (T2-1) | ✅ EXTREME signals fire second leg at trigger |
+| Partial TP1 (T2-4) | ✅ Weighted P&L when TP1 hits on a prior candle |
+| Break-even stop (T3-1) | ✅ SL moves to entry when price reaches trigger |
+| Progressive trailing (T4-4) | ✅ SL tightens at ATR milestones |
+| Volatility-adjusted sizing (T3-4) | ✅ Kelly-style formula from config |
+| Trade timeout (72h) | ✅ Force-close at market |
+
+### Risk metrics
+
+| Metric | Description |
+|--------|-------------|
+| Sharpe ratio | Per-trade mean / std (not annualized — variable hold times) |
+| Max drawdown | Largest peak-to-trough in cumulative P&L curve |
+| Max consecutive losses | Longest SL streak |
+| Monte Carlo P5/P50/P95 | Bootstrap 1000 sims for net P&L and max DD confidence intervals |
+
 ### Limitations
 
 The backtest does **not** simulate:
-- Fear & Greed index filter
+- Fear & Greed index filter (not available historically)
 - BTC context filter
 - Correlation cap
 - SL cooldowns
-- Capital sizing tiers (all trades use $200)
 - Slippage or trading fees
 
 ### Interpreting results

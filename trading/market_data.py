@@ -87,25 +87,25 @@ def get_btc_dominance() -> Optional[float]:
     """Return current BTC dominance % (0-100), or None on any failure (fail-open)."""
     if not BTC_DOM_ENABLED:
         return None
+    _bdc_conn = db_connect()
+    db_init(_bdc_conn)
     try:
-        _bdc_conn = db_connect()
-        db_init(_bdc_conn)
         cache = get_btc_dom_cache(_bdc_conn)
         if cache:
             age_h = (datetime.now() - datetime.fromisoformat(cache["ts"])).total_seconds() / 3600
             if age_h < BTC_DOM_CACHE_H:
-                _bdc_conn.close()
                 return float(cache["value"])
         req  = urllib.request.Request(COINGECKO_GLOBAL, headers={"Accept": "application/json"})
         resp = urllib.request.urlopen(req, timeout=10)
         data = json.loads(resp.read().decode())
         dom  = float(data["data"]["market_cap_percentage"]["btc"])
         set_btc_dom_cache(_bdc_conn, dom)
-        _bdc_conn.close()
         return dom
     except Exception as e:
         print(f"  \u26a0 BTC dominance fetch failed: {e}")
         return None
+    finally:
+        _bdc_conn.close()
 
 
 def _is_btc_dom_rising(current: Optional[float]) -> bool:

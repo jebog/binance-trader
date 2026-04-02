@@ -217,6 +217,10 @@ def scan() -> None:
     try:
         _scan_body(_scan_conn)
     finally:
+        try:
+            release_scan_lock(_scan_conn)
+        except Exception:
+            pass
         _scan_conn.close()
     print(f"\n{'='*55}\n")
 
@@ -536,9 +540,6 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
                                       "rsi": s["rsi"], "signal_strength": s["signal_strength"]}
                                      for s in signals], new_trades,
                                      conn=_scan_conn)
-    # ── Release scan lock ────────────────────────────────────────────────────
-    release_scan_lock(_scan_conn)
-
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
         generate_dashboard(get_state_dict(_scan_conn))

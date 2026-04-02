@@ -58,6 +58,10 @@ def acquire_scan_lock(conn: Optional[sqlite3.Connection] = None,
         conn = db_connect()
         db_init(conn)
     try:
+        # Atomic read-then-write: read existing lock, check TTL, write new lock.
+        # SQLite serializes writers in WAL mode — concurrent callers block at the
+        # INSERT/UPDATE in set_kv, so the window between get_kv and set_kv is safe
+        # because only one writer can execute at a time.
         existing = get_kv(conn, "scan_lock") or ""
         if existing:
             parts = existing.split("|", 1)
@@ -133,16 +137,22 @@ def build_market_context() -> dict[str, Any]:
 
 
 def run_position_management(conn: Optional[sqlite3.Connection] = None) -> None:
-    """Run break-even (T3-1) and progressive trailing (T4-4) checks on open trades."""
+    """Run break-even (T3-1) and progressive trailing (T4-4) checks on open trades.
+
+    Fetches open trades once and reuses the list for both phases.
+    """
+    if not BREAKEVEN_ENABLED and not PROGRESSIVE_TRAILING_ENABLED:
+        return
+    try:
+        _c = conn if conn is not None else db_connect()
+        _trades = get_open_trades(_c)
+        if conn is None:
+            _c.close()
+    except Exception:
+        _trades = []
+
     if BREAKEVEN_ENABLED:
-        try:
-            _c = conn if conn is not None else db_connect()
-            _be_trades = get_open_trades(_c)
-            if conn is None:
-                _c.close()
-        except Exception:
-            _be_trades = []
-        for _be_trade in _be_trades:
+        for _be_trade in _trades:
             try:
                 _be_sym = _be_trade["symbol"]
                 _be_cp = float(get("/api/v3/ticker/price", {"symbol": _be_sym})["price"])
@@ -151,14 +161,7 @@ def run_position_management(conn: Optional[sqlite3.Connection] = None) -> None:
                 print(f"  \u26a0 Break-even check failed for {_be_trade.get('symbol', '?')}: {_be_e}")
 
     if PROGRESSIVE_TRAILING_ENABLED:
-        try:
-            _c = conn if conn is not None else db_connect()
-            _pt_trades = get_open_trades(_c)
-            if conn is None:
-                _c.close()
-        except Exception:
-            _pt_trades = []
-        for _pt_trade in _pt_trades:
+        for _pt_trade in _trades:
             if not _pt_trade.get("breakeven_moved"):
                 continue
             try:

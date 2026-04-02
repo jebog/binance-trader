@@ -67,8 +67,7 @@ def _ticker_price(symbol: str) -> dict:
 
 def test_full_scan_cycle_no_signals():
     """Full scan with all pairs at neutral RSI — no signals, state persisted correctly."""
-    conn = scanner.db_connect()
-    scanner.db_init(conn)
+    conn = _fresh_conn()
 
     def mock_get(path: str, params: Any = None, _retries: int = 1) -> Any:
         if "/klines" in path:
@@ -79,6 +78,8 @@ def test_full_scan_cycle_no_signals():
         if "/ticker/price" in path:
             sym = params.get("symbol", "") if params else ""
             return _ticker_price(sym)
+        if "/ticker/24hr" in path:
+            return {"priceChangePercent": "0.5"}
         if "/exchangeInfo" in path:
             return {"symbols": [{"filters": [
                 {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
@@ -94,19 +95,28 @@ def test_full_scan_cycle_no_signals():
         resp.read = lambda: _fear_greed_response()
         return resp
 
-    with patch.object(scanner, "get", side_effect=mock_get), \
-         patch.object(scanner, "signed_get", return_value=[]), \
+
+    _portfolio = {"total_usdc": 500.0,
+                  "assets": [{"asset": "USDC", "qty": 500.0, "value_usdc": 500.0}]}
+
+    with patch("trading.signals.get", side_effect=mock_get), \
+         patch("trading.market_data.get", side_effect=mock_get), \
+         patch("trading.market_data.signed_get", return_value=[]), \
+         patch("trading.scan_helpers.get", side_effect=mock_get), \
+         patch("trading.positions.get", side_effect=mock_get), \
+         patch("trading.positions.signed_get", return_value=[]), \
          patch("urllib.request.urlopen", side_effect=mock_urlopen), \
-         patch.object(scanner, "get_portfolio", return_value={
-             "total_usdc": 500.0,
-             "assets": [{"asset": "USDC", "qty": 500.0, "value_usdc": 500.0}],
-         }), \
+         patch.object(scanner, "get_portfolio", return_value=_portfolio), \
          patch.object(scanner, "get_open_positions", return_value=[]), \
-         patch.object(scanner, "send_telegram", return_value=None), \
+         patch.object(scanner, "has_open_position", return_value=False), \
+         patch("trading.notify.send_telegram", return_value=None), \
+         patch("trading.scan_helpers.send_telegram", return_value=None), \
+         patch("trading.positions.send_telegram", return_value=None), \
          patch.object(scanner, "generate_dashboard", return_value=None), \
          patch.object(scanner, "notify_mac", return_value=None), \
          patch.object(scanner, "call_webhook", return_value=None), \
-         patch.object(scanner, "has_open_position", return_value=False):
+         patch.object(scanner, "acquire_scan_lock", return_value=True), \
+         patch.object(scanner, "release_scan_lock", return_value=None):
         scanner._scan_body(conn)
 
     # Verify state was persisted

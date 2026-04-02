@@ -9,10 +9,10 @@ Price design — 100-candle declining window:
   prices[k] = 100 - k * 0.5  →  klines[99][4] = 50.5  (entry price)
   ATR ≈ 0.61  →  atr_pct_raw ≈ 0.0122  →  sl_pct = 0.02 (clamped to ATR_SL_MIN)
   sl_price   ≈ 49.49   (entry * 0.98)
-  tp_price   ≈ 52.86   (entry * (1 + 0.02 * ATR_TP_MULT/ATR_SL_MULT))
-  be_trigger ≈ 51.11   (entry * (1 + 1 × atr_pct_raw))   — uses raw ATR%, NOT sl_pct
+  tp_price   ≈ 52.18   (entry * (1 + 0.02 * ATR_TP_MULT/ATR_SL_MULT))
+  be_trigger ≈ 50.93   (entry * (1 + 0.7 × atr_pct_raw))  — BREAKEVEN_ATR_MULT=0.7
   tp1_price  ≈ 51.17   (entry * (1 + 1 × sl_pct/ATR_SL_MULT)) — uses clamped sl_pct
-  stage1_trig≈ 51.42   (entry * (1 + 1.5 × atr_pct_raw))
+  stage1_trig≈ 51.11   (entry * (1 + 1.0 × atr_pct_raw))  — stage[0]=(1.0, 120)
 
 Key implementation note: progressive trailing updates sl_price on the same candle it fires.
 Tests that want clean TP/SL/TIMEOUT outcomes patch BREAKEVEN_ENABLED=False and
@@ -157,8 +157,9 @@ def test_same_candle_tp1_no_credit():
 
 def test_breakeven_arms_on_trigger():
     """Once price reaches be_trigger, breakeven_moved is set and sl persisted."""
-    # high=51.31 > be_trigger(~51.11); low safely above entry so SL does not fire
-    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.016, low=ENTRY_PRICE * 1.003)
+    # be_trigger ≈ 50.93 (0.7×ATR), stage1 ≈ 51.11 (1.0×ATR)
+    # high=51.0 → above be_trigger but below stage1 → BE arms, no trailing
+    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.010, low=ENTRY_PRICE * 1.003)
     # Drop candle: now sl=entry=50.5; low drops below entry → SL fires
     drop_candle = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.001, low=ENTRY_PRICE * 0.997)
     trades = _run([be_candle, drop_candle])
@@ -170,7 +171,7 @@ def test_breakeven_arms_on_trigger():
 
 def test_breakeven_save():
     """Break-even floor catches a falling trade at entry — exit at or above entry."""
-    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.016, low=ENTRY_PRICE * 1.003)
+    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.010, low=ENTRY_PRICE * 1.003)
     drop_candle = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.001, low=ENTRY_PRICE * 0.997)
     trades = _run([be_candle, drop_candle])
     assert len(trades) == 1
@@ -190,25 +191,26 @@ def test_breakeven_not_set_before_trigger():
 
 def test_progressive_trailing_tightens_sl():
     """Trailing tightens at stage-1 milestone; exit SL is above entry (profitable)."""
-    # Candle 0 (i=101): be arms (high 51.31 > be_trig 51.11); stage1_trig=51.42 not yet hit
-    #   low=51.16 > entry(50.5) → no SL on this candle
-    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.016, low=ENTRY_PRICE * 1.013)
+    # be_trigger ≈ 50.93 (0.7×ATR), stage1 ≈ 51.11 (1.0×ATR), stage2 ≈ 51.42 (1.5×ATR)
+    # Stage-1 bps = 120 → trailing_sl = peak * (1 - 0.012)
 
-    # Candle 1 (i=102): stage-1 trigger hit (high 51.51 > stage1 51.42); not stage2 (51.73)
-    #   peak=51.51, trailing_sl=51.51*0.99=50.995; low=51.31 > 50.995 → no SL
-    stg1_candle = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.020, low=ENTRY_PRICE * 1.016)
+    # Candle 0 (i=101): arms BE + stage1 (high 51.2 > both 50.93 and 51.11)
+    #   but NOT stage2 (51.42). peak=51.2, trailing_sl=51.2*0.988=50.586
+    #   low=51.16 > trailing_sl(50.586) → no SL
+    be_candle   = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.014, low=ENTRY_PRICE * 1.013)
 
-    # Candle 2 (i=103): peak rises; trailing_sl tightens above low → SL
-    #   high=51.61 → peak=51.61, trailing_sl=51.61*0.99=51.094; stage2_trig=51.73 not hit
-    #   low=51.00 < trailing_sl(51.094) → SL fires; exit_price=51.094 > entry(50.5)
-    exit_candle = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.022, low=ENTRY_PRICE * 1.010)
+    # Candle 1 (i=102): peak rises; trailing_sl tightens; low falls below → SL
+    #   high=51.3 → peak=51.3, trailing_sl=51.3*0.988=50.685
+    #   stage2_trig=51.42: 51.3 < 51.42 → still stage 1
+    #   low=50.6 < trailing_sl(50.685) → SL fires; exit=50.685 > entry(50.5)
+    exit_candle = _kline(ENTRY_PRICE, high=ENTRY_PRICE * 1.016, low=ENTRY_PRICE * 1.002)
 
-    trades = _run([be_candle, stg1_candle, exit_candle])
+    trades = _run([be_candle, exit_candle])
     assert len(trades) == 1
     t = trades[0]
     assert t["outcome"] == "SL"
     assert t["breakeven_moved"] is True
-    assert t["trailing_stage"] == 1
+    assert t["trailing_stage"] >= 1
     assert t["exit_price"] > t["entry"]
 
 

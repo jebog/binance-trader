@@ -34,18 +34,18 @@ CAPITAL = 200.0   # USDC per trade
 
 # ── Risk management ───────────────────────────────────────────
 MAX_POSITIONS    = 2     # max concurrent open positions
-SL_COOLDOWN_H    = 4     # hours to block a pair after a stop-loss hit
+SL_COOLDOWN_H    = 8     # hours to block a pair after a stop-loss hit (was 4)
 MAX_DRAWDOWN_PCT = 0.15  # halt new orders if portfolio drops >15% from peak
 DIGEST_HOUR      = 8    # local hour (0–23) to send morning digest
 
 # ── SL / TP ───────────────────────────────────────────────────
 STOP_LOSS      = 0.03   # 3%   — fixed fallback when ATR unavailable
-TAKE_PROFIT    = 0.075  # 7.5% — fixed fallback
+TAKE_PROFIT    = 0.05   # 5%   — fixed fallback (was 7.5% — too ambitious)
 TRAILING_DELTA = 150    # basis points for trailing stop (150 = 1.5%); 0 = fixed SL
 ATR_SL_MULT    = 1.5    # SL = ATR × 1.5
-ATR_TP_MULT    = 3.5    # TP = ATR × 3.5  → ~2.33 R/R
+ATR_TP_MULT    = 2.5    # TP = ATR × 2.5  → ~1.67 R/R (was 3.5 — TP never hit)
 ATR_SL_MIN     = 0.02   # SL floor  (never tighter than 2%)
-ATR_SL_MAX     = 0.06   # SL ceiling (never wider than 6%)
+ATR_SL_MAX     = 0.04   # SL ceiling (never wider than 4%, was 6%)
 
 # ── RSI divergence filter (T2-2) ─────────────────────────────────────────────
 DIVERGENCE_ENABLED     = True
@@ -83,7 +83,7 @@ TRADE_TIMEOUT_H       = 72     # force-exit any position open longer than 72h
 
 # ── Break-even stop (T3-1) ────────────────────────────────────────────────────
 BREAKEVEN_ENABLED  = True
-BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + BREAKEVEN_ATR_MULT × atr_pct)
+BREAKEVEN_ATR_MULT = 0.7    # trigger: price ≥ entry × (1 + 0.7 × atr_pct) — arm earlier (was 1.0)
 
 # ── Progressive trailing stop (T4-4) ──────────────────────────────────────────
 PROGRESSIVE_TRAILING_ENABLED = True
@@ -94,9 +94,9 @@ PROGRESSIVE_TRAILING_ENABLED = True
 # Active trades track progress via an integer stage index; reordering changes
 # which trigger/bps pair applies next, potentially tightening the stop prematurely.
 PROGRESSIVE_TRAILING_STAGES: list[tuple[float, int]] = [
-    (1.5, 100),   # at +1.5×ATR: tighten to 100bps (1.0%)
-    (2.0,  75),   # at +2.0×ATR: tighten to  75bps (0.75%)
-    (2.5,  50),   # at +2.5×ATR: tighten to  50bps (0.5%)
+    (1.0, 120),   # at +1.0×ATR: tighten to 120bps (1.2%) — was 1.5×ATR, 100bps
+    (1.5,  80),   # at +1.5×ATR: tighten to  80bps (0.8%) — was 2.0×ATR, 75bps
+    (2.0,  50),   # at +2.0×ATR: tighten to  50bps (0.5%) — was 2.5×ATR, 50bps
 ]
 
 # ── Volatility-adjusted capital sizing (T3-4) ─────────────────────────────────

@@ -231,9 +231,21 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 ### Two-timer TUI architecture
 
-- **5s timer** → `_read_state_file()` — disk only, no API — updates cooldowns, portfolio cache, open P&L, peak drawdown, log tail
-- **30s timer** → `action_trigger_scan()` — full API round-trip in `@work(thread=True, exclusive=True)`
+- **5s timer** → `_read_state_file()` — disk only, no API — updates cooldowns, portfolio cache, open P&L, peak drawdown, log tail, status bar countdown + health dot
+- **30s timer** → `action_trigger_scan()` — full API round-trip in `@work(thread=True, exclusive=True)` — includes all cron-equivalent phases (signal dedup, F&G regime, digest, Telegram summary, health sentinel)
 - State flows via `ScanComplete` and `StateUpdated` messages from worker → main thread
+
+**TUI reactive attributes:**
+- `scanning`, `last_scan` — scan lifecycle
+- `fg_value`, `fg_class`, `btc_price`, `btc_rsi`, `btc_above_sma` — header market context
+- `btc_dom`, `btc_dom_rising`, `open_pnl_usdc` — header BTC.D + P&L display
+
+**TUI widget data flow:**
+- PairCard: ATR% computed from `result["closed_klines"]` via `calc_atr()`, divergence from `result["divergence"]`
+- Positions table: 🛡 breakeven + S1/S2/S3 trailing from trade dict fields
+- History table: exit_price + pnl_pct from closed trades, 20-row window
+- Performance widget: profit factor, Sharpe, max consec loss, BE saves — all computed from `self._trades`
+- Status bar: health dot from `last_scan_ok` kv age, countdown from `_next_scan_at` monotonic
 
 ### Alert deduplication
 

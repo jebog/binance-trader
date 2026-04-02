@@ -223,7 +223,7 @@ The daily timeframe classifies each pair's broader trend before the 1h signal is
 |-------------|-----------|----------------|--------|
 | **Bullish** | > 45 | above | MODERATE allowed |
 | **Neutral** | 30–45 | any | STRONG allowed, MODERATE blocked |
-| **Bearish** | < 30 | below | STRONG blocked, EXTREME still fires |
+| **Bearish** | < 30, or 30–45 below SMA | — | STRONG blocked, EXTREME still fires |
 
 EXTREME signals bypass the daily filter — deep oversold readings are entries regardless of trend.
 
@@ -354,6 +354,7 @@ All settings live in `config.py` — edit only this file, never `scanner.py` dir
 | `PAIR_SCORE_LOOKBACK` | `20` | Last N closed trades per symbol |
 | `PROGRESSIVE_TRAILING_ENABLED` | `True` | Tighten trailing delta at ATR milestones (T4-4) |
 | `PROGRESSIVE_TRAILING_STAGES` | `[(1.5,100),(2.0,75),(2.5,50)]` | (ATR multiplier trigger, new bps); do not reorder while trades are open |
+| `CRON_ENABLED` | `false` | Set `true` in `.env` to enable launchd cron job; TUI has full parity |
 
 **ATR floor note:** When ATR < `ATR_SL_MIN / ATR_SL_MULT`, SL is floored to `ATR_SL_MIN` but TP still scales from the floored SL. The apparent R/R improves beyond what the raw ATR justifies — a conservative bias in flat/low-volatility markets.
 

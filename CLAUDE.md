@@ -59,6 +59,7 @@ MAX_POSITIONS    = 2         # max concurrent open positions
 SL_COOLDOWN_H    = 4         # hours to block a pair after SL hit
 MAX_DRAWDOWN_PCT = 0.15      # halt new orders if portfolio drops >15% from peak
 DIGEST_HOUR      = 8         # local hour (0–23) to send morning digest
+CRON_ENABLED     = false     # set true in .env to enable launchd cron job (TUI has full parity)
 
 # SL/TP
 TRAILING_DELTA = 150       # trailing stop in basis points; 0 = fixed stop
@@ -123,18 +124,20 @@ PROGRESSIVE_TRAILING_STAGES = [(1.5, 100), (2.0, 75), (2.5, 50)]  # (atr_mult, b
 ## How to run
 
 ```bash
+# Live TUI dashboard (recommended — full feature parity with cron)
+python3 tui.py
+
 # Interactive mode (manual CONFIRM prompt)
 python3 scanner.py
 
-# Cron mode (Telegram confirmation)
+# Cron mode (Telegram confirmation) — optional, set CRON_ENABLED=true in .env
 SCANNER_CRON=1 python3 scanner.py
-
-# Live TUI dashboard
-python3 tui.py
 
 # Walk-forward backtest
 python3 backtest.py
 ```
+
+The TUI has full cron parity (signal dedup, F&G regime alerts, daily digest, Telegram summaries, health sentinel). Cron is optional — set `CRON_ENABLED=true` in `.env` to enable the launchd job.
 
 The launchd job (`~/Library/LaunchAgents/com.trading.scanner.plist`) runs cron mode every 30 minutes with `SCANNER_CRON=1`.
 

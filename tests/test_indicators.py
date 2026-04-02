@@ -1377,7 +1377,9 @@ class TestBreakeven:
         trade["trailing_stage"] = 0
         current_price = 2000.0 * 1.05
 
-        conn = scanner.db_connect()
+        import sqlite3 as _sql
+        conn = _sql.connect(":memory:")
+        conn.row_factory = _sql.Row
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
@@ -1407,7 +1409,9 @@ class TestBreakeven:
         trade["trailing_stage"] = 0
         current_price = 2000.0 * 1.05
 
-        conn = scanner.db_connect()
+        import sqlite3 as _sql
+        conn = _sql.connect(":memory:")
+        conn.row_factory = _sql.Row
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
@@ -1461,7 +1465,9 @@ class TestProgressiveTrailingDB:
         # = 2000 * 1.03 = 2060
         current_price = 2065.0
 
-        conn = scanner.db_connect()
+        import sqlite3 as _sql
+        conn = _sql.connect(":memory:")
+        conn.row_factory = _sql.Row
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 
@@ -1486,7 +1492,9 @@ class TestProgressiveTrailingDB:
         trade = self._make_trade()
         current_price = 2065.0
 
-        conn = scanner.db_connect()
+        import sqlite3 as _sql
+        conn = _sql.connect(":memory:")
+        conn.row_factory = _sql.Row
         scanner.db_init(conn)
         scanner.insert_trade(conn, trade)
 

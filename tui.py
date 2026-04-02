@@ -53,6 +53,7 @@ from scanner import (
     _escape_md,
     _estimate_sl_tp_pct,
     _load_cooldowns,
+    acquire_scan_lock,
     analyze,
     apply_correlation_cap,
     build_market_context,
@@ -64,6 +65,7 @@ from scanner import (
     get_portfolio,
     get_state_dict,
     place_buy_order,
+    release_scan_lock,
     run_position_management,
     run_split_entry_checks,
     save_state,
@@ -801,6 +803,25 @@ class ScannerApp(App):
             run_split_entry_checks()
             run_position_management()
 
+            # ── Acquire scan lock (prevents cron + TUI double-ordering) ──────
+            if not acquire_scan_lock(caller="tui"):
+                tlog("[yellow]⏸ Scan lock held by cron — skipping signal detection[/]")
+                # Still update dashboard from DB
+                try:
+                    _dash_conn = db_connect()
+                    db_init(_dash_conn)
+                    generate_dashboard(get_state_dict(_dash_conn))
+                    _dash_conn.close()
+                except Exception:
+                    pass
+                self.call_from_thread(
+                    self.post_message,
+                    ScanComplete(results=[], signals=[], context=context,
+                                 portfolio=portfolio or {}, positions=get_open_positions(),
+                                 open_pnl=None),
+                )
+                return
+
             tlog("Analyzing pairs...")
             results    = []
             candidates = []
@@ -880,6 +901,7 @@ class ScannerApp(App):
                 except Exception:
                     pass
 
+            release_scan_lock()
             tlog(f"[green]Scan complete — {len(results)} pairs, {len(signals)} signal(s)[/]")
 
             if signals:
@@ -904,6 +926,10 @@ class ScannerApp(App):
 
         except Exception as e:
             tlog(f"[red bold]Scan error: {markup_escape(str(e))}[/]")
+            try:
+                release_scan_lock()
+            except Exception:
+                pass
         finally:
             self.call_from_thread(setattr, self, "scanning", False)
 

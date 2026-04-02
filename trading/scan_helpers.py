@@ -16,7 +16,15 @@ from config import (
     SPLIT_ENTRY_TTL_H,
 )
 from trading.analytics import _pair_score
-from trading.db import db_connect, get_all_trades, get_open_trades, insert_trade
+from trading.db import (
+    db_connect,
+    db_init,
+    get_all_trades,
+    get_kv,
+    get_open_trades,
+    insert_trade,
+    set_kv,
+)
 from trading.http_client import get
 from trading.market_data import (
     _is_btc_dom_rising,
@@ -31,6 +39,53 @@ from trading.orders import (
     _place_split_second_entry,
 )
 from trading.positions import _check_breakeven, _check_progressive_trailing
+
+# ── Scan lock ────────────────────────────────────────────────────────────────
+# Prevents cron + TUI from placing duplicate orders for the same signal.
+# Lock TTL is 5 minutes (covers Telegram confirm wait in cron mode).
+SCAN_LOCK_TTL_S = 300
+
+
+def acquire_scan_lock(conn: Optional[sqlite3.Connection] = None,
+                      caller: str = "unknown") -> bool:
+    """Try to acquire the scan lock. Returns True if acquired, False if held by another.
+
+    The lock is a kv entry 'scan_lock' with value 'caller|iso_timestamp'.
+    Stale locks (older than SCAN_LOCK_TTL_S) are automatically reclaimed.
+    """
+    _own = conn is None
+    if _own:
+        conn = db_connect()
+        db_init(conn)
+    try:
+        existing = get_kv(conn, "scan_lock") or ""
+        if existing:
+            parts = existing.split("|", 1)
+            if len(parts) == 2:
+                try:
+                    lock_age = (datetime.now() - datetime.fromisoformat(parts[1])).total_seconds()
+                    if lock_age < SCAN_LOCK_TTL_S:
+                        return False  # lock held by another caller
+                except (ValueError, TypeError):
+                    pass  # corrupt timestamp — reclaim
+        set_kv(conn, "scan_lock", f"{caller}|{datetime.now().isoformat()}")
+        return True
+    finally:
+        if _own:
+            conn.close()
+
+
+def release_scan_lock(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Release the scan lock."""
+    _own = conn is None
+    if _own:
+        conn = db_connect()
+        db_init(conn)
+    try:
+        set_kv(conn, "scan_lock", "")
+    finally:
+        if _own:
+            conn.close()
 
 
 def apply_correlation_cap(

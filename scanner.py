@@ -191,8 +191,10 @@ from trading.dashboard import generate_dashboard  # noqa: E402, F401
 
 # ── trading.scan_helpers ─────────────────────────────────────────────────────
 from trading.scan_helpers import (  # noqa: E402, F401
+    acquire_scan_lock,
     apply_correlation_cap,
     build_market_context,
+    release_scan_lock,
     run_position_management,
     run_split_entry_checks,
 )
@@ -237,6 +239,11 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
 
     run_split_entry_checks(_scan_conn)
     run_position_management(_scan_conn)
+
+    # ── Acquire scan lock (prevents cron + TUI double-ordering) ────────────────
+    if not acquire_scan_lock(_scan_conn, caller="scanner"):
+        print("  ⏸ Scan lock held by another process — skipping signal detection")
+        return
 
     context = build_market_context()
     fg_value   = context["fg_value"]
@@ -529,6 +536,9 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
                                       "rsi": s["rsi"], "signal_strength": s["signal_strength"]}
                                      for s in signals], new_trades,
                                      conn=_scan_conn)
+    # ── Release scan lock ────────────────────────────────────────────────────
+    release_scan_lock(_scan_conn)
+
     # ── Generate dashboard ────────────────────────────────────────────────────
     try:
         generate_dashboard(get_state_dict(_scan_conn))

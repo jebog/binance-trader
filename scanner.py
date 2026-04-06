@@ -244,6 +244,13 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
     run_split_entry_checks(_scan_conn)
     run_position_management(_scan_conn)
 
+    # ── DCA accumulation check (cheap when not scheduled) ──────────────────────
+    try:
+        from trading.dca import run_dca_check
+        run_dca_check(_scan_conn)
+    except Exception as _dca_e:
+        print(f"  \u26a0 DCA check failed: {_dca_e}")
+
     # ── Acquire scan lock (prevents cron + TUI double-ordering) ────────────────
     if not acquire_scan_lock(_scan_conn, caller="scanner"):
         print("  ⏸ Scan lock held by another process — skipping signal detection")

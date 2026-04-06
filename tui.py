@@ -992,6 +992,13 @@ class ScannerApp(App):
             run_split_entry_checks()
             run_position_management()
 
+            # ── DCA accumulation check ───────────────────────────────────────
+            try:
+                from trading.dca import run_dca_check
+                run_dca_check()
+            except Exception as _dca_e:
+                tlog(f"[yellow]⚠ DCA check failed: {_dca_e}[/]")
+
             # ── Acquire scan lock (prevents cron + TUI double-ordering) ──────
             if not acquire_scan_lock(caller="tui"):
                 tlog("[yellow]⏸ Scan lock held by cron — skipping signal detection[/]")

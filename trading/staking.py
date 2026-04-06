@@ -12,8 +12,8 @@ Design:
     call from TUI/dashboard refresh loops — they only issue signed GETs.
 
 Binance endpoints used:
-  POST /sapi/v1/eth-staking/eth/stake   — wrap ETH → BETH
-  GET  /sapi/v1/eth-staking/account     — cumulative profit, holding amount
+  POST /sapi/v2/eth-staking/eth/stake   — wrap ETH → BETH
+  GET  /sapi/v2/eth-staking/account     — cumulative profit, holding amount
   GET  /api/v3/account                  — read BETH balance from spot wallet
 """
 from __future__ import annotations
@@ -65,7 +65,7 @@ def stake_eth(qty: float) -> Optional[dict[str, Any]]:
             print(f"  {msg}")
             return None
 
-        resp = signed_post("/sapi/v1/eth-staking/eth/stake", {
+        resp = signed_post("/sapi/v2/eth-staking/eth/stake", {
             "amount": f"{qty:.6f}",
         })
         print(f"  \u2713 Staked {qty:.6f} ETH → BETH (resp: {resp.get('success', resp)})")
@@ -93,7 +93,7 @@ def stake_eth(qty: float) -> Optional[dict[str, Any]]:
 def get_staking_stats() -> dict[str, Any]:
     """Return staking position stats: beth_qty, eth_value, cumulative rewards.
 
-    Uses `/sapi/v1/eth-staking/account` if available; falls back to spot
+    Uses `/sapi/v2/eth-staking/account` if available; falls back to spot
     balance + live price if the staking endpoint is unavailable.
     """
     stats: dict[str, Any] = {
@@ -118,7 +118,7 @@ def get_staking_stats() -> dict[str, Any]:
 
     # 3) Cumulative reward from staking account endpoint (may fail — fail-soft)
     try:
-        acct = signed_get("/sapi/v1/eth-staking/account", {})
+        acct = signed_get("/sapi/v2/eth-staking/account", {})
         stats["cumulative_reward"] = float(acct.get("cumulativeProfitInBETH", 0))
     except Exception:
         pass  # endpoint unavailable or no staking position

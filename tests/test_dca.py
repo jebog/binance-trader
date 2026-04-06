@@ -14,6 +14,7 @@ import pytest
 
 import trading.dca
 import trading.orders
+import trading.staking
 from trading.analytics import _compute_perf_stats, _pair_score
 from trading.db import db_init, get_kv, insert_trade
 
@@ -338,3 +339,111 @@ class TestReserveGuard:
             with pytest.raises(RuntimeError, match="guard-passed"):
                 trading.orders.place_buy_order("ETHUSDC", 200.0, 2000.0, None)
             mock_sg.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# trading.staking — fail-soft guarantees
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestStaking:
+    def test_disabled_returns_none(self):
+        with patch.object(trading.staking, "STAKING_ENABLED", False), \
+             patch.object(trading.staking, "signed_post") as mock_post:
+            assert trading.staking.stake_eth(0.5) is None
+            mock_post.assert_not_called()
+
+    def test_zero_qty_returns_none(self):
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post") as mock_post:
+            assert trading.staking.stake_eth(0) is None
+            mock_post.assert_not_called()
+
+    def test_below_binance_minimum_skips(self):
+        """qty < 0.0001 ETH → skip without hitting the API."""
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post") as mock_post:
+            assert trading.staking.stake_eth(0.00005) is None
+            mock_post.assert_not_called()
+
+    def test_api_failure_is_fail_soft(self):
+        """Stake API exception → returns None, does NOT raise, sends warning."""
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post", side_effect=Exception("API down")), \
+             patch.object(trading.staking, "send_telegram", return_value=None) as mock_tg:
+            result = trading.staking.stake_eth(0.5)
+        assert result is None
+        mock_tg.assert_called_once()
+        assert "failed" in mock_tg.call_args[0][0].lower()
+
+    def test_successful_stake(self):
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post",
+                          return_value={"success": True}) as mock_post, \
+             patch.object(trading.staking, "send_telegram", return_value=None):
+            result = trading.staking.stake_eth(0.5)
+        assert result == {"success": True}
+        # Verify v2 endpoint is called (review flagged v1 as stale)
+        assert "/sapi/v2/eth-staking/eth/stake" in mock_post.call_args[0][0]
+
+    def test_get_beth_balance_sums_free_and_locked(self):
+        with patch.object(trading.staking, "signed_get", return_value={"balances": [
+                 {"asset": "BETH", "free": "0.3", "locked": "0.1"},
+             ]}), \
+             patch.object(trading.staking, "STAKING_ASSET", "BETH"):
+            assert trading.staking.get_beth_balance() == pytest.approx(0.4)
+
+    def test_get_beth_balance_missing_returns_zero(self):
+        with patch.object(trading.staking, "signed_get", return_value={"balances": []}):
+            assert trading.staking.get_beth_balance() == 0.0
+
+    def test_get_beth_balance_api_error_returns_zero(self):
+        with patch.object(trading.staking, "signed_get", side_effect=Exception("x")):
+            assert trading.staking.get_beth_balance() == 0.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Insufficient-balance debounce + reserve auto-init
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestDebounceAndAutoInit:
+    def test_insufficient_balance_debounces_telegram(self):
+        """Two consecutive low-balance calls → only one Telegram alert."""
+        conn = _mem_conn()
+        with patch.object(trading.dca, "DCA_ENABLED", True), \
+             patch.object(trading.dca, "DCA_AMOUNT_USDC", 40.0), \
+             patch.object(trading.dca, "DCA_MIN_SCANNER_USDC", 200.0), \
+             patch.object(trading.dca, "signed_get", return_value={"balances": [
+                 {"asset": "USDC", "free": "100.0", "locked": "0"},
+             ]}), \
+             patch.object(trading.dca, "send_telegram", return_value=None) as mock_tg:
+            trading.dca.place_dca_buy(conn)
+            trading.dca.place_dca_buy(conn)
+            trading.dca.place_dca_buy(conn)
+        # First call fires, next two suppressed by < 1h debounce
+        assert mock_tg.call_count == 1
+        conn.close()
+
+    def test_run_dca_check_auto_initializes_reserve(self):
+        """First call with unset reserve → auto-init to DCA_AMOUNT × RESERVE_MULT."""
+        conn = _mem_conn()
+        with patch.object(trading.dca, "DCA_ENABLED", True), \
+             patch.object(trading.dca, "DCA_AMOUNT_USDC", 40.0), \
+             patch.object(trading.dca, "DCA_RESERVE_MULT", 10), \
+             patch.object(trading.dca, "should_run_dca", return_value=False):
+            assert trading.dca.get_dca_reserve(conn) == 0.0
+            trading.dca.run_dca_check(conn)
+            assert trading.dca.get_dca_reserve(conn) == 400.0
+        conn.close()
+
+    def test_run_dca_check_preserves_existing_reserve(self):
+        """Existing non-zero reserve is NOT overwritten."""
+        conn = _mem_conn()
+        from trading.db import set_kv
+        set_kv(conn, "dca_reserved_usdc", "1234.56")
+        with patch.object(trading.dca, "DCA_ENABLED", True), \
+             patch.object(trading.dca, "DCA_AMOUNT_USDC", 40.0), \
+             patch.object(trading.dca, "DCA_RESERVE_MULT", 10), \
+             patch.object(trading.dca, "should_run_dca", return_value=False):
+            trading.dca.run_dca_check(conn)
+            assert trading.dca.get_dca_reserve(conn) == 1234.56
+        conn.close()

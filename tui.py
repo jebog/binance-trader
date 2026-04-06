@@ -444,6 +444,122 @@ class PerformanceWidget(Static):
         self.update(self.render_perf(trades))
 
 
+class DCAWidget(Static):
+    """ETH accumulation progress + staking + next-buy countdown."""
+
+    def render_dca(self) -> str:
+        try:
+            from config import (
+                DCA_ENABLED,
+                DCA_TARGET_ASSET,
+                DCA_TARGET_QTY,
+                STAKING_ENABLED,
+            )
+        except Exception:
+            return "[dim]DCA unavailable[/]"
+
+        if not DCA_ENABLED:
+            return f"[{M_SUBTEXT}]DCA disabled[/]\n[dim]Set DCA_ENABLED=true[/]"
+
+        try:
+            from trading.db import db_connect, db_init
+            from trading.dca import get_dca_reserve, get_dca_stats, next_dca_time
+            from trading.staking import get_beth_balance
+
+            conn = db_connect()
+            db_init(conn)
+            # include_price=False → no API call in the 5s refresh path
+            stats = get_dca_stats(conn, include_price=False)
+            reserve = get_dca_reserve(conn)
+            conn.close()
+        except Exception as e:
+            return f"[{M_RED}]DCA error:[/] {e}"
+
+        # BETH balance is cached only at 30s scan boundary (live API call).
+        # For 5s refresh, fall back to 0 if not yet populated.
+        beth_qty = getattr(self, "_cached_beth", 0.0)
+        current_price = getattr(self, "_cached_eth_price", 0.0)
+
+        free_qty = float(stats.get("total_qty") or 0)
+        total_qty = free_qty + beth_qty
+        target = float(DCA_TARGET_QTY)
+        progress = (total_qty / target * 100) if target > 0 else 0.0
+        progress = min(progress, 100.0)
+        bar_width = 12
+        filled = int(progress / 100 * bar_width)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        invested = float(stats.get("total_invested") or 0)
+        avg_entry = float(stats.get("avg_entry") or 0)
+
+        # P&L only computable with a current price
+        if current_price > 0 and total_qty > 0:
+            value = total_qty * current_price
+            pnl_usdc = value - invested
+            pnl_pct = (pnl_usdc / invested * 100) if invested > 0 else 0.0
+            pnl_col = M_GREEN if pnl_usdc >= 0 else M_RED
+            pnl_line = (
+                f"Value: [{M_TEXT}]${value:,.0f}[/]  "
+                f"[{pnl_col}]{'+' if pnl_usdc >= 0 else ''}${pnl_usdc:.0f} ({pnl_pct:+.1f}%)[/]"
+            )
+        else:
+            pnl_line = f"[{M_SUBTEXT}]Value: waiting for price…[/]"
+
+        # Countdown to next scheduled buy
+        try:
+            next_dt = next_dca_time()
+            delta = next_dt - datetime.now()
+            secs = max(0, int(delta.total_seconds()))
+            days, rem = divmod(secs, 86400)
+            hours, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                countdown = f"{days}d {hours}h"
+            elif hours > 0:
+                countdown = f"{hours}h {mins}m"
+            else:
+                countdown = f"{mins}m"
+            next_line = f"[{M_SUBTEXT}]Next buy: {countdown}[/] [dim]({next_dt.strftime('%a %H:%M')})[/]"
+        except Exception:
+            next_line = f"[{M_SUBTEXT}]Next buy: —[/]"
+
+        progress_col = M_GREEN if progress >= 100 else M_ORANGE
+        staking_line = ""
+        if STAKING_ENABLED and beth_qty > 0:
+            staking_line = f"\n[{M_GREEN}]🌱 Staked: {beth_qty:.4f} BETH[/]"
+        elif STAKING_ENABLED:
+            staking_line = f"\n[{M_SUBTEXT}]🌱 Staking: enabled[/]"
+
+        avg_line = (
+            f"Avg: [{M_TEXT}]${avg_entry:,.0f}[/]  Inv: [{M_TEXT}]${invested:,.0f}[/]"
+            if avg_entry > 0 else f"[{M_SUBTEXT}]No buys yet[/]"
+        )
+        reserve_line = (
+            f"[{M_SUBTEXT}]Reserve: ${reserve:,.0f}[/]"
+            if reserve > 0 else f"[{M_RED}]Reserve: unset[/]"
+        )
+
+        return (
+            f"[{progress_col}]{bar}[/] [{M_TEXT}]{total_qty:.4f}[/]/[{M_SUBTEXT}]{target}[/] {DCA_TARGET_ASSET} "
+            f"[{progress_col}]({progress:.0f}%)[/]\n"
+            f"{avg_line}\n"
+            f"{pnl_line}\n"
+            f"{next_line}\n"
+            f"{reserve_line}"
+            f"{staking_line}"
+        )
+
+    def update_dca(self, beth_qty: float = 0.0, eth_price: float = 0.0) -> None:
+        """Called from 30s scan worker with fresh API data."""
+        self._cached_beth = beth_qty
+        self._cached_eth_price = eth_price
+        self.update(self.render_dca())
+
+    def refresh_countdown(self) -> None:
+        """Called from 5s timer — rerenders using cached API values."""
+        self.update(self.render_dca())
+
+
 class BacktestWidget(Static):
     def render_backtest(self) -> str:
         try:
@@ -664,6 +780,10 @@ class ScannerApp(App):
                 yield Label("PERFORMANCE", classes="panel-title")
                 yield Label("─" * 26, classes="panel-divider")
                 yield PerformanceWidget(id="perf-widget")
+                yield Label("")
+                yield Label("ETH ACCUMULATION", classes="panel-title")
+                yield Label("─" * 26, classes="panel-divider")
+                yield DCAWidget(id="dca-widget")
 
             # Center panel — tabbed: Market / Positions / History / Backtest
             with TabbedContent(id="center-tabs"):
@@ -837,6 +957,11 @@ class ScannerApp(App):
         self.query_one("#cooldown-widget", CooldownWidget).update_cooldowns(self._cooldowns)
         self.query_one("#perf-widget",     PerformanceWidget).update_trades(self._trades)
         self.query_one("#equity-widget",   EquityWidget).refresh_equity(self._trades)
+        # DCA widget: rerender countdown (uses cached API values set by scan worker)
+        try:
+            self.query_one("#dca-widget", DCAWidget).refresh_countdown()
+        except Exception:
+            pass
         if self._portfolio:
             self.query_one("#portfolio-widget", PortfolioWidget).update_portfolio(
                 self._portfolio, open_pnl=self._open_pnl, peak_usdc=self._peak_usdc
@@ -1272,6 +1397,23 @@ class ScannerApp(App):
             switcher = self.query_one("#left-switcher", ContentSwitcher)
             if switcher.current == "portfolio-loading":
                 switcher.current = "portfolio-widget"
+
+        # Update DCA widget with fresh BETH qty + ETH price from portfolio
+        try:
+            beth_qty = 0.0
+            eth_price = 0.0
+            if msg.portfolio:
+                for a in msg.portfolio.get("assets", []):
+                    if a.get("asset") == "BETH":
+                        beth_qty = float(a.get("qty") or 0)
+                        eth_price = float(a.get("price_usdc") or 0)
+                    elif a.get("asset") == "ETH" and eth_price == 0:
+                        eth_price = float(a.get("price_usdc") or 0)
+            self.query_one("#dca-widget", DCAWidget).update_dca(
+                beth_qty=beth_qty, eth_price=eth_price
+            )
+        except Exception:
+            pass
 
         # Update positions table
         self._refresh_positions_table(msg.positions)

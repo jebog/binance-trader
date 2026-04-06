@@ -274,8 +274,15 @@ def place_dca_buy(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
 
 # ── DCA statistics ────────────────────────────────────────────────────────────
 
-def get_dca_stats(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
-    """Return cumulative DCA statistics: qty, avg_entry, invested, current_value, pnl_pct."""
+def get_dca_stats(
+    conn: Optional[sqlite3.Connection] = None,
+    include_price: bool = True,
+) -> dict[str, Any]:
+    """Return cumulative DCA statistics: qty, avg_entry, invested, current_value, pnl_pct.
+
+    Set include_price=False to skip the live ticker fetch — safe for frequent
+    calls from UI refresh loops (5s timers) where API calls must be avoided.
+    """
     _own = conn is None
     if _own:
         conn = db_connect()
@@ -322,7 +329,9 @@ def get_dca_stats(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
         stats["last_buy"]  = rows[-1]["time"]
         stats["progress_pct"] = (stats["total_qty"] / DCA_TARGET_QTY * 100) if DCA_TARGET_QTY > 0 else 0.0
 
-        # Fetch current price for unrealized P&L
+        # Fetch current price for unrealized P&L (skip on include_price=False)
+        if not include_price:
+            return stats
         try:
             ticker = get("/api/v3/ticker/price", {"symbol": DCA_TARGET_PAIR})
             cp = float(ticker["price"])

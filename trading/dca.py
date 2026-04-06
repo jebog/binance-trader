@@ -148,7 +148,19 @@ def place_dca_buy(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
                 f"(need {DCA_AMOUNT_USDC} for buy + {DCA_MIN_SCANNER_USDC} scanner floor)"
             )
             print(f"  {msg}")
-            send_telegram(msg)
+            # Debounce Telegram alert: only fire if last skip was > 1h ago.
+            # Prevents spam when scan loop retries every 30s on low-balance days.
+            last_skip = get_kv(conn, "last_dca_skip") or ""
+            should_alert = True
+            if last_skip:
+                try:
+                    age_h = (datetime.now() - datetime.fromisoformat(last_skip)).total_seconds() / 3600
+                    should_alert = age_h >= 1.0
+                except (ValueError, TypeError):
+                    should_alert = True
+            if should_alert:
+                send_telegram(msg)
+                set_kv(conn, "last_dca_skip", datetime.now().isoformat())
             return None
 
         # ── Fetch current price + precision ───────────────────────────────
@@ -171,8 +183,9 @@ def place_dca_buy(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
             print(f"  \u26a0 DCA exchange info fetch failed: {e}")
             return None
 
-        # Compute quantity — use quoteOrderQty (spend exact USDC) to avoid
-        # stepSize rounding issues entirely. Binance handles the math.
+        # NOTE: qty_est is ONLY used for the min_qty pre-flight check below.
+        # The actual order uses quoteOrderQty (spend exact USDC) so Binance
+        # handles qty computation — no stepSize rounding needed client-side.
         qty_raw = DCA_AMOUNT_USDC / price
         qty_prec = len(str(step).rstrip('0').split('.')[-1])
         qty_est = round(math.floor(qty_raw / step) * step, qty_prec)
@@ -194,7 +207,7 @@ def place_dca_buy(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
                 "side":           "BUY",
                 "type":           "MARKET",
                 "quoteOrderQty":  DCA_AMOUNT_USDC,
-                "newClientOrderId": f"agent-dca-{int(time.time())}",
+                "newClientOrderId": f"agent-dca-{time.time_ns()}",
             })
         except Exception as e:
             msg = f"\u274c DCA buy failed: {e}"
@@ -267,6 +280,9 @@ def get_dca_stats(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
     if _own:
         conn = db_connect()
         db_init(conn)
+    # Defensive: ensure row access by column name works even if caller
+    # passed a raw connection without setting row_factory.
+    conn.row_factory = sqlite3.Row
 
     try:
         rows = conn.execute(
@@ -382,6 +398,11 @@ def run_dca_check(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
     """
     if not DCA_ENABLED:
         return None
+    # Auto-initialize reserve on first activation — prevents unprotected
+    # runway if the user forgets to call initialize_dca_reserve() manually.
+    if get_dca_reserve(conn) == 0.0:
+        reserved = initialize_dca_reserve(conn)
+        print(f"  \U0001f512 DCA reserve auto-initialized: ${reserved:.2f}")
     if not should_run_dca(conn):
         return None
     return place_dca_buy(conn)

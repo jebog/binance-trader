@@ -199,6 +199,23 @@ from trading.scan_helpers import (  # noqa: E402, F401
     run_split_entry_checks,
 )
 
+# ── trading.dca / trading.staking ────────────────────────────────────────────
+from trading.dca import (  # noqa: E402, F401
+    get_dca_reserve,
+    get_dca_stats,
+    initialize_dca_reserve,
+    next_dca_time,
+    place_dca_buy,
+    run_dca_check,
+    should_run_dca,
+)
+from trading.staking import (  # noqa: E402, F401
+    get_beth_balance,
+    get_staking_stats,
+    get_total_eth,
+    stake_eth,
+)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  scan() and _scan_body() — the main entry points

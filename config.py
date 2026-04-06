@@ -105,6 +105,28 @@ TARGET_RISK_PCT    = 0.015  # target 1.5% portfolio risk per trade (= 1×ATR as 
 VOL_SIZING_MIN     = 0.25   # floor: never below 25% of CAPITAL
 VOL_SIZING_MAX     = 1.00   # ceiling: never above 100% of CAPITAL
 
+# ── ETH Accumulation + DCA ────────────────────────────────────
+# Long-term accumulation layer targeting 1 ETH, runs independently of scanner.
+# Funded from USDC balance, isolated via DCA_RESERVED_USDC kv sentinel so the
+# scanner never spends into the DCA reserve.
+# Set DCA_ENABLED=true in .env to activate.
+DCA_ENABLED       = os.getenv("DCA_ENABLED", "false").lower() == "true"
+DCA_TARGET_ASSET  = os.getenv("DCA_TARGET_ASSET", "ETH")
+DCA_TARGET_PAIR   = os.getenv("DCA_TARGET_PAIR", "ETHUSDC")
+DCA_TARGET_QTY    = float(os.getenv("DCA_TARGET_QTY", "1.0"))     # accumulation goal
+DCA_AMOUNT_USDC   = float(os.getenv("DCA_AMOUNT_USDC", "40.0"))   # per weekly buy
+DCA_DAY_OF_WEEK   = int(os.getenv("DCA_DAY_OF_WEEK", "3"))        # 0=Mon, 3=Thu, 6=Sun
+DCA_HOUR          = int(os.getenv("DCA_HOUR", "10"))              # 0-23 local time
+DCA_RESERVE_MULT  = int(os.getenv("DCA_RESERVE_MULT", "10"))      # reserve N weeks upfront
+DCA_MIN_SCANNER_USDC = float(os.getenv("DCA_MIN_SCANNER_USDC", "200.0"))  # scanner floor
+
+# ── ETH Staking ───────────────────────────────────────────────
+# Auto-stake accumulated ETH on Binance Flexible ETH Staking (no lockup).
+# BETH token represents staked ETH 1:1 and earns ~2.5-3% APY.
+STAKING_ENABLED    = os.getenv("STAKING_ENABLED", "false").lower() == "true"
+STAKING_ASSET      = os.getenv("STAKING_ASSET", "BETH")
+STAKING_AUTO_STAKE = os.getenv("STAKING_AUTO_STAKE", "true").lower() == "true"
+
 # ── Persistence ───────────────────────────────────────────────
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.db")
 

@@ -88,6 +88,7 @@ def _compute_perf_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     closed = [
         t for t in trades
         if t.get("status") in ("tp_hit", "sl_hit", "timeout")
+        and t.get("signal_strength") != "DCA"  # exclude DCA accumulation trades
         and t.get("exit_time")
         and t.get("pnl_pct") is not None
         and _safe_fromisoformat(t["exit_time"]) >= cutoff
@@ -149,6 +150,8 @@ def _send_daily_digest(state: dict[str, Any]) -> None:
     for t in trades:
         if t.get("status") not in ("tp_hit", "sl_hit"):
             continue
+        if t.get("signal_strength") == "DCA":
+            continue  # DCA trades never close, but guard anyway
         try:
             ts = datetime.fromisoformat(t.get("exit_time") or t.get("time", ""))
             if ts >= cutoff:
@@ -230,6 +233,7 @@ def _pair_score(symbol: str, trades: list[dict[str, Any]]) -> float:
         t for t in trades
         if t.get("symbol") == symbol
         and t.get("status") in ("tp_hit", "sl_hit", "timeout")
+        and t.get("signal_strength") != "DCA"  # exclude DCA accumulation trades
         and t.get("pnl_pct") is not None
     ][-PAIR_SCORE_LOOKBACK:]
     if len(closed) < PAIR_SCORE_MIN_TRADES:

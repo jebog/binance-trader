@@ -32,6 +32,8 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | `trading/analytics.py` | `_calc_capital()`, `_compute_perf_stats()`, `_pair_score()`, `_send_daily_digest()` |
 | `trading/dashboard.py` | HTML dashboard generation |
 | `trading/scan_helpers.py` | `build_market_context()`, `apply_correlation_cap()`, `run_position_management()`, `run_split_entry_checks()` |
+| `trading/dca.py` | `should_run_dca()`, `place_dca_buy()`, `get_dca_stats()`, `run_dca_check()`, reserve helpers |
+| `trading/staking.py` | `stake_eth()`, `get_beth_balance()`, `get_staking_stats()`, `get_total_eth()` |
 | `trading/notify.py` | `send_telegram()`, `call_webhook()`, `notify_mac()` |
 | `trading/logger.py` | `logger` (structured logging to file + console), path constants |
 | `tui.py` | Textual TUI — live dashboard, runs scanner in background thread |
@@ -469,6 +471,78 @@ conn.commit(); conn.close()
 
 ---
 
+## ETH Accumulation Layer (DCA + Staking)
+
+A long-term accumulation layer that runs **alongside** the tactical scanner, targeting 1 ETH via weekly DCA buys with optional auto-staking to BETH. Fully feature-flagged behind `DCA_ENABLED`/`STAKING_ENABLED` — off by default, zero behavior change until activated.
+
+### Design invariants
+
+1. **Capital isolation** — `dca_reserved_usdc` kv sentinel reserves N weeks of DCA runway. `place_buy_order()` refuses any scanner trade that would drop live USDC below the reserve (fail-open on API errors so transient Binance hiccups don't block entries).
+2. **Separate storage** — DCA trades live in the same `trades` table but with `signal_strength="DCA"` and `status="dca_hold"`. They never close (no TP/SL) and are filtered out of `_compute_perf_stats`, `_pair_score`, and the 7-day digest so they can't skew scanner KPIs.
+3. **Idempotent scheduling** — `run_dca_check()` is called every scan (30s). `should_run_dca()` gates on `DCA_ENABLED + day_of_week + hour + last_dca_run > 6 days` so safe to call repeatedly.
+4. **Fail-soft staking** — `stake_eth()` failures never abort the DCA buy. The ETH stays free in the spot wallet and can be staked manually via Binance Earn UI.
+5. **BETH valuation** — `get_portfolio()` special-cases BETH to use live ETH spot price (1:1 invariant), so staked value is counted in `total_usdc` for vol-sizing and circuit-breaker math without needing a tradable `BETHUSDC` pair.
+
+### Config (all override-able via `.env`)
+
+```python
+DCA_ENABLED          = False       # master feature flag
+DCA_TARGET_ASSET     = "ETH"
+DCA_TARGET_PAIR      = "ETHUSDC"
+DCA_TARGET_QTY       = 1.0         # accumulation goal
+DCA_AMOUNT_USDC      = 40.0        # per weekly buy
+DCA_DAY_OF_WEEK      = 3           # 0=Mon, 3=Thu, 6=Sun
+DCA_HOUR             = 10          # 0-23 local time
+DCA_RESERVE_MULT     = 10          # reserve N weeks upfront
+DCA_MIN_SCANNER_USDC = 200.0       # scanner floor for DCA balance precheck
+
+STAKING_ENABLED      = False
+STAKING_ASSET        = "BETH"
+STAKING_AUTO_STAKE   = True        # auto-stake each DCA buy
+```
+
+### Order of operations in `place_dca_buy()`
+
+1. USDC balance check: must be ≥ `DCA_AMOUNT_USDC + DCA_MIN_SCANNER_USDC` (else skip + Telegram)
+2. Fetch ETH price + `LOT_SIZE` filter from `/exchangeInfo`
+3. Place market buy using `quoteOrderQty=DCA_AMOUNT_USDC` (spend exact USDC, Binance computes qty — avoids stepSize rounding)
+4. Extract fill price from `cummulativeQuoteQty / executedQty` via `_order_fill_price()`
+5. Insert trade row with `status="dca_hold"`, `signal_strength="DCA"`, `tp=sl=0`
+6. Set `last_dca_run` kv sentinel
+7. Send Telegram confirmation
+8. If `STAKING_ENABLED and STAKING_AUTO_STAKE`: call `stake_eth(filled_qty)` (fail-soft)
+
+### Common tasks
+
+**Activate DCA**: set `DCA_ENABLED=true` in `.env`, restart TUI. First Thursday 10:00 will fire the initial buy.
+
+**Set/reset the reserve**: `trading.dca.initialize_dca_reserve(conn)` sets reserve to `DCA_AMOUNT_USDC × DCA_RESERVE_MULT`. Or write directly via `set_kv(conn, "dca_reserved_usdc", "400")`.
+
+**Force a DCA buy now** (ignoring schedule):
+```python
+from trading.dca import place_dca_buy
+from trading.db import db_connect, db_init
+conn = db_connect(); db_init(conn)
+place_dca_buy(conn)  # bypasses should_run_dca()
+conn.close()
+```
+
+**Clear `last_dca_run` to re-enable this week's slot**:
+```python
+import sqlite3
+conn = sqlite3.connect("state.db")
+conn.execute("DELETE FROM kv WHERE key = 'last_dca_run'")
+conn.commit(); conn.close()
+```
+
+**Check DCA progress**:
+```python
+from trading.dca import get_dca_stats
+print(get_dca_stats())  # n_buys, total_qty, avg_entry, pnl_pct, progress_pct
+```
+
+---
+
 ## What NOT to do
 
 - **Never import scanner.py with TeeLogger active** — guard must stay as `if __name__ == "__main__"`
@@ -487,4 +561,8 @@ conn.commit(); conn.close()
 - **Never annualize the per-trade IR in `_compute_perf_stats`** — trades have variable hold times, not fixed scan-period returns; annualizing with 17520 (scan periods/year) produces meaningless values
 - **Never skip the 15m RSI warm-up candles** — `ENTRY_REFINE_15M_LIMIT=50` gives 35 Wilder smoothing steps; fewer than ~28 produces RSI values with >20% error near thresholds
 - **Never patch `scanner.X` in tests for functions that live in `trading/`** — use `patch("trading.module.X")` where `module` is the one that imports the name. Python mocking patches where a name is looked up, not where it's defined
+- **Never remove the `signal_strength != 'DCA'` filter from `_compute_perf_stats` / `_pair_score` / the 7-day digest** — DCA trades never close and would either be silently ignored (best case) or inflate metrics with their `dca_hold` status (worst case)
+- **Never eagerly import `trading.dca` from `trading/orders.py`** — the reserve guard uses a lazy import inside `place_buy_order` to keep the dependency arrow pointing dca→orders (not the reverse) and avoid circular imports
+- **Never let `stake_eth()` failures abort the DCA pipeline** — staking is a best-effort side effect; a failed stake must leave the ETH free in spot and let `place_dca_buy` return successfully
+- **Never use a tradable pair lookup for BETH** — there is no `BETHUSDC` spot market; `get_portfolio()` must special-case BETH to the live ETH price (1:1 wrapper invariant)
 - **Never import from `scanner` inside `trading/` modules** — this creates circular imports. Dependency arrows only point downward: config → logger → db → notify → http_client → indicators → market_data → signals → orders → positions → analytics → dashboard → scan_helpers

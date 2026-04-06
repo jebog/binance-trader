@@ -26,7 +26,7 @@ from trading.db import (
     save_cooldown,
     save_pending_second_entry,
 )
-from trading.http_client import get, signed_delete, signed_post
+from trading.http_client import get, signed_delete, signed_get, signed_post
 from trading.indicators import calc_atr
 from trading.notify import send_telegram
 
@@ -262,6 +262,32 @@ def place_buy_order(
     closed_klines: Optional[list[list[Any]]] = None,
 ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any]]:
     """Place market buy + OCO (TP/SL)."""
+    # ── DCA reserve guard ───────────────────────────────────────────────
+    # Refuse to buy if doing so would eat into the DCA runway. Fail-open on
+    # errors (balance fetch failures should not block scanner trades).
+    try:
+        from config import DCA_ENABLED
+        if DCA_ENABLED:
+            from trading.dca import get_dca_reserve
+            reserve = get_dca_reserve()
+            if reserve > 0:
+                acct = signed_get("/api/v3/account", {})
+                free_usdc = 0.0
+                for b in acct.get("balances", []):
+                    if b["asset"] == "USDC":
+                        free_usdc = float(b["free"])
+                        break
+                if free_usdc - capital < reserve:
+                    raise ValueError(
+                        f"DCA reserve guard: buying ${capital:.2f} would drop USDC "
+                        f"${free_usdc:.2f} below reserve ${reserve:.2f} "
+                        f"\u2014 scanner trade skipped to protect DCA runway"
+                    )
+    except ValueError:
+        raise
+    except Exception as _guard_err:
+        print(f"  \u26a0 DCA reserve guard check failed (fail-open): {_guard_err}")
+
     qty_raw = capital / price
     info = get("/api/v3/exchangeInfo", {"symbol": symbol})
     step = 1.0

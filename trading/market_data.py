@@ -206,6 +206,12 @@ def get_portfolio() -> Optional[dict[str, Any]]:
         qty   = float(b["free"]) + float(b["locked"])
         if asset in STABLES:
             price = 1.0
+        elif asset == "BETH":
+            # BETH (staked ETH wrapper) doesn't trade on spot — value at ETH price 1:1
+            try:
+                price = float(get("/api/v3/ticker/price", {"symbol": "ETHUSDC"})["price"])
+            except Exception:
+                price = None
         else:
             price = None
             for quote in ("USDC", "USDT"):

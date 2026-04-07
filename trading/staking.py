@@ -65,8 +65,16 @@ def stake_eth(qty: float) -> Optional[dict[str, Any]]:
             print(f"  {msg}")
             return None
 
+        # Binance enforces 4-decimal precision on the `amount` parameter.
+        # Truncate (don't round) so we never attempt to stake more than we hold.
+        import math as _math
+        qty_4dp = _math.floor(qty * 10000) / 10000
+        if qty_4dp < 0.0001:
+            msg = f"\u26a0 Stake skipped — qty {qty} truncates to {qty_4dp} < 0.0001"
+            print(f"  {msg}")
+            return None
         resp = signed_post("/sapi/v2/eth-staking/eth/stake", {
-            "amount": f"{qty:.6f}",
+            "amount": f"{qty_4dp:.4f}",
         })
         print(f"  \u2713 Staked {qty:.6f} ETH → BETH (resp: {resp.get('success', resp)})")
         send_telegram(

@@ -1630,4 +1630,7 @@ class ScannerApp(App):
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = ScannerApp()
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass  # clean Ctrl-C exit — no traceback

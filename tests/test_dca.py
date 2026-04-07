@@ -384,6 +384,27 @@ class TestStaking:
         assert result == {"success": True}
         # Verify v2 endpoint is called (review flagged v1 as stale)
         assert "/sapi/v2/eth-staking/eth/stake" in mock_post.call_args[0][0]
+        # Verify 4-decimal precision (Binance spec)
+        assert mock_post.call_args[0][1]["amount"] == "0.5000"
+
+    def test_amount_truncated_to_4_decimals(self):
+        """Binance enforces 4-decimal precision — truncate (not round) so
+        we never stake more than we actually hold."""
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post",
+                          return_value={"success": True}) as mock_post, \
+             patch.object(trading.staking, "send_telegram", return_value=None):
+            # 0.12347 rounded-to-4dp = 0.1235 (MORE than held → rejection)
+            # 0.12347 truncated-to-4dp = 0.1234 (safe)
+            trading.staking.stake_eth(0.12347)
+        assert mock_post.call_args[0][1]["amount"] == "0.1234"
+
+    def test_amount_truncates_below_minimum_skips(self):
+        """qty that truncates below 0.0001 → skip without hitting API."""
+        with patch.object(trading.staking, "STAKING_ENABLED", True), \
+             patch.object(trading.staking, "signed_post") as mock_post:
+            assert trading.staking.stake_eth(0.00009) is None
+            mock_post.assert_not_called()
 
     def test_get_beth_balance_sums_free_and_locked(self):
         with patch.object(trading.staking, "signed_get", return_value={"balances": [

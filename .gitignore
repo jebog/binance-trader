@@ -52,3 +52,7 @@ ve-hero.png
 state.db
 state.db-shm
 state.db-wal
+
+# ── Ad-hoc manual trade watchers (one-off scripts, not part of the scanner) ───
+xrp_fill_watcher.py
+xrp_watcher.log

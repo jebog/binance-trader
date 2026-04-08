@@ -17,8 +17,9 @@ Personal macOS algorithmic scanner that monitors 6 spot pairs every 30 minutes, 
 9. [Dashboard](#dashboard)
 10. [Telegram Integration](#telegram-integration)
 11. [launchd Setup (macOS)](#launchd-setup-macos)
-12. [Credentials](#credentials)
-13. [Troubleshooting](#troubleshooting)
+12. [Boot Reconciliation](#boot-reconciliation)
+13. [Credentials](#credentials)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -63,6 +64,7 @@ Trading/
 │   ├── analytics.py        perf stats, pair score, digest, capital sizing
 │   ├── dashboard.py        HTML dashboard generation
 │   ├── scan_helpers.py     Shared helpers (context, correlation cap, position mgmt)
+│   ├── reconcile.py        Boot-time Binance↔DB drift check (fail-loud, blocks startup on divergence)
 │   ├── notify.py           Telegram, webhook, macOS notifications
 │   └── logger.py           Structured logging setup, path constants
 ├── tui.py                  Real-time TUI dashboard (Textual)
@@ -355,6 +357,8 @@ All settings live in `config.py` — edit only this file, never `scanner.py` dir
 | `PROGRESSIVE_TRAILING_ENABLED` | `True` | Tighten trailing delta at ATR milestones (T4-4) |
 | `PROGRESSIVE_TRAILING_STAGES` | `[(1.5,100),(2.0,75),(2.5,50)]` | (ATR multiplier trigger, new bps); do not reorder while trades are open |
 | `CRON_ENABLED` | `false` | Set `true` in `.env` to enable launchd cron job; TUI has full parity |
+| `RECONCILE_ENABLED` | `True` | Boot-time Binance↔DB drift check (fail-loud); set `false` in `.env` to bypass |
+| `RECONCILE_IGNORE_ASSETS` | `["BNB","XRP","ETH","BETH"]` | Base assets held outside scanner control (manual buys, DCA, staking wrappers) |
 
 **ATR floor note:** When ATR < `ATR_SL_MIN / ATR_SL_MULT`, SL is floored to `ATR_SL_MIN` but TP still scales from the floored SL. The apparent R/R improves beyond what the raw ATR justifies — a conservative bias in flat/low-volatility markets.
 
@@ -574,6 +578,102 @@ launchctl load   ~/Library/LaunchAgents/com.trading.scanner.plist
 ```bash
 tail -f scanner.log
 ```
+
+---
+
+## Boot Reconciliation
+
+At every startup of `scanner.py` or `tui.py`, a reconciliation pass compares the open trades stored in `state.db` against the live state on Binance. If anything has drifted while the scanner was offline, **startup is aborted** with a Telegram alert — the scanner refuses to trade against an inconsistent picture of the world.
+
+### What it detects
+
+| Type | What it means | Why it matters |
+|---|---|---|
+| **`missing_position`** | DB trade is `open`/`partial_tp`/`no_oco`, but the live Binance balance for the base asset is below 50% of the recorded qty | You sold manually via the app, ran a dust conversion, or something fed the position out of the scanner's view. The scanner would otherwise treat a phantom long as real and skip new entries on that pair. |
+| **`missing_oco`** | DB trade has an `oco_id`, but no matching OCO exists in `/api/v3/openOrderList` | The position is **unprotected** — no SL, no TP. You cancelled the OCO from the Binance app, or it expired. Highest priority divergence. |
+
+The 50% threshold on `missing_position` is intentionally permissive: BNB-fee skim, partial TP1 fills, and split entries all leave less than `qty` in the wallet legitimately. Only a *meaningful* drop counts as a divergence.
+
+`partial_tp_no_oco` trades are **exempt** from the `missing_oco` check — that status is the *known* unprotected state and re-flagging it on every boot would just be noise.
+
+### Behavior on detection
+
+The reconciliation is **fail-loud, no auto-heal** by design:
+
+1. Both startup paths (`scanner.py` `__main__` and `tui.py` `__main__`) call `enforce_boot_gate(conn)` before any trading logic
+2. If the report is OK → log line, no Telegram, scanner proceeds normally
+3. If divergences are found → **Telegram alert with full details** + `ReconcileError` raised + process exits with code `1`
+4. **You must inspect, fix manually, and restart** — the scanner does not silently re-place orders or mark trades closed on its own
+
+The rationale: any divergence reflects a state we don't fully understand. Silent correction can compound the damage if the underlying logic has a bug. Better to bother the human once than to autonomously turn a small inconsistency into a large one.
+
+### Whitelisting manually-held assets
+
+The reconciliation reads **base-asset balances**, not symbol-specific positions (Binance spot has no per-pair "position" concept). If you also hold an asset outside scanner control — manual buys, DCA accumulation, BETH staking wrappers — it must be excluded, otherwise a manual sell on that asset would false-trigger `missing_position` on a still-valid scanner trade.
+
+```python
+# config.py
+RECONCILE_IGNORE_ASSETS = ["BNB", "XRP", "ETH", "BETH"]
+```
+
+Any DB trade whose symbol's base asset is in this list is skipped entirely during reconciliation.
+
+### Resolving a divergence
+
+**`missing_oco` — position unprotected, two paths:**
+
+```bash
+# Option 1: re-place the OCO via the Binance app, then update the DB
+sqlite3 state.db "UPDATE trades SET oco_id='<new_list_id>' WHERE id=<trade_id>;"
+
+# Option 2: accept it as a known-unprotected state (scanner skips OCO checks
+# but still ages out the position via TRADE_TIMEOUT_H)
+sqlite3 state.db "UPDATE trades SET status='no_oco', oco_id=NULL WHERE id=<trade_id>;"
+```
+
+**`missing_position` — DB thinks you're long but the position is gone:**
+
+```python
+import sqlite3
+from datetime import datetime
+conn = sqlite3.connect("state.db")
+conn.execute("""
+    UPDATE trades
+    SET status='sl_hit', exit_price=?, exit_time=?, pnl_pct=?
+    WHERE id=?
+""", (1.234, datetime.now().isoformat(), -1.5, 42))  # adjust to actual exit
+conn.commit(); conn.close()
+```
+
+Use `sl_hit` for a loss (also triggers `SL_COOLDOWN_H` on the symbol), `tp_hit` for a profit, or `timeout` to avoid both side effects.
+
+### Manual dry-run (check without starting the scanner)
+
+```python
+from trading.db import db_connect, db_init
+from trading.reconcile import reconcile_at_boot, format_report_telegram
+
+conn = db_connect(); db_init(conn)
+report = reconcile_at_boot(conn)
+print(format_report_telegram(report))
+print(f"OK: {report.ok} | Checked: {report.checked_trades} | Skipped: {report.skipped_trades}")
+for d in report.divergences:
+    print(f"  {d.kind} {d.symbol} trade={d.trade_id}: {d.detail}")
+conn.close()
+```
+
+### Disabling temporarily
+
+Set `RECONCILE_ENABLED=false` in `.env`. **Only use this when you're about to fix a divergence manually and need the scanner running first** — running with the gate off in production defeats its purpose.
+
+### What's deliberately out of scope (v1)
+
+Two divergence types are **not** detected in v1 and may be added later:
+
+- **Type B** — A live Binance position with no matching DB row (would catch crashes between market buy and `insert_trade`). Currently impossible to distinguish from a manual buy, so it would generate constant noise.
+- **Type D** — Quantity mismatch within 50–100% of the recorded qty (partial sells via the app). The 50% threshold catches the obvious cases; finer-grained drift detection requires an audit-log table to track expected vs actual deltas over time.
+
+Auto-heal (re-placing missing OCOs, marking phantom trades closed) is also intentionally out of scope. If you want it, build it as a *separate* module with its own opt-in flag rather than coupling detection and correction in the same code path.
 
 ---
 

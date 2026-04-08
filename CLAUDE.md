@@ -21,7 +21,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 |------|------|
 | `config.py` | **Single source of truth for all settings** — edit this, nothing else |
 | `scanner.py` | **Thin facade** — re-exports all names from `trading/`, owns `scan()`, `_scan_body()`, `TeeLogger`, `get_health()` |
-| `trading/` | **Package** (13 modules) — all logic lives here |
+| `trading/` | **Package** (14 modules) — all logic lives here |
 | `trading/db.py` | SQLite schema, CRUD helpers, `save_state()`, `get_state_dict()` |
 | `trading/http_client.py` | `get()`, `signed_get/post/delete()` — Binance REST API (1-retry on transient errors) |
 | `trading/indicators.py` | `calc_rsi()`, `calc_sma()`, `calc_atr()`, `detect_bullish_divergence()` — pure math |
@@ -32,6 +32,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | `trading/analytics.py` | `_calc_capital()`, `_compute_perf_stats()`, `_pair_score()`, `_send_daily_digest()` |
 | `trading/dashboard.py` | HTML dashboard generation |
 | `trading/scan_helpers.py` | `build_market_context()`, `apply_correlation_cap()`, `run_position_management()`, `run_split_entry_checks()` |
+| `trading/reconcile.py` | `reconcile_at_boot()`, `enforce_boot_gate()`, `format_report_telegram()` — boot-time Binance↔DB drift check (fail-loud) |
 | `trading/dca.py` | `should_run_dca()`, `place_dca_buy()`, `get_dca_stats()`, `run_dca_check()`, reserve helpers |
 | `trading/staking.py` | `stake_eth()`, `get_beth_balance()`, `get_staking_stats()`, `get_total_eth()` |
 | `trading/notify.py` | `send_telegram()`, `call_webhook()`, `notify_mac()` |
@@ -119,6 +120,11 @@ PAIR_SCORE_LOOKBACK   = 20    # last N closed trades per symbol
 PROGRESSIVE_TRAILING_ENABLED = True
 # WARNING: do not reorder stages while open trades are active (trades track by index)
 PROGRESSIVE_TRAILING_STAGES = [(1.5, 100), (2.0, 75), (2.5, 50)]  # (atr_mult, bps)
+
+# Boot-time reconciliation (Binance ↔ state.db)
+RECONCILE_ENABLED       = True              # gate scanner/TUI startup on a successful drift check
+RECONCILE_IGNORE_ASSETS = ["BNB","XRP",     # base assets to skip — anything held outside scanner
+                           "ETH","BETH"]    # control (manual buys, DCA, staking wrappers)
 ```
 
 ---
@@ -341,6 +347,18 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 **`partial_tp` counts as open** — `_check_sl_outcomes` uses `active_statuses = ("open", "partial_tp")`. `partial_tp_no_oco` is intentionally excluded (manual intervention required, no scanner supervision).
 
+**Boot reconciliation is fail-loud, not auto-heal** — `enforce_boot_gate()` runs at the top of `scanner.py __main__` and `tui.py __main__` (before `app.run()`) and raises `ReconcileError` on any divergence. The scanner/TUI then exit with code 1 + Telegram alert. v1 deliberately does NOT auto-cancel/re-place orders — the assumption is that any divergence reflects a state we don't fully understand, and silent correction can compound the damage. The user must inspect, fix manually (close position, re-place OCO, or `UPDATE trades SET status='sl_hit'` etc.), and restart.
+
+**Reconcile divergence types** — only the two risk-critical ones are checked in v1:
+- **A `missing_position`**: DB trade has `status IN ('open','partial_tp','no_oco','partial_tp_no_oco')` but live Binance balance for the base asset is `< 0.5 × recorded_qty`. The 50% threshold is permissive on purpose: BNB-fee skim, partial_tp1 fills, and split entries all leave less than `qty` in the wallet legitimately.
+- **C `missing_oco`**: DB trade has `oco_id` set and `status != 'partial_tp_no_oco'`, but the OCO is no longer in `/api/v3/openOrderList`. Position is unprotected — top priority. `partial_tp_no_oco` is exempt because that status is the *known* unprotected state (re-flagging would be noise).
+
+Types B (Binance position with no DB row) and D (qty mismatch within 50–100%) are deliberately deferred to a future iteration.
+
+**Reconcile uses base-asset balance, not symbol-specific** — there is no per-pair "position" concept on Binance spot. We strip the quote (`ETHUSDC → ETH`) and read `account.balances[ETH]`. If you hold ETH from two sources (scanner trade + manual buy), the balance check will see both and not flag missing_position. This is why `RECONCILE_IGNORE_ASSETS` exists: any asset you also touch manually must be excluded, otherwise a manual sell would reduce the balance and false-trigger missing_position on a still-valid scanner trade.
+
+**`fetch_state` is injected lazily, not as a default arg** — `reconcile_at_boot(conn, *, fetch_state=None)` looks up `_fetch_binance_state` *inside* the function body when `fetch_state is None`. Using `fetch_state=_fetch_binance_state` as a signature default would freeze the reference at module-import time, making `patch("trading.reconcile._fetch_binance_state")` from tests a no-op. Same trap as Django's `dispatch_uid` lookups.
+
 ---
 
 ## Common tasks
@@ -457,6 +475,46 @@ Set `PAIR_SCORE_ENABLED = False` in `config.py`. Correlation cap falls back to l
 ### Disable progressive trailing
 Set `PROGRESSIVE_TRAILING_ENABLED = False` in `config.py`. Break-even stop stays at entry price for all ATR milestones.
 
+### Disable boot reconciliation
+Set `RECONCILE_ENABLED=false` in `.env` (not `config.py` — the config reads this from the env). The scanner/TUI will start without checking Binance state. **Only do this temporarily** — e.g. when you know there's a divergence you're about to fix manually and you need the scanner running for something else first.
+
+### Add an asset to the reconcile ignore list
+Edit `RECONCILE_IGNORE_ASSETS` in `config.py`. Defaults are `["BNB","XRP","ETH","BETH"]` — add anything you trade manually outside the scanner. The reconcile pass will skip any DB trade whose symbol's base asset is in this list.
+
+### Manually run reconcile (dry-run, no boot gate)
+```python
+from trading.db import db_connect, db_init
+from trading.reconcile import reconcile_at_boot, format_report_telegram
+conn = db_connect(); db_init(conn)
+report = reconcile_at_boot(conn)
+print(format_report_telegram(report))
+print(f"OK: {report.ok} | Checked: {report.checked_trades} | Skipped: {report.skipped_trades}")
+for d in report.divergences:
+    print(f"  {d.kind} {d.symbol} trade={d.trade_id}: {d.detail}")
+conn.close()
+```
+
+### Resolve a missing_oco divergence
+The position is unprotected. Two paths:
+1. **Re-place the OCO manually** via the Binance app, then `UPDATE trades SET oco_id='<new_list_id>' WHERE id=<trade_id>` so the next reconcile passes.
+2. **Mark the trade as `no_oco`** (intentional unprotected state — the scanner will skip OCO checks but still age-out the position via `TRADE_TIMEOUT_H`): `UPDATE trades SET status='no_oco', oco_id=NULL WHERE id=<trade_id>`.
+
+### Resolve a missing_position divergence
+The DB thinks you're long, but the position is gone. Mark the trade as closed:
+```python
+import sqlite3
+from datetime import datetime
+conn = sqlite3.connect("state.db")
+# Use the current price as exit_price if you don't know the manual sell price
+conn.execute("""
+    UPDATE trades
+    SET status='sl_hit', exit_price=?, exit_time=?, pnl_pct=?
+    WHERE id=?
+""", (1.234, datetime.now().isoformat(), -1.5, 42))  # adjust values
+conn.commit(); conn.close()
+```
+Use `sl_hit` if it was a loss (triggers SL cooldown), `tp_hit` if it was a profit, or `timeout` if you don't want either side effect.
+
 ### Reset trailing stage for a trade
 If a trade's `trailing_stage` gets stuck (e.g., after manual OCO intervention):
 ```python
@@ -565,4 +623,8 @@ print(get_dca_stats())  # n_buys, total_qty, avg_entry, pnl_pct, progress_pct
 - **Never eagerly import `trading.dca` from `trading/orders.py`** — the reserve guard uses a lazy import inside `place_buy_order` to keep the dependency arrow pointing dca→orders (not the reverse) and avoid circular imports
 - **Never let `stake_eth()` failures abort the DCA pipeline** — staking is a best-effort side effect; a failed stake must leave the ETH free in spot and let `place_dca_buy` return successfully
 - **Never use a tradable pair lookup for BETH** — there is no `BETHUSDC` spot market; `get_portfolio()` must special-case BETH to the live ETH price (1:1 wrapper invariant)
-- **Never import from `scanner` inside `trading/` modules** — this creates circular imports. Dependency arrows only point downward: config → logger → db → notify → http_client → indicators → market_data → signals → orders → positions → analytics → dashboard → scan_helpers
+- **Never import from `scanner` inside `trading/` modules** — this creates circular imports. Dependency arrows only point downward: config → logger → db → notify → http_client → indicators → market_data → signals → orders → positions → analytics → dashboard → scan_helpers → reconcile
+- **Never make `reconcile_at_boot` mutate state** — it must remain a pure read-only function (DB SELECT + 2 Binance GETs). Auto-heal logic (re-placing OCOs, marking trades closed) belongs in a separate explicit module if/when it's added. Mixing detection and correction makes the failure mode "scanner silently fixed something wrong" — which is exactly what the fail-loud design is trying to prevent.
+- **Never remove the `RECONCILE_IGNORE_ASSETS` whitelist** — the reconcile uses base-asset balance, so any asset you also hold manually (BNB for fees, ETH from DCA, BETH from staking, manual buys) MUST be excluded or you'll get false `missing_position` flags every boot. Adding a new manually-held asset without updating this list will cause the scanner to refuse startup.
+- **Never let `enforce_boot_gate` swallow exceptions** — if the Telegram alert fails, the `ReconcileError` must still propagate. Logging the Telegram failure is correct; replacing the raise with a `return` would let the scanner start in a broken state silently, defeating the entire purpose of the gate.
+- **Never use `_fetch_binance_state` as a default arg in `reconcile_at_boot`** — defaults are evaluated at module-import time, so `patch("trading.reconcile._fetch_binance_state")` would have no effect on subsequent calls. Use `fetch_state=None` and look it up inside the function body.

@@ -215,6 +215,11 @@ from trading.staking import (  # noqa: E402, F401
     get_total_eth,
     stake_eth,
 )
+from trading.reconcile import (  # noqa: E402, F401
+    ReconcileError,
+    enforce_boot_gate,
+    reconcile_at_boot,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -609,4 +614,15 @@ def get_health(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
 
 
 if __name__ == "__main__":
+    # Boot-time reconciliation: refuse to start if state.db diverges from Binance.
+    # See trading/reconcile.py for details. Disable via RECONCILE_ENABLED=false.
+    _boot_conn = db_connect()
+    db_init(_boot_conn)
+    try:
+        enforce_boot_gate(_boot_conn)
+    except ReconcileError as _e:
+        print(f"\n🚨 Reconcile failed — scanner will NOT start.\n\n{_e}\n")
+        _boot_conn.close()
+        sys.exit(1)
+    _boot_conn.close()
     scan()

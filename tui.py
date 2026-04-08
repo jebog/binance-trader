@@ -1629,6 +1629,22 @@ class ScannerApp(App):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Boot-time reconciliation: refuse to start the TUI if state.db diverges
+    # from Binance. Done BEFORE app.run() so we can print to plain stdout and
+    # exit cleanly without entering the Textual rendering loop. See
+    # trading/reconcile.py for details.
+    from trading.reconcile import ReconcileError, enforce_boot_gate
+    _boot_conn = db_connect()
+    db_init(_boot_conn)
+    try:
+        enforce_boot_gate(_boot_conn)
+    except ReconcileError as _e:
+        import sys
+        print(f"\n🚨 Reconcile failed — TUI will NOT start.\n\n{_e}\n")
+        _boot_conn.close()
+        sys.exit(1)
+    _boot_conn.close()
+
     app = ScannerApp()
     try:
         app.run()

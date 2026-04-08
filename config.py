@@ -127,6 +127,19 @@ STAKING_ENABLED    = os.getenv("STAKING_ENABLED", "false").lower() == "true"
 STAKING_ASSET      = os.getenv("STAKING_ASSET", "BETH")
 STAKING_AUTO_STAKE = os.getenv("STAKING_AUTO_STAKE", "true").lower() == "true"
 
+# ── Boot reconciliation (Binance ↔ state.db) ─────────────────
+# At startup, compare open trades in state.db against real Binance state.
+# Detects two critical divergence types:
+#   A) DB says trade is open, but no live position on Binance (manual sell, etc.)
+#   C) DB trade has oco_id but the OCO no longer exists on Binance (unprotected position)
+# When divergences are found, the scanner refuses to start (fail-loud) and sends a
+# Telegram alert. Manual intervention required to clear them.
+RECONCILE_ENABLED = os.getenv("RECONCILE_ENABLED", "true").lower() == "true"
+# Assets to skip during reconciliation — typically anything you hold or trade outside
+# the scanner (manual buys, DCA accumulation, staking wrappers). The reconcile pass
+# only inspects symbols whose base asset is NOT in this list.
+RECONCILE_IGNORE_ASSETS = ["BNB", "XRP", "ETH", "BETH"]
+
 # ── Persistence ───────────────────────────────────────────────
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.db")
 

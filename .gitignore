@@ -4,6 +4,7 @@
 # ── Runtime / generated files ─────────────────────────────────────────────────
 state.json
 scanner.log
+scanner.log.*
 dashboard.html
 backtest_results.json
 

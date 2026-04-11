@@ -53,7 +53,6 @@ from trading.http_client import get, signed_get, signed_post
 from trading.notify import send_telegram
 from trading.orders import _order_fill_price
 
-
 # ── Schedule check ────────────────────────────────────────────────────────────
 
 def should_run_dca(conn: Optional[sqlite3.Connection] = None) -> bool:
@@ -277,11 +276,20 @@ def place_dca_buy(conn: Optional[sqlite3.Connection] = None) -> Optional[dict[st
 def get_dca_stats(
     conn: Optional[sqlite3.Connection] = None,
     include_price: bool = True,
+    include_staking: bool = False,
 ) -> dict[str, Any]:
     """Return cumulative DCA statistics: qty, avg_entry, invested, current_value, pnl_pct.
 
-    Set include_price=False to skip the live ticker fetch — safe for frequent
-    calls from UI refresh loops (5s timers) where API calls must be avoided.
+    Args:
+      conn: optional SQLite connection (opens own if None)
+      include_price: fetch live ETH ticker for unrealized P&L (~1 weight/call).
+        Disable on 5s refresh loops where API budget matters.
+      include_staking: populate staking yield fields (`staked_eth`,
+        `staking_yield`, `staking_yield_pct`) via get_staked_eth(). Cached 120s
+        so reads are cheap on refresh loops, but the first call of a fresh
+        cache period spends ~300 weight (2 sapi calls). Default False for
+        test safety — callers that can tolerate the cache cost should opt in
+        explicitly (TUI, webapp).
     """
     _own = conn is None
     if _own:
@@ -299,18 +307,22 @@ def get_dca_stats(
         ).fetchall()
 
         stats: dict[str, Any] = {
-            "n_buys":         len(rows),
-            "total_qty":      0.0,
-            "total_invested": 0.0,
-            "avg_entry":      0.0,
-            "current_price":  0.0,
-            "current_value":  0.0,
-            "pnl_usdc":       0.0,
-            "pnl_pct":        0.0,
-            "target_qty":     DCA_TARGET_QTY,
-            "progress_pct":   0.0,
-            "first_buy":      None,
-            "last_buy":       None,
+            "n_buys":            len(rows),
+            "total_qty":         0.0,
+            "total_invested":    0.0,
+            "avg_entry":         0.0,
+            "current_price":     0.0,
+            "current_value":     0.0,
+            "pnl_usdc":          0.0,
+            "pnl_pct":           0.0,
+            "target_qty":        DCA_TARGET_QTY,
+            "progress_pct":      0.0,
+            "first_buy":         None,
+            "last_buy":          None,
+            # Staking yield (populated after price fetch below, fail-soft)
+            "staked_eth":        0.0,
+            "staking_yield":     0.0,
+            "staking_yield_pct": 0.0,
         }
 
         if not rows:
@@ -329,19 +341,36 @@ def get_dca_stats(
         stats["last_buy"]  = rows[-1]["time"]
         stats["progress_pct"] = (stats["total_qty"] / DCA_TARGET_QTY * 100) if DCA_TARGET_QTY > 0 else 0.0
 
-        # Fetch current price for unrealized P&L (skip on include_price=False)
-        if not include_price:
-            return stats
-        try:
-            ticker = get("/api/v3/ticker/price", {"symbol": DCA_TARGET_PAIR})
-            cp = float(ticker["price"])
-            stats["current_price"] = cp
-            stats["current_value"] = stats["total_qty"] * cp
-            stats["pnl_usdc"]      = stats["current_value"] - stats["total_invested"]
-            if stats["total_invested"] > 0:
-                stats["pnl_pct"] = stats["pnl_usdc"] / stats["total_invested"] * 100
-        except Exception:
-            pass
+        # Fetch current price for unrealized P&L (opt-in via include_price)
+        if include_price:
+            try:
+                ticker = get("/api/v3/ticker/price", {"symbol": DCA_TARGET_PAIR})
+                cp = float(ticker["price"])
+                stats["current_price"] = cp
+                stats["current_value"] = stats["total_qty"] * cp
+                stats["pnl_usdc"]      = stats["current_value"] - stats["total_invested"]
+                if stats["total_invested"] > 0:
+                    stats["pnl_pct"] = stats["pnl_usdc"] / stats["total_invested"] * 100
+            except Exception:
+                pass
+
+        # Staking yield: compare actual staked ETH (includes rebase gains) vs
+        # DCA-recorded qty. Positive diff = yield accrual; negative = withdrawal
+        # or stake failures. Independent of include_price because get_staked_eth
+        # is cache-backed (120s TTL) — reads are cheap after the 30s scan
+        # worker warms the cache.
+        if include_staking:
+            try:
+                from trading.staking import get_staked_eth
+                staked = get_staked_eth()
+                stats["staked_eth"] = staked["total_eth"]
+                if stats["total_qty"] > 0:
+                    stats["staking_yield"] = staked["total_eth"] - stats["total_qty"]
+                    stats["staking_yield_pct"] = (
+                        stats["staking_yield"] / stats["total_qty"] * 100
+                    )
+            except Exception:
+                pass
 
         return stats
 

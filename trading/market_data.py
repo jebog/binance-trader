@@ -206,8 +206,23 @@ def get_portfolio() -> Optional[dict[str, Any]]:
         qty   = float(b["free"]) + float(b["locked"])
         if asset in STABLES:
             price = 1.0
-        elif asset == "BETH":
-            # BETH (staked ETH wrapper) doesn't trade on spot — value at ETH price 1:1
+        elif asset in ("BETH", "LDBETH"):
+            # Legacy BETH / Simple Earn locked BETH — 1:1 with ETH
+            try:
+                price = float(get("/api/v3/ticker/price", {"symbol": "ETHUSDC"})["price"])
+            except Exception:
+                price = None
+        elif asset in ("WBETH", "LDWBETH"):
+            # WBETH is an accrual token, 1 WBETH > 1 ETH via daily rebase.
+            # Value = ETH price × current WBETH:ETH exchange rate (cached 1h).
+            try:
+                from trading.staking import get_wbeth_exchange_rate
+                eth_price = float(get("/api/v3/ticker/price", {"symbol": "ETHUSDC"})["price"])
+                price = eth_price * get_wbeth_exchange_rate()
+            except Exception:
+                price = None
+        elif asset == "LDETH":
+            # Simple Earn flexible ETH — 1:1 with spot ETH
             try:
                 price = float(get("/api/v3/ticker/price", {"symbol": "ETHUSDC"})["price"])
             except Exception:

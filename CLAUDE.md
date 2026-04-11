@@ -2,7 +2,7 @@
 
 ## What this project does
 
-Automated Binance spot trading scanner. Every 30 minutes it:
+Automated Binance spot trading scanner. The TUI (`python3 tui.py`) is the primary runtime; cron is optional. Each scan (30s from the TUI, 30min via launchd cron):
 1. Fetches Fear & Greed index + BTC context (RSI, SMA, dominance)
 2. Analyzes 6 USDC pairs with RSI/SMA/volume/momentum/divergence signals
 3. Classifies signals as EXTREME / STRONG / MODERATE
@@ -21,7 +21,7 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 |------|------|
 | `config.py` | **Single source of truth for all settings** — edit this, nothing else |
 | `scanner.py` | **Thin facade** — re-exports all names from `trading/`, owns `scan()`, `_scan_body()`, `TeeLogger`, `get_health()` |
-| `trading/` | **Package** (14 modules) — all logic lives here |
+| `trading/` | **Package** (15 modules) — all logic lives here |
 | `trading/db.py` | SQLite schema, CRUD helpers, `save_state()`, `get_state_dict()` |
 | `trading/http_client.py` | `get()`, `signed_get/post/delete()` — Binance REST API (1-retry on transient errors) |
 | `trading/indicators.py` | `calc_rsi()`, `calc_sma()`, `calc_atr()`, `detect_bullish_divergence()` — pure math |
@@ -34,12 +34,13 @@ Automated Binance spot trading scanner. Every 30 minutes it:
 | `trading/scan_helpers.py` | `build_market_context()`, `apply_correlation_cap()`, `run_position_management()`, `run_split_entry_checks()` |
 | `trading/reconcile.py` | `reconcile_at_boot()`, `enforce_boot_gate()`, `format_report_telegram()` — boot-time Binance↔DB drift check (fail-loud) |
 | `trading/dca.py` | `should_run_dca()`, `place_dca_buy()`, `get_dca_stats()`, `run_dca_check()`, reserve helpers |
-| `trading/staking.py` | `stake_eth()`, `get_beth_balance()`, `get_staking_stats()`, `get_total_eth()` |
+| `trading/staking.py` | `stake_eth()`, `get_staked_eth(force_refresh=False)` (canonical, 120s cache), `get_wbeth_exchange_rate()` (1h cache), `get_beth_balance()` (legacy alias), `get_staking_stats()`, `get_total_eth()`, `get_free_ldeth()` |
 | `trading/notify.py` | `send_telegram()`, `call_webhook()`, `notify_mac()` |
 | `trading/logger.py` | `logger` (structured logging to file + console), path constants |
 | `tui.py` | Textual TUI — live dashboard, runs scanner in background thread |
 | `tui.tcss` | Catppuccin Mocha theme for the TUI |
 | `backtest.py` | Walk-forward backtest (70/30 split), Monte Carlo, Sharpe/drawdown metrics |
+| `webapp/` | **NiceGUI read-only viewer** — passive browser dashboard (`python3 -m webapp.main`). Reads `state.db` via `get_state_dict()`, never mutates. Zero imports from `scanner.py`; depends only on `trading.*`. Widgets in `webapp/widgets/` mirror the TUI 1:1 (header, pair grid, positions, history, portfolio, cooldowns, performance, DCA, logs). `reload=False` is mandatory in `main.py` — NiceGUI's watcher subprocess would corrupt SQLite WAL reads. Binds to `127.0.0.1:8080` by default; override via `WEBAPP_HOST`/`WEBAPP_PORT` in `.env` |
 | `state.db` | **Canonical runtime state** (SQLite, WAL mode): trades, cooldowns, caches, kv sentinels |
 | `scanner.log` | Append-only structured log (via `trading.logger`) |
 | `dashboard.html` | Auto-generated HTML dashboard (written after each scan) |
@@ -59,7 +60,7 @@ TELEGRAM_TOKEN / TELEGRAM_CHAT_ID      # Telegram bot
 PAIRS            = [...]     # which symbols to scan (USDC quote)
 CAPITAL          = 200.0     # USDC per trade
 MAX_POSITIONS    = 2         # max concurrent open positions
-SL_COOLDOWN_H    = 4         # hours to block a pair after SL hit
+SL_COOLDOWN_H    = 8         # hours to block a pair after SL hit
 MAX_DRAWDOWN_PCT = 0.15      # halt new orders if portfolio drops >15% from peak
 DIGEST_HOUR      = 8         # local hour (0–23) to send morning digest
 CRON_ENABLED     = false     # set true in .env to enable launchd cron job (TUI has full parity)
@@ -67,10 +68,10 @@ CRON_ENABLED     = false     # set true in .env to enable launchd cron job (TUI 
 # SL/TP
 TRAILING_DELTA = 150       # trailing stop in basis points; 0 = fixed stop
 ATR_SL_MULT    = 1.5       # SL = ATR × 1.5
-ATR_TP_MULT    = 3.5       # TP = ATR × 3.5
-ATR_SL_MIN/MAX = 0.02/0.06 # SL clamped to [2%, 6%]
+ATR_TP_MULT    = 2.5       # TP = ATR × 2.5  (~1.67 R/R; 3.5 was too ambitious — TP never hit)
+ATR_SL_MIN/MAX = 0.02/0.04 # SL clamped to [2%, 4%]
 STOP_LOSS      = 0.03      # fallback if ATR unavailable
-TAKE_PROFIT    = 0.075     # fallback
+TAKE_PROFIT    = 0.05      # fallback (was 0.075 — too ambitious)
 
 # T2-2: RSI divergence filter
 DIVERGENCE_ENABLED     = True
@@ -98,7 +99,7 @@ TRADE_TIMEOUT_H       = 72    # force-exit any position open longer than 72h
 
 # T3-1: Break-even stop
 BREAKEVEN_ENABLED  = True
-BREAKEVEN_ATR_MULT = 1.0    # trigger: price ≥ entry × (1 + 1×ATR%)
+BREAKEVEN_ATR_MULT = 0.7    # trigger: price ≥ entry × (1 + 0.7×ATR%) — arm earlier (was 1.0)
 
 # T3-4: Volatility-adjusted capital sizing
 VOL_SIZING_ENABLED = True
@@ -119,7 +120,7 @@ PAIR_SCORE_LOOKBACK   = 20    # last N closed trades per symbol
 # T4-4: Progressive trailing stop
 PROGRESSIVE_TRAILING_ENABLED = True
 # WARNING: do not reorder stages while open trades are active (trades track by index)
-PROGRESSIVE_TRAILING_STAGES = [(1.5, 100), (2.0, 75), (2.5, 50)]  # (atr_mult, bps)
+PROGRESSIVE_TRAILING_STAGES = [(1.0, 120), (1.5, 80), (2.0, 50)]  # (atr_mult, bps)
 
 # Boot-time reconciliation (Binance ↔ state.db)
 RECONCILE_ENABLED       = True              # gate scanner/TUI startup on a successful drift check
@@ -143,11 +144,41 @@ SCANNER_CRON=1 python3 scanner.py
 
 # Walk-forward backtest
 python3 backtest.py
+
+# Read-only browser viewer (NiceGUI, binds 127.0.0.1:8080)
+python3 -m webapp.main
 ```
 
 The TUI has full cron parity (signal dedup, F&G regime alerts, daily digest, Telegram summaries, health sentinel). Cron is optional — set `CRON_ENABLED=true` in `.env` to enable the launchd job.
 
 The launchd job (`~/Library/LaunchAgents/com.trading.scanner.plist`) runs cron mode every 30 minutes with `SCANNER_CRON=1`.
+
+---
+
+## Tests & quality
+
+```bash
+pytest                               # all tests (pyproject.toml: testpaths=["tests"], -q)
+pytest tests/test_reconcile.py       # one file
+pytest -k "split_entry"              # one pattern
+
+ruff check .                         # lint — scanner.py has I001 isort exception (late imports)
+ruff check . --fix                   # auto-fix import order / whitespace
+
+mypy scanner.py trading/             # type check (strict_optional, ignore_missing_imports)
+```
+
+**Test suite layout** (`tests/`):
+- `test_indicators.py` — RSI/SMA/ATR/divergence pure math
+- `test_db.py` — schema, CRUD, kv helpers, WAL concurrency
+- `test_reconcile.py` — boot-gate divergence detection (types A + C)
+- `test_dca.py` — DCA scheduling, reserve guard, BETH valuation
+- `test_scan_integration.py` — end-to-end scan phases with mocked Binance
+- `test_backtest.py` — walk-forward split, Monte Carlo
+- `test_webapp_state.py` — read-only viewer state binding
+- `conftest.py` — fixtures + `NullHandler` on `trading.logger` to prevent `scanner.log` pollution
+
+**Mocking convention**: patch functions at the `trading.X.Y` path where `Y` is *imported*, not `scanner.Y`. The scanner.py facade re-exports, but Python mocking patches lookup-location.
 
 ---
 
@@ -176,7 +207,7 @@ F&G < 20 (Extreme Fear) blocks MODERATE signals. BTC RSI < 30 + below SMA blocks
 - **Performance reporting (T4-1)**: `_compute_perf_stats()` computes per-trade IR (mean/std of pnl_pct), profit factor, max consecutive losses, and per-tier win rates from the trailing 30 days of closed trades. Appended to daily digest if any closed trades exist.
 - **15m entry refinement (T4-2)**: before placing an order, `_get_15m_rsi()` fetches 50 15m candles and computes RSI. If RSI > `ENTRY_REFINE_15M_RSI_MAX` (default 45), the signal is deferred this scan (logged + Telegram in cron mode). Fail-open: API error → allow.
 - **Dynamic pair scoring (T4-3)**: correlation cap (≥3 candidates) sorts by `_pair_score()` instead of RSI alone. Score = win_rate × profit_factor from last 20 closed trades per symbol. Fewer than 3 trades → neutral score 0.5. All-wins → returns win_rate (avoids huge epsilon-divided value).
-- **Progressive trailing stop (T4-4)**: after break-even arms, `_check_progressive_trailing()` tightens trailing delta at 1.5×/2×/2.5×ATR milestones (stages 1/2/3). Each stage cancels OCO and re-places with tighter `new_bps`. Cancel failure → retry next scan (stage not advanced). Re-OCO failure → critical Telegram + `no_oco` + advance stage (prevent retry loop). Stage tracked via `trade["trailing_stage"]` integer.
+- **Progressive trailing stop (T4-4)**: after break-even arms, `_check_progressive_trailing()` tightens trailing delta at 1.0×/1.5×/2.0×ATR milestones (stages 1/2/3). Each stage cancels OCO and re-places with tighter `new_bps`. Cancel failure → retry next scan (stage not advanced). Re-OCO failure → critical Telegram + `no_oco` + advance stage (prevent retry loop). Stage tracked via `trade["trailing_stage"]` integer.
 
 ### Multi-timeframe (daily trend filter)
 
@@ -204,7 +235,7 @@ All accept `conn: Optional[sqlite3.Connection] = None` — shared connection whe
 2. **Trade timeout (T3-2)** — force-exit any position open > `TRADE_TIMEOUT_H` hours; runs BEFORE the OCO loop so `no_oco` trades are also age-checked
 3. **Split-entry check (T2-1)** — `run_split_entry_checks()`: check `pending_second_entries`; fire second leg if price ≤ trigger; expire entries older than TTL
 4. **Break-even stop (T3-1)** — for each open+partial_tp trade: if price ≥ break-even trigger, cancel OCO + re-place with SL at entry; sets `breakeven_moved=True`
-5. **Progressive trailing (T4-4)** — for each break-even-armed trade: check 1.5×/2×/2.5×ATR milestones; tighten trailing delta at each stage; advances `trailing_stage` index
+5. **Progressive trailing (T4-4)** — for each break-even-armed trade: check 1.0×/1.5×/2.0×ATR milestones; tighten trailing delta at each stage; advances `trailing_stage` index
 6. **Fetch context** — Fear & Greed, BTC RSI/SMA/price, BTC dominance; fire F&G regime-change alert if threshold crossed
 7. **Fetch portfolio** — live Binance balances
 8. **Analyze all pairs** — collect candidates; apply divergence (T2-2) and dom-rising (T2-3) gates inside `analyze()`
@@ -278,6 +309,8 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 | `portfolio` + `portfolio_assets` | `save_portfolio` | Latest Binance balance snapshot |
 | `fg_cache` | `set_fg_cache` in `get_fear_greed` | Cached F&G response (singleton, valid 25h) |
 | `btc_dom_cache` | `set_btc_dom_cache` in `get_btc_dominance` | CoinGecko dominance value + timestamp (singleton, 1h cache) |
+| `wbeth_rate_cache` | `set_wbeth_rate_cache` in `get_wbeth_exchange_rate` | WBETH:ETH exchange rate + APR (singleton, 1h cache) |
+| `staked_eth_cache` | `set_staked_eth_cache` in `get_staked_eth` | Full staked-ETH resolution dict — holdingInETH, spot_beth, spot_wbeth, spot_ldwbeth, spot_ldbeth, exchange_rate, total_eth (singleton, 120s cache). Warmed by TUI's 30s scan worker via `get_staked_eth(force_refresh=True)`; read by TUI's 5s refresh and the webapp via `get_dca_stats(include_staking=True)` without hitting Binance. |
 | `cooldowns` | `save_cooldown` via `_save_cooldown` | SL cooldown expiry timestamps per symbol |
 | `sent_signals` | `save_sent_signal` in `scan` | Signal dedup ledger |
 | `pending_second_entries` | `save/clear_pending_second_entry` | Split-entry pending legs (T2-1) |
@@ -317,7 +350,7 @@ first_half_open + pending_second_entry ──► trigger price hit → cancel fi
 
 ## Key design decisions
 
-**Facade re-export pattern** — `scanner.py` is a thin facade (574 lines) that re-exports every name from `trading/`. All callers (`tui.py`, `backtest.py`, tests) use `from scanner import X` unchanged. Test mocks must patch at the `trading.*` module level (where names are looked up), not at `scanner.*`.
+**Facade re-export pattern** — `scanner.py` is a thin facade (~630 lines) that re-exports every name from `trading/`. All callers (`tui.py`, `backtest.py`, tests) use `from scanner import X` unchanged. Test mocks must patch at the `trading.*` module level (where names are looked up), not at `scanner.*`.
 
 **TeeLogger guard** — `scanner.py` line 35: `if __name__ == "__main__": sys.stdout = TeeLogger()`. Without this, importing scanner from tui.py would hijack Textual's stdout. Must stay in scanner.py, not in any `trading/` submodule.
 
@@ -539,7 +572,12 @@ A long-term accumulation layer that runs **alongside** the tactical scanner, tar
 2. **Separate storage** — DCA trades live in the same `trades` table but with `signal_strength="DCA"` and `status="dca_hold"`. They never close (no TP/SL) and are filtered out of `_compute_perf_stats`, `_pair_score`, and the 7-day digest so they can't skew scanner KPIs.
 3. **Idempotent scheduling** — `run_dca_check()` is called every scan (30s). `should_run_dca()` gates on `DCA_ENABLED + day_of_week + hour + last_dca_run > 6 days` so safe to call repeatedly.
 4. **Fail-soft staking** — `stake_eth()` failures never abort the DCA buy. The ETH stays free in the spot wallet and can be staked manually via Binance Earn UI.
-5. **BETH valuation** — `get_portfolio()` special-cases BETH to use live ETH spot price (1:1 invariant), so staked value is counted in `total_usdc` for vol-sizing and circuit-breaker math without needing a tradable `BETHUSDC` pair.
+5. **Staked ETH valuation** — `get_portfolio()` special-cases **four** staked-ETH asset names:
+   - `BETH` / `LDBETH` — legacy wrapper + Simple Earn locked BETH, **1:1 with ETH**
+   - `WBETH` / `LDWBETH` — Binance's 2023+ staking wrapper, **accrual token** (1 WBETH ≈ 1.0948 ETH today and growing via daily rebase). Valued as `eth_price × exchange_rate` where `exchange_rate` comes from `trading.staking.get_wbeth_exchange_rate()` (cached 1h in `wbeth_rate_cache` table).
+   - `LDETH` — pre-existing Simple Earn flexible ETH, 1:1 with spot ETH
+  
+   The canonical "how much ETH do I own across all locations" helper is `trading.staking.get_staked_eth()` which resolves `/sapi/v2/eth-staking/account.holdingInETH` + the four spot balance rows, returning a per-location breakdown and a total. `get_beth_balance()` is kept as a legacy-name alias that delegates to `get_staked_eth()["total_eth"]`.
 
 ### Config (all override-able via `.env`)
 
@@ -628,3 +666,8 @@ print(get_dca_stats())  # n_buys, total_qty, avg_entry, pnl_pct, progress_pct
 - **Never remove the `RECONCILE_IGNORE_ASSETS` whitelist** — the reconcile uses base-asset balance, so any asset you also hold manually (BNB for fees, ETH from DCA, BETH from staking, manual buys) MUST be excluded or you'll get false `missing_position` flags every boot. Adding a new manually-held asset without updating this list will cause the scanner to refuse startup.
 - **Never let `enforce_boot_gate` swallow exceptions** — if the Telegram alert fails, the `ReconcileError` must still propagate. Logging the Telegram failure is correct; replacing the raise with a `return` would let the scanner start in a broken state silently, defeating the entire purpose of the gate.
 - **Never use `_fetch_binance_state` as a default arg in `reconcile_at_boot`** — defaults are evaluated at module-import time, so `patch("trading.reconcile._fetch_binance_state")` would have no effect on subsequent calls. Use `fetch_state=None` and look it up inside the function body.
+- **Never assume WBETH:ETH is 1:1** — WBETH is an accrual token distributed by Binance ETH Staking since the 2023 migration. The exchange rate only moves UP via daily rebase (currently ~1.0948). Use `trading.staking.get_wbeth_exchange_rate()` which caches `/sapi/v1/eth-staking/eth/history/rateHistory` for 1h. Assuming 1:1 systematically undervalues the portfolio by ~10% today and growing.
+- **Never read staked ETH balance only from `/api/v3/account.balances`** — Binance's ETH staking product distributes WBETH which appears as `LDWBETH` (Locked Deposit prefix) in spot balances, NOT under a raw `BETH` or `WBETH` asset name. The legacy `get_beth_balance()` pattern that did `if b["asset"] == "BETH"` returns 0 for all post-2023 users. Use `trading.staking.get_staked_eth()` which resolves the `/sapi/v2/eth-staking/account.holdingInETH` endpoint plus all five possible spot balance locations (BETH, WBETH, LDBETH, LDWBETH, and the staking account itself).
+- **Never remove the LD-prefix balance scan from `get_portfolio()`** — users with pre-existing Simple Earn positions have `LDETH` / `LDWBETH` / `LDBETH` in their spot balances with meaningful value. The portfolio special-cases for these asset names are what make that capital visible to vol-sizing, circuit-breaker drawdown math, and the DCA progress widget. Removing them silently under-reports portfolio value and can cause the circuit breaker to fire on a non-existent drawdown.
+- **Never call `get_staked_eth()` without consideration for caching** — each fresh call spends ~300 weight (2 sapi calls: `/sapi/v2/eth-staking/account` + `/api/v3/account`). On a 5s TUI refresh that's 3600/min — 3× over Binance's spot rate limit. The function is **cache-backed** (120s TTL in `staked_eth_cache` table). Callers on hot paths (TUI 5s refresh, webapp) must rely on cache hits; the 30s scan worker pre-warms via `get_staked_eth(force_refresh=True)`. If you need fresh data from a new code path, prefer `force_refresh=True` from the 30s boundary rather than more frequent calls.
+- **Never set `include_staking=True` from a test** without mocking `trading.staking.get_staked_eth` — the default is `include_staking=False` specifically so unit tests don't accidentally call the real Binance API. When testing staking-yield behavior, patch `trading.staking.get_staked_eth` to return a canned dict, and pass `include_staking=True` explicitly.

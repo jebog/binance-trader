@@ -26,6 +26,22 @@ def _mem_conn() -> sqlite3.Connection:
     return conn
 
 
+class _NoCloseConn:
+    """Proxy wrapper around a sqlite3.Connection that turns close() into a no-op.
+
+    Used in tests where the code-under-test closes the conn in a `finally`
+    block but we still need to inspect the DB afterward.
+    """
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def close(self) -> None:  # no-op
+        return None
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # should_run_dca — schedule gating
 # ═════════════════════════════════════════════════════════════════════════════
@@ -407,19 +423,471 @@ class TestStaking:
             mock_post.assert_not_called()
 
     def test_get_beth_balance_sums_free_and_locked(self):
+        # Legacy BETH path: get_staked_eth() checks BETH in spot balances
+        # directly by hardcoded asset name (no longer looks at STAKING_ASSET).
+        # db_connect mocked to prevent cache-layer leakage from real state.db.
+        conn = _NoCloseConn(_mem_conn())
         with patch.object(trading.staking, "signed_get", return_value={"balances": [
                  {"asset": "BETH", "free": "0.3", "locked": "0.1"},
              ]}), \
-             patch.object(trading.staking, "STAKING_ASSET", "BETH"):
+             patch.object(trading.staking, "db_connect", return_value=conn):
             assert trading.staking.get_beth_balance() == pytest.approx(0.4)
 
     def test_get_beth_balance_missing_returns_zero(self):
-        with patch.object(trading.staking, "signed_get", return_value={"balances": []}):
+        conn = _NoCloseConn(_mem_conn())
+        with patch.object(trading.staking, "signed_get", return_value={"balances": []}), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
             assert trading.staking.get_beth_balance() == 0.0
 
     def test_get_beth_balance_api_error_returns_zero(self):
-        with patch.object(trading.staking, "signed_get", side_effect=Exception("x")):
+        conn = _NoCloseConn(_mem_conn())
+        with patch.object(trading.staking, "signed_get", side_effect=Exception("x")), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
             assert trading.staking.get_beth_balance() == 0.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# trading.staking — WBETH exchange rate + cross-location resolution
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestStakedEthResolution:
+    """get_staked_eth() must resolve WBETH + LD-prefix balances, not just BETH.
+
+    These tests stub `db_connect` in trading.staking to return an in-memory
+    SQLite connection so the real state.db is never touched by unit tests.
+    """
+
+    def _patched_conn(self):
+        """Return an in-memory SQLite conn with the schema applied."""
+        return _mem_conn()
+
+    def test_holding_in_eth_from_staking_account(self):
+        """Primary path: /sapi/v2/eth-staking/account.holdingInETH."""
+        conn = _mem_conn()
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {
+                    "holdingInETH": "0.0183",
+                    "holdings": {"wbethAmount": "0.01671", "bethAmount": "0"},
+                }
+            if "/api/v3/account" in url:
+                return {"balances": []}
+            if "rateHistory" in url:
+                return {"rows": [
+                    {"exchangeRate": "1.0948", "annualPercentageRate": "0.0256"}
+                ]}
+            return {}
+
+        with patch.object(trading.staking, "signed_get", side_effect=sg), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["holdingInETH"] == pytest.approx(0.0183)
+        assert staked["total_eth"] == pytest.approx(0.0183)
+        assert staked["exchange_rate"] == pytest.approx(1.0948)
+        conn.close()
+
+    def test_ldwbeth_resolved_with_exchange_rate(self):
+        """LDWBETH (Simple Earn) is converted via exchange rate when staking
+        endpoint returns zero holdingInETH."""
+        conn = _mem_conn()
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0"}  # no staking account position
+            if "/api/v3/account" in url:
+                return {"balances": [
+                    {"asset": "LDWBETH", "free": "0.01671066", "locked": "0"},
+                ]}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "signed_get", side_effect=sg), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["spot_ldwbeth"] == pytest.approx(0.01671066)
+        assert staked["holdingInETH"] == 0.0
+        # 0.01671066 × 1.0948 = 0.01829483 ETH
+        assert staked["total_eth"] == pytest.approx(0.01671066 * 1.0948)
+        conn.close()
+
+    def test_ldbeth_legacy_one_to_one(self):
+        """LDBETH (legacy Simple Earn BETH) stays 1:1 with ETH."""
+        conn = _mem_conn()
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0"}
+            if "/api/v3/account" in url:
+                return {"balances": [
+                    {"asset": "LDBETH", "free": "0.5", "locked": "0"},
+                ]}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "signed_get", side_effect=sg), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["spot_ldbeth"] == pytest.approx(0.5)
+        # LDBETH is summed 1:1, NOT scaled by the WBETH rate
+        assert staked["total_eth"] == pytest.approx(0.5)
+        conn.close()
+
+    def test_holding_in_eth_plus_legacy_beth_both_counted(self):
+        """Legacy spot BETH must be added to holdingInETH (separate products)."""
+        conn = _mem_conn()
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0.1"}
+            if "/api/v3/account" in url:
+                return {"balances": [
+                    {"asset": "BETH", "free": "0.05", "locked": "0"},
+                ]}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "signed_get", side_effect=sg), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
+            staked = trading.staking.get_staked_eth()
+
+        # holdingInETH (0.10) + spot_beth (0.05) = 0.15 total
+        assert staked["total_eth"] == pytest.approx(0.15)
+        conn.close()
+
+    def test_all_failures_return_zero(self):
+        """Both endpoints raise → fail-soft zero values."""
+        conn = _mem_conn()
+
+        with patch.object(trading.staking, "signed_get",
+                          side_effect=Exception("network down")), \
+             patch.object(trading.staking, "db_connect", return_value=conn):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["total_eth"] == 0.0
+        assert staked["holdingInETH"] == 0.0
+        assert staked["exchange_rate"] == 1.0  # fallback
+        conn.close()
+
+
+class TestWbethExchangeRate:
+    """get_wbeth_exchange_rate() caches 1h in state.db, falls back gracefully."""
+
+    def test_fresh_cache_skips_api_call(self):
+        """Cache < 1h old → return cached value without API call."""
+        from trading.db import set_wbeth_rate_cache
+        conn = _mem_conn()
+        set_wbeth_rate_cache(conn, 1.0948, 0.0256)
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get") as mock_sg:
+            rate = trading.staking.get_wbeth_exchange_rate()
+
+        assert rate == pytest.approx(1.0948)
+        mock_sg.assert_not_called()
+        conn.close()
+
+    def test_stale_cache_refetched(self):
+        """Cache > 1h old → fetch fresh, update cache, return new value."""
+        real = _mem_conn()
+        # Proxy prevents staking.get_wbeth_exchange_rate()'s finally-block
+        # from closing the test conn before we inspect the cache row.
+        conn = _NoCloseConn(real)
+
+        stale_ts = (datetime.now() - timedelta(hours=2)).isoformat()
+        real.execute(
+            "INSERT INTO wbeth_rate_cache (id, exchange_rate, apr, ts) "
+            "VALUES (1, 1.05, 0.02, ?)",
+            (stale_ts,),
+        )
+        real.commit()
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get", return_value={
+                 "rows": [{"exchangeRate": "1.0948",
+                           "annualPercentageRate": "0.0256"}]
+             }):
+            rate = trading.staking.get_wbeth_exchange_rate()
+
+        assert rate == pytest.approx(1.0948)
+        # Cache should now be refreshed
+        row = real.execute(
+            "SELECT exchange_rate FROM wbeth_rate_cache WHERE id = 1"
+        ).fetchone()
+        assert float(row[0]) == pytest.approx(1.0948)
+        real.close()
+
+    def test_api_failure_falls_back_to_stale_cache(self):
+        """API unreachable but stale cache exists → return stale, log warning."""
+        conn = _mem_conn()
+        stale_ts = (datetime.now() - timedelta(hours=5)).isoformat()
+        conn.execute(
+            "INSERT INTO wbeth_rate_cache (id, exchange_rate, apr, ts) "
+            "VALUES (1, 1.07, 0.025, ?)",
+            (stale_ts,),
+        )
+        conn.commit()
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get",
+                          side_effect=Exception("API down")):
+            rate = trading.staking.get_wbeth_exchange_rate()
+
+        assert rate == pytest.approx(1.07)  # stale value
+        conn.close()
+
+    def test_api_failure_no_cache_returns_fallback(self):
+        """Both API and cache unavailable → safe fallback of 1.0."""
+        conn = _mem_conn()
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get",
+                          side_effect=Exception("API down")):
+            rate = trading.staking.get_wbeth_exchange_rate()
+
+        assert rate == 1.0
+        conn.close()
+
+    def test_malformed_response_falls_through(self):
+        """Response missing the `rows` key → fall through to fallback."""
+        conn = _mem_conn()
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get",
+                          return_value={"unexpected": "shape"}):
+            rate = trading.staking.get_wbeth_exchange_rate()
+
+        assert rate == 1.0
+        conn.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# trading.staking — staked_eth_cache (120s TTL) + force_refresh
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestStakedEthCache:
+    """get_staked_eth() caches its 7-field result for 120s in state.db."""
+
+    def test_fresh_cache_hit_returns_without_api_call(self):
+        """Cache < 120s old → return cached dict, no signed_get calls."""
+        from trading.db import set_staked_eth_cache
+        real = _mem_conn()
+        set_staked_eth_cache(real, {
+            "holdingInETH": 0.5,
+            "spot_beth": 0.0,
+            "spot_wbeth": 0.0,
+            "spot_ldwbeth": 0.0,
+            "spot_ldbeth": 0.0,
+            "exchange_rate": 1.1,
+            "total_eth": 0.55,
+        })
+        conn = _NoCloseConn(real)
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get") as mock_sg:
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["total_eth"] == pytest.approx(0.55)
+        assert staked["holdingInETH"] == pytest.approx(0.5)
+        mock_sg.assert_not_called()  # cache hit → zero API calls
+        real.close()
+
+    def test_stale_cache_refetches_from_api(self):
+        """Cache > 120s old → fetch fresh via signed_get, rewrite cache."""
+        real = _mem_conn()
+        # Manually insert a stale row (5 min old)
+        stale_ts = (datetime.now() - timedelta(minutes=5)).isoformat()
+        real.execute(
+            "INSERT INTO staked_eth_cache "
+            "(id, holding_in_eth, spot_beth, spot_wbeth, spot_ldwbeth, "
+            " spot_ldbeth, exchange_rate, total_eth, ts) "
+            "VALUES (1, 0.3, 0, 0, 0, 0, 1.09, 0.327, ?)",
+            (stale_ts,),
+        )
+        real.commit()
+        conn = _NoCloseConn(real)
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0.7"}
+            if "/api/v3/account" in url:
+                return {"balances": []}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get", side_effect=sg):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["holdingInETH"] == pytest.approx(0.7)  # fresh value, not 0.3
+        assert staked["total_eth"] == pytest.approx(0.7)
+        # Cache should be rewritten with the new value
+        row = real.execute(
+            "SELECT holding_in_eth FROM staked_eth_cache WHERE id = 1"
+        ).fetchone()
+        assert float(row[0]) == pytest.approx(0.7)
+        real.close()
+
+    def test_force_refresh_bypasses_fresh_cache(self):
+        """force_refresh=True ignores a fresh cache, always hits Binance."""
+        from trading.db import set_staked_eth_cache
+        real = _mem_conn()
+        # Fresh cache with stale-looking values
+        set_staked_eth_cache(real, {
+            "holdingInETH": 0.1,
+            "spot_beth": 0.0,
+            "spot_wbeth": 0.0,
+            "spot_ldwbeth": 0.0,
+            "spot_ldbeth": 0.0,
+            "exchange_rate": 1.0,
+            "total_eth": 0.1,
+        })
+        conn = _NoCloseConn(real)
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0.9"}  # fresh value
+            if "/api/v3/account" in url:
+                return {"balances": []}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get", side_effect=sg) as mock_sg:
+            staked = trading.staking.get_staked_eth(force_refresh=True)
+
+        assert staked["holdingInETH"] == pytest.approx(0.9)  # live, not cached 0.1
+        assert mock_sg.called  # API was actually hit
+        real.close()
+
+    def test_corrupt_cache_ts_falls_through_to_refresh(self):
+        """Corrupt ts → cache read fails → fall through to fresh fetch."""
+        real = _mem_conn()
+        real.execute(
+            "INSERT INTO staked_eth_cache "
+            "(id, holding_in_eth, spot_beth, spot_wbeth, spot_ldwbeth, "
+            " spot_ldbeth, exchange_rate, total_eth, ts) "
+            "VALUES (1, 0.2, 0, 0, 0, 0, 1.09, 0.218, ?)",
+            ("not-a-valid-iso-timestamp",),
+        )
+        real.commit()
+        conn = _NoCloseConn(real)
+
+        def sg(url, params=None):
+            if "eth-staking/account" in url:
+                return {"holdingInETH": "0.4"}
+            if "/api/v3/account" in url:
+                return {"balances": []}
+            if "rateHistory" in url:
+                return {"rows": [{"exchangeRate": "1.0948"}]}
+            return {}
+
+        with patch.object(trading.staking, "db_connect", return_value=conn), \
+             patch.object(trading.staking, "signed_get", side_effect=sg):
+            staked = trading.staking.get_staked_eth()
+
+        assert staked["holdingInETH"] == pytest.approx(0.4)  # fresh, not stale 0.2
+        real.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# get_dca_stats — new staking yield fields
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestDcaStatsStakingYield:
+    def _insert(self, conn, qty, capital, entry, when="2026-01-01T10:00:00"):
+        insert_trade(conn, {
+            "order_id": f"dca-yield-{qty}-{capital}",
+            "symbol": "ETHUSDC",
+            "time": when,
+            "entry": entry,
+            "tp": 0.0,
+            "sl": 0.0,
+            "qty": qty,
+            "capital": capital,
+            "oco_id": None,
+            "status": "dca_hold",
+            "sl_pct": 0.0,
+            "tp_pct": 0.0,
+            "breakeven_moved": False,
+            "trailing_stage": 0,
+            "signal_strength": "DCA",
+        })
+
+    def test_stats_includes_staking_yield_fields(self):
+        """get_dca_stats should populate staked_eth + yield from get_staked_eth
+        when include_staking=True is explicitly opt-in."""
+        conn = _mem_conn()
+        self._insert(conn, 0.0183, 39.92, 2181.67)
+
+        # Simulate rebase yield: actual staked = 0.01835 (slightly above DCA cost basis)
+        fake_staked = {"total_eth": 0.01835, "holdingInETH": 0.01835,
+                       "exchange_rate": 1.0948, "spot_beth": 0,
+                       "spot_wbeth": 0, "spot_ldwbeth": 0, "spot_ldbeth": 0}
+
+        with patch.object(trading.dca, "get", return_value={"price": "2300.0"}), \
+             patch("trading.staking.get_staked_eth", return_value=fake_staked):
+            stats = trading.dca.get_dca_stats(conn, include_staking=True)
+
+        assert stats["staked_eth"] == pytest.approx(0.01835)
+        assert stats["staking_yield"] == pytest.approx(0.00005)  # 0.01835 - 0.0183
+        assert stats["staking_yield_pct"] == pytest.approx(
+            (0.00005 / 0.0183) * 100
+        )
+        conn.close()
+
+    def test_stats_yield_zero_when_no_buys(self):
+        """Empty DCA ledger → yield fields default to 0.0, no division by zero."""
+        conn = _mem_conn()
+        with patch.object(trading.dca, "get", return_value={"price": "2300.0"}):
+            stats = trading.dca.get_dca_stats(conn, include_staking=True)
+        assert stats["staking_yield"] == 0.0
+        assert stats["staking_yield_pct"] == 0.0
+        conn.close()
+
+    def test_stats_staking_failure_is_fail_soft(self):
+        """get_staked_eth() raising must NOT break DCA stats — yield stays 0."""
+        conn = _mem_conn()
+        self._insert(conn, 0.02, 40.0, 2000.0)
+
+        with patch.object(trading.dca, "get", return_value={"price": "2100.0"}), \
+             patch("trading.staking.get_staked_eth",
+                   side_effect=Exception("staking API down")):
+            stats = trading.dca.get_dca_stats(conn, include_staking=True)
+
+        assert stats["n_buys"] == 1  # core stats still populated
+        assert stats["pnl_pct"] == pytest.approx(5.0)
+        assert stats["staked_eth"] == 0.0  # fail-soft default
+        assert stats["staking_yield"] == 0.0
+        conn.close()
+
+    def test_stats_skips_staking_when_flag_off(self):
+        """include_staking=False (default) → yield fields stay 0.0, no
+        get_staked_eth call, no risk of real API hit from test."""
+        conn = _mem_conn()
+        self._insert(conn, 0.02, 40.0, 2000.0)
+
+        # Patch get_staked_eth to a sentinel that would fail if called
+        def should_not_be_called():
+            raise AssertionError("include_staking=False should skip get_staked_eth")
+
+        with patch.object(trading.dca, "get", return_value={"price": "2100.0"}), \
+             patch("trading.staking.get_staked_eth", side_effect=should_not_be_called):
+            stats = trading.dca.get_dca_stats(conn)  # default include_staking=False
+
+        assert stats["n_buys"] == 1
+        assert stats["pnl_pct"] == pytest.approx(5.0)
+        assert stats["staked_eth"] == 0.0
+        assert stats["staking_yield"] == 0.0
+        conn.close()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

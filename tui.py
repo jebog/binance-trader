@@ -464,12 +464,13 @@ class DCAWidget(Static):
         try:
             from trading.db import db_connect, db_init
             from trading.dca import get_dca_reserve, get_dca_stats, next_dca_time
-            from trading.staking import get_beth_balance
 
             conn = db_connect()
             db_init(conn)
-            # include_price=False → no API call in the 5s refresh path
-            stats = get_dca_stats(conn, include_price=False)
+            # include_price=False → no ticker API call in the 5s refresh path
+            # include_staking=True → read from staked_eth_cache (warmed by 30s
+            # scan worker via get_staked_eth(force_refresh=True)), no API cost
+            stats = get_dca_stats(conn, include_price=False, include_staking=True)
             reserve = get_dca_reserve(conn)
             conn.close()
         except Exception as e:
@@ -1123,6 +1124,18 @@ class ScannerApp(App):
                 run_dca_check()
             except Exception as _dca_e:
                 tlog(f"[yellow]⚠ DCA check failed: {_dca_e}[/]")
+
+            # ── Warm the staked-ETH cache (for 5s refresh DCA widget) ────────
+            # force_refresh=True bypasses the 120s TTL and writes a fresh
+            # snapshot. The 5s timer's get_dca_stats(include_staking=True)
+            # call then reads cache instead of hitting Binance every tick.
+            try:
+                from trading.staking import get_staked_eth
+                _staked = get_staked_eth(force_refresh=True)
+                # Also populate _cached_beth for the legacy DCA widget code path
+                self._cached_beth = _staked.get("total_eth", 0.0)
+            except Exception as _stk_e:
+                tlog(f"[yellow]⚠ Staked-ETH cache warm failed: {_stk_e}[/]")
 
             # ── Acquire scan lock (prevents cron + TUI double-ordering) ──────
             if not acquire_scan_lock(caller="tui"):

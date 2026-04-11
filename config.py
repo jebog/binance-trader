@@ -124,7 +124,13 @@ DCA_MIN_SCANNER_USDC = float(os.getenv("DCA_MIN_SCANNER_USDC", "200.0"))  # scan
 # Auto-stake accumulated ETH on Binance Flexible ETH Staking (no lockup).
 # BETH token represents staked ETH 1:1 and earns ~2.5-3% APY.
 STAKING_ENABLED    = os.getenv("STAKING_ENABLED", "false").lower() == "true"
-STAKING_ASSET      = os.getenv("STAKING_ASSET", "BETH")
+# Historical knob for the staked-ETH wrapper symbol. As of Binance's 2023
+# migration, the ETH staking product distributes WBETH (accrual token) instead
+# of the legacy BETH wrapper. trading.staking.get_staked_eth() resolves ALL
+# possible locations (BETH, WBETH, LDBETH, LDWBETH + the staking account
+# endpoint) regardless of this value — it is kept only for back-compat with
+# tests and future asset migrations.
+STAKING_ASSET      = os.getenv("STAKING_ASSET", "WBETH")
 STAKING_AUTO_STAKE = os.getenv("STAKING_AUTO_STAKE", "true").lower() == "true"
 
 # ── Boot reconciliation (Binance ↔ state.db) ─────────────────

@@ -85,6 +85,25 @@ CREATE TABLE IF NOT EXISTS btc_dom_cache (
     ts    TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS wbeth_rate_cache (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    exchange_rate REAL    NOT NULL,
+    apr           REAL,
+    ts            TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS staked_eth_cache (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    holding_in_eth REAL    NOT NULL DEFAULT 0,
+    spot_beth      REAL    NOT NULL DEFAULT 0,
+    spot_wbeth     REAL    NOT NULL DEFAULT 0,
+    spot_ldwbeth   REAL    NOT NULL DEFAULT 0,
+    spot_ldbeth    REAL    NOT NULL DEFAULT 0,
+    exchange_rate  REAL    NOT NULL DEFAULT 1.0,
+    total_eth      REAL    NOT NULL DEFAULT 0,
+    ts             TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS portfolio (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     total_usdc REAL    NOT NULL,
@@ -353,6 +372,75 @@ def set_btc_dom_cache(conn: sqlite3.Connection, value: float) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO btc_dom_cache (id, value, ts) VALUES (1, ?, ?)",
         (value, datetime.now().isoformat()),
+    )
+    conn.commit()
+
+
+# ── WBETH exchange-rate cache ─────────────────────────────────────────────────
+
+def get_wbeth_rate_cache(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT exchange_rate, apr, ts FROM wbeth_rate_cache WHERE id = 1"
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_wbeth_rate_cache(
+    conn: sqlite3.Connection,
+    exchange_rate: float,
+    apr: Optional[float] = None,
+) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO wbeth_rate_cache (id, exchange_rate, apr, ts) "
+        "VALUES (1, ?, ?, ?)",
+        (exchange_rate, apr, datetime.now().isoformat()),
+    )
+    conn.commit()
+
+
+# ── Staked-ETH-resolution cache ───────────────────────────────────────────────
+#
+# Full get_staked_eth() result cached for 120s to let the TUI's 5s refresh
+# loop read real staking values without making Binance API calls on every
+# tick. The TUI's 30s scan worker calls get_staked_eth(force_refresh=True)
+# to warm the cache on each real scan boundary.
+
+def get_staked_eth_cache(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT holding_in_eth, spot_beth, spot_wbeth, spot_ldwbeth, "
+        "spot_ldbeth, exchange_rate, total_eth, ts "
+        "FROM staked_eth_cache WHERE id = 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "holdingInETH":  float(row["holding_in_eth"]),
+        "spot_beth":     float(row["spot_beth"]),
+        "spot_wbeth":    float(row["spot_wbeth"]),
+        "spot_ldwbeth":  float(row["spot_ldwbeth"]),
+        "spot_ldbeth":   float(row["spot_ldbeth"]),
+        "exchange_rate": float(row["exchange_rate"]),
+        "total_eth":     float(row["total_eth"]),
+        "ts":            row["ts"],
+    }
+
+
+def set_staked_eth_cache(conn: sqlite3.Connection, data: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO staked_eth_cache "
+        "(id, holding_in_eth, spot_beth, spot_wbeth, spot_ldwbeth, "
+        " spot_ldbeth, exchange_rate, total_eth, ts) "
+        "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            float(data.get("holdingInETH", 0.0) or 0.0),
+            float(data.get("spot_beth", 0.0) or 0.0),
+            float(data.get("spot_wbeth", 0.0) or 0.0),
+            float(data.get("spot_ldwbeth", 0.0) or 0.0),
+            float(data.get("spot_ldbeth", 0.0) or 0.0),
+            float(data.get("exchange_rate", 1.0) or 1.0),
+            float(data.get("total_eth", 0.0) or 0.0),
+            datetime.now().isoformat(),
+        ),
     )
     conn.commit()
 

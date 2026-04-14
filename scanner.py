@@ -255,7 +255,7 @@ def _scan_body(_scan_conn: sqlite3.Connection) -> None:
 
     try:
         _stuck = _scan_conn.execute(
-            "SELECT symbol, status FROM trades WHERE status IN ('timeout_sell_failed', 'no_oco')"
+            "SELECT symbol, status FROM trades WHERE status IN ('no_oco', 'partial_tp_no_oco')"
         ).fetchall()
         if _stuck:
             _stuck_list = ", ".join(f"{r[0]}({r[1]})" for r in _stuck)
@@ -599,7 +599,7 @@ def get_health(conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
     last_ok = get_kv(conn, "last_scan_ok") or ""
     last_scan = get_kv(conn, "last_scan") or ""
     stuck = conn.execute(
-        "SELECT COUNT(*) FROM trades WHERE status IN ('timeout_sell_failed', 'no_oco')"
+        "SELECT COUNT(*) FROM trades WHERE status IN ('no_oco', 'partial_tp_no_oco')"
     ).fetchone()[0]
     if _own:
         conn.close()

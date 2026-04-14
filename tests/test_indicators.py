@@ -1031,8 +1031,7 @@ class TestSplitEntry:
              patch.object(scanner, "_clear_pending_second_entry", side_effect=fake_clear), \
              patch.object(scanner, "_place_split_second_entry", return_value=None), \
              patch.object(scanner, "get", return_value={"price": "1950.0"}), \
-             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)), \
-             patch("scanner.SPLIT_ENTRY_ENABLED", True):
+             patch.object(scanner, "send_telegram", side_effect=lambda m: telegram_calls.append(m)):
             # Simulate the TTL-expiry branch in scan() directly
             entry_age_h = (
                 datetime.now() - datetime.fromisoformat(expired_time)
@@ -1240,8 +1239,7 @@ class TestTradeTimeout:
         sell_calls: list = []
         with patch.object(scanner, "signed_delete", return_value=None), \
              patch.object(scanner, "signed_post", side_effect=lambda p, d: sell_calls.append((p, d))), \
-             patch.object(scanner, "send_telegram", return_value=None), \
-             patch("scanner.TRADE_TIMEOUT_ENABLED", True):
+             patch.object(scanner, "send_telegram", return_value=None):
             # Simulate the timeout guard logic directly (as written in _check_sl_outcomes)
             age_h = (datetime.now() - datetime.fromisoformat(trade["time"])).total_seconds() / 3600
             would_timeout = age_h >= scanner.TRADE_TIMEOUT_H
